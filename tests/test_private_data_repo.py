@@ -15,7 +15,7 @@ class PrivateDataRepositoryTests(unittest.TestCase):
             root = pathlib.Path(tmp)
             (root / '.git').mkdir()
             with patch.dict('os.environ', {'ATS_DATA_REPO': str(root)}):
-                self.assertEqual(ats.private_data_repo(), root)
+                self.assertEqual(ats.private_data_repo(), root.resolve())
 
     def test_data_repo_refuses_non_git_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

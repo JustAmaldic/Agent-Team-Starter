@@ -10,7 +10,7 @@ def blocks(text):
         match = re.match(r'(FAIL|ERROR): (\S+) \((.+?)\)', header)
         if match:
             body = body.split('\n' + '-' * 70 + '\nRan ')[0]
-            yield f'{match.group(1)} {match.group(3)}.{match.group(2)}', body.strip()
+            yield f'{match.group(1)} {match.group(3)}', body.strip()
 
 
 def escape(value):
