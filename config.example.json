@@ -1,0 +1,10 @@
+{
+  "default_agent": "codex",
+  "max_revisions": 2,
+  "test_commands": [],
+  "base_branch": "main",
+  "routing": {
+    "codex": ["test", "bug", "python"],
+    "claude": ["architecture", "refactor", "design"]
+  }
+}

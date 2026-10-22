@@ -1,0 +1,11 @@
+{
+  "project": "MyApp",
+  "base_branch": "main",
+  "test_commands": [
+    "python3 -m pytest -q"
+  ],
+  "max_revisions": 2,
+  "test_timeout": 900,
+  "max_review_diff_chars": 150000,
+  "allow_approval_without_tests": false
+}

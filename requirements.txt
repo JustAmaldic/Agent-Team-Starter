@@ -1,0 +1,2 @@
+# ATS currently uses only the Python standard library.
+# Add third-party Python packages here when ATS needs them.
