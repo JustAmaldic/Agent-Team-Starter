@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Runtime files
+*.log
+*.pid
+*.lock
+tmp/
+temp/
+.cache/
+
+# Agent worktrees
+.worktrees/
+worktrees/
+
+# Local configuration
+config.local.json
+settings.local.json
+.claude/settings.local.json
+.ats-project.local.json
+
+# Editor and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Private local ATS state and historical task logs (never publish)
+data/
+.ats-state/
+.ats-data/
+knowledge/
+*.patch
