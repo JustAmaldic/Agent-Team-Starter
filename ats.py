@@ -18,7 +18,21 @@ import uuid
 from pathlib import Path
 
 ATS = Path(__file__).resolve().parent
-APP = ATS.parent if ATS.name == '.ats' else Path.cwd()
+
+
+def app_directory():
+    """The application ATS works on.
+
+    ATS_APP lets one central ATS installation (for example the ATS app's host)
+    work on any project; without it the classic `.ats` clone layout applies.
+    """
+    configured = os.environ.get('ATS_APP', '').strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return ATS.parent if ATS.name == '.ats' else Path.cwd()
+
+
+APP = app_directory()
 def state_directory():
     """Keep project-specific agent output outside the Git repository."""
     root = Path(os.environ.get('ATS_STATE_DIR', str(Path.home() / '.ats-state'))).expanduser()
@@ -226,6 +240,29 @@ def read_json(path):
     return json.loads(text)
 
 
+def emit(item):
+    """Append one event as a JSON line to ATS_EVENTS_FILE for a live consumer.
+
+    Best effort: a missing variable or an unwritable file never affects the task.
+    """
+    path = os.environ.get('ATS_EVENTS_FILE')
+    if not path:
+        return
+    try:
+        line = json.dumps(item, ensure_ascii=False, default=str) + '\n'
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(line)
+            handle.flush()
+    except OSError:
+        pass
+
+
+def phase(stage, task_id, **fields):
+    """Live-only stage marker (not stored as an event file)."""
+    emit(dict(timestamp=dt.datetime.now(dt.timezone.utc).isoformat(), task_id=task_id,
+              event_type='phase', stage=stage, **fields))
+
+
 def record(kind, summary, task=None, **fields):
     conf = project()
     name = cleanname(conf.get('project', APP.name))
@@ -237,6 +274,7 @@ def record(kind, summary, task=None, **fields):
                 summary=summary, event_id=uid, **fields)
     (target / f'{now.replace(":", "-")}-{uid}.json').write_text(
         json.dumps(item, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    emit(item)
     return item
 
 KNOWLEDGE_KINDS = {'finding', 'feedback', 'lesson', 'rule', 'decision', 'pattern'}
@@ -905,6 +943,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
     reviewer = None
     reasons = ['not reviewed']
     for cycle in range(max_revisions + 1):
+        phase('checks', task_id, cycle=cycle)
         checks = run_checks(conf, folder)
         execute(['git', 'add', '-A'], folder)
         diff = execute(['git', 'diff', '--cached', 'HEAD'], folder).stdout
@@ -927,6 +966,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             reasons = ['diff too large to review completely']
             break
         tree = index_tree(folder)
+        phase('review', task_id, cycle=cycle, reviewer=preferred, implementer=implementer)
         try:
             reviewer, review = invoke_with_fallback(preferred, review_prompt(task, checks, diff, history),
                                                     folder, unavailable, task_id, 'review',
@@ -958,9 +998,11 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                tampered_paths=tampered, tests=checks, cycle=cycle, branch=branch)
         history.append({'cycle': cycle, 'reviewer': reviewer, 'findings': findings, 'responses': []})
         if approved:
+            phase('approved', task_id, cycle=cycle)
             return True, reviewer, implementer, history
         if cycle == max_revisions:
             break
+        phase('revision', task_id, cycle=cycle, implementer=implementer)
         try:
             implementer, response = invoke_with_fallback(implementer, revision_prompt(task, review, findings),
                                                          folder, unavailable, task_id, 'revision', quiet=quiet)
@@ -983,6 +1025,17 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
     return False, reviewer, implementer, history
 
 
+def preset_task_id():
+    """ATS_TASK_ID lets a caller know the task id before the run starts."""
+    value = os.environ.get('ATS_TASK_ID', '').strip()
+    if not value:
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise RuntimeError('ATS_TASK_ID must be a UUID: ' + value)
+
+
 def task_flow(task, agent, push, quiet=False):
     conf=project()
     repository = execute(['git', 'rev-parse', '--show-toplevel'], check=False)
@@ -992,7 +1045,7 @@ def task_flow(task, agent, push, quiet=False):
     if local_mode and push:
         raise RuntimeError('This project is not a Git repository. Run .ats task without --push; local changes will be exported as a patch.')
     agent=select(task) if agent=='auto' else agent
-    task_id=str(uuid.uuid4())
+    task_id=preset_task_id() or str(uuid.uuid4())
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
@@ -1007,6 +1060,7 @@ def task_flow(task, agent, push, quiet=False):
         else:
             execute(['git','worktree','add','-b',branch,str(folder),'HEAD'])
         worktree_created=True
+        phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
         prompt = (f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'}. Task: {task}. "
                   "Change only necessary application files and add tests. "
                   "Do not push, merge, deploy, trade, expose secrets or modify .ats."
@@ -1026,9 +1080,11 @@ def task_flow(task, agent, push, quiet=False):
         else:
             execute(['git','commit','-m','ATS: '+task[:65]],folder)
         print(f'Branch: {branch} | approved: {approved} | workspace: {folder}')
+        phase('finished', task_id, approved=approved, branch=branch, worktree=str(folder))
         if local_mode:
             patch = export_local_patch(folder)
             if patch:
+                phase('patch', task_id, patch=str(patch))
                 print(f'Local patch: {patch}')
                 print('Review and apply from your application directory: git apply --check "' + str(patch) + '"')
                 print('Then: git apply "' + str(patch) + '"')
@@ -1040,6 +1096,7 @@ def task_flow(task, agent, push, quiet=False):
             print('Independent review/checks incomplete: PR publishing blocked; worktree preserved')
             return
         if push:
+            phase('pr', task_id, branch=branch)
             execute(['git','push','-u','origin',branch],folder)
             if not shutil.which('gh'):
                 print('gh missing: branch pushed but draft PR must be created manually');return
@@ -1047,6 +1104,7 @@ def task_flow(task, agent, push, quiet=False):
             outcome=execute(['gh','pr','create','--draft','--base',base,'--head',branch,'--title','ATS: '+task[:65],
                              '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\nReview/check outcomes in ATS data. Human merge required.'],folder)
             print(outcome.stdout)
+            phase('pr_created', task_id, url=outcome.stdout.strip()[-300:])
     except AgentUsageExhausted as exc:
         message = str(exc) if isinstance(exc, BothAgentsExhausted) else 'Usage voor beide agents is op'
         print(message, file=sys.stderr)
@@ -1083,7 +1141,12 @@ def main():
     sub.add_parser('sync');sub.add_parser('doctor');sub.add_parser('install');sub.add_parser('data-sync')
     p=sub.add_parser('learn');p.add_argument('kind',choices=sorted(KNOWLEDGE_KINDS));p.add_argument('title');p.add_argument('observation');p.add_argument('--evidence',required=True);p.add_argument('--task');p.add_argument('--confidence',choices=CONFIDENCE_LEVELS,default='medium')
     args=parser.parse_args()
-    sync_in()
+    if os.environ.get('ATS_APP') and not APP.is_dir():
+        raise RuntimeError('ATS_APP is not a directory: ' + str(APP))
+    if os.environ.get('ATS_NO_SELF_UPDATE', '').strip() not in ('', '0', 'false'):
+        pass   # the caller (e.g. the ATS app host) manages ATS source updates
+    else:
+        sync_in()
     exitcode=0
     if args.command == 'task':
         try:

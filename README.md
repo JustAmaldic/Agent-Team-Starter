@@ -37,6 +37,19 @@ ATS stores review events and agent output locally under `~/.ats-state/<project-i
 
 Review app code before giving agents access, and keep keys, credentials and `.env` files out of Git. No automation should bypass a required human merge or deployment approval.
 
+## Running ATS from a central place (host integration)
+
+ATS can also run from one central installation instead of a `.ats` clone per project. A host process, such as the ATS desktop app, sets these environment variables per task:
+
+| Variable | Effect |
+|---|---|
+| `ATS_APP` | Project root to work on (instead of the folder around `.ats` or the current directory). |
+| `ATS_EVENTS_FILE` | Every event is also appended to this file as one JSON line, plus live-only `phase` events (`implementation`, `checks`, `review`, `revision`, `approved`, `pr`, `pr_created`, `patch`, `finished`). |
+| `ATS_TASK_ID` | Use this UUID as the task id, so the caller knows it before the run starts. |
+| `ATS_NO_SELF_UPDATE` | Skip the fast-forward source update at start; the caller manages ATS updates. |
+
+Without these variables ATS behaves exactly as before.
+
 ## Optional: private shared history
 
 To share events and reviewed learnings between machines, create a **private** GitHub repository and clone it to `~/.ats-data` (or set `ATS_DATA_REPO` to the clone). ATS verifies with `gh` that the repository is private and opens a pull request with new data after each task; it never pushes to `main`. Set `ATS_DATA_REMOTE=OWNER/REPO` to pin the expected repository. `python scripts/bootstrap_private_data.py --repo OWNER/REPO` creates and seeds one.
