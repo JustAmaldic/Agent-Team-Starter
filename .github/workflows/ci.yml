@@ -23,7 +23,14 @@ jobs:
       - name: Syntax check
         run: python -m compileall -q ats.py scripts tests
       - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee "${{ runner.temp }}/unittest.txt"
+      - name: Report failing tests as annotations
+        if: failure()
+        shell: bash
+        run: python .github/scripts/report_test_failures.py "${{ runner.temp }}/unittest.txt"
       - name: Validate clean public export
         shell: bash
         run: |
