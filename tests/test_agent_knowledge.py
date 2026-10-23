@@ -24,6 +24,26 @@ class AgentKnowledgeTests(unittest.TestCase):
                 self.assertEqual(item['id'], saved['id'])
                 self.assertEqual(saved['evidence'], ['review #18'])
 
+    def test_rules_are_not_pushed_out_by_review_findings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            rules, findings = root / 'knowledge/projects/ARC/rules', root / 'knowledge/projects/ARC/findings'
+            rules.mkdir(parents=True)
+            findings.mkdir(parents=True)
+            (rules / 'r.json').write_text(json.dumps({
+                'kind': 'rule', 'title': 'Bump VERSION', 'observation': 'in sessielink.py',
+                'evidence': ['human'], 'status': 'approved', 'created_at': '2026-10-01T00:00:00Z'}))
+            for i in range(20):   # newer, verified review findings
+                (findings / f'f{i}.json').write_text(json.dumps({
+                    'kind': 'finding', 'title': f'Finding {i}', 'observation': 'fixed',
+                    'evidence': ['a.py:1'], 'status': 'verified', 'created_at': f'2026-10-2{i % 10}T00:00:00Z'}))
+            with patch.object(ats, 'PRIVATE_DATA_REPO', root), \
+                 patch.object(ats, 'project', return_value={'project': 'ARC'}):
+                context = ats.knowledge_context(limit=5)
+            lines = [line for line in context.splitlines() if line.startswith('- [')]
+            self.assertEqual(len(lines), 5)
+            self.assertTrue(lines[0].startswith('- [rule] Bump VERSION'))
+
     def test_unverified_rules_not_loaded_into_agent_context(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
