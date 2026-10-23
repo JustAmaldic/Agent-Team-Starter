@@ -305,6 +305,9 @@ def read_json(path):
     return json.loads(text)
 
 
+EMIT_LOCK = threading.Lock()
+
+
 def emit(item):
     """Append one event as a JSON line to ATS_EVENTS_FILE for a live consumer.
 
@@ -315,7 +318,7 @@ def emit(item):
         return
     try:
         line = json.dumps(item, ensure_ascii=False, default=str) + '\n'
-        with open(path, 'a', encoding='utf-8') as handle:
+        with EMIT_LOCK, open(path, 'a', encoding='utf-8') as handle:   # parallel parts emit from two threads
             handle.write(line)
             handle.flush()
     except OSError:
@@ -1126,10 +1129,33 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
 SUBTASK_EXAMPLE = ["first bounded implementation with tests", "next bounded implementation with tests"]
 
 
+MAX_PARTS = 20
+MAX_PARALLEL_PARTS = 2   # one part per agent
+
+
+def plan_waves(plan):
+    """Plan -> waves: lists of parts built at the same time. None when the plan is unusable.
+
+    A string is a part on its own; a list of two strings is a pair the two agents build in
+    parallel (parts that do not depend on each other). Waves run in order.
+    """
+    if not isinstance(plan, list):
+        return None
+    waves = []
+    for entry in plan:
+        wave = [entry] if isinstance(entry, str) else entry
+        if not isinstance(wave, list) or not 1 <= len(wave) <= MAX_PARALLEL_PARTS:
+            return None
+        if not all(isinstance(p, str) and p.strip() and not is_placeholder(p) and p not in SUBTASK_EXAMPLE
+                   for p in wave):
+            return None
+        waves.append([p.strip() for p in wave])
+    total = sum(len(w) for w in waves)
+    return waves if 2 <= total <= MAX_PARTS else None
+
+
 def valid_plan(plan):
-    return (isinstance(plan, list) and 2 <= len(plan) <= 20
-            and all(isinstance(p, str) and p.strip() and not is_placeholder(p) and p not in SUBTASK_EXAMPLE
-                    for p in plan))
+    return plan_waves(plan) is not None
 
 
 def subtask_plan(output):
@@ -1142,68 +1168,222 @@ def subtask_plan(output):
         return None
     plan = parse_marked_json(lines[-1], 'ATS_SUBTASKS_JSON')
     if not valid_plan(plan):
-        raise RuntimeError('Invalid task plan: expected 2 to 20 concrete subtask strings')
-    return [p.strip() for p in plan]
+        raise RuntimeError('Invalid task plan: expected 2 to 20 concrete parts (strings, or pairs of strings)')
+    return plan
+
+
+def other_agent(agent):
+    return 'claude' if agent == 'codex' else 'codex'
+
+
+def git_identity(folder):
+    """['-c', ...] for an ATS identity when git has none here (local snapshot projects), else []."""
+    if execute(['git', 'config', 'user.email'], folder, check=False).stdout.strip():
+        return []
+    return ['-c', 'user.name=ATS', '-c', 'user.email=ats@localhost']
+
+
+def commit_all(folder, message):
+    """Commit everything in a worktree; returns False when there was nothing to commit."""
+    execute(['git', 'add', '-A'], folder)
+    if execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode == 0:
+        return False
+    execute(['git', *git_identity(folder), 'commit', '-m', message], folder)
+    return True
+
+
+def run_part(task, plan, number, total, part, task_id, folder, branch, implementer, unavailable, conf,
+             base, quiet=False, alongside=None):
+    """Implement one part and put it through the review loop. Returns (approved, reviewer, author, cycles)."""
+    description = f'{task}\nSubtask {number}/{total}: {part}'
+    # The reviewer sees only this part's diff; with the plan it does not flag work that belongs
+    # to another part as missing.
+    review_task = (description + '\nFull plan (review ONLY this part; other parts are reviewed '
+                   'separately): ' + json.dumps(plan, ensure_ascii=False))
+    together = (f'Another agent builds part {alongside[0]} ({alongside[1]}) AT THE SAME TIME in a separate '
+                'copy; do not implement it and avoid changing the same code. ' if alongside else '')
+    phase('implementation', task_id, implementer=implementer, subtask=number)
+    prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. '
+              f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
+              f'Implement ONLY this part: {description}\n' + together +
+              'Earlier parts have passed independent review. Preserve them. Add tests. '
+              'Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; '
+              'ATS commits the work after the review.'
+              + knowledge_context()
+              + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
+              + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
+    try:
+        author, output = invoke_with_fallback(implementer, prompt, folder, unavailable,
+                                              task_id, 'implementation', quiet=quiet, fallback=False)
+    except (AgentUsageExhausted, RuntimeError) as exc:
+        record('escalated', str(exc), task_id, subtask=number, implementer=implementer, branch=branch,
+               blocking_reasons=[f'subtask {number}: {exc}'])
+        return False, None, implementer, []
+    record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
+    capture_learning_proposals(output, task_id)
+    try:
+        approved, reviewer, author, cycles = review_loop(
+            review_task, task_id, folder, branch, author, unavailable, conf,
+            quiet=quiet, base=base, subtask=number)
+    except RuntimeError as exc:   # e.g. the part produced no changes
+        record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
+               blocking_reasons=[f'subtask {number}: {exc}'])
+        return False, None, author, []
+    for cycle in cycles:
+        cycle['subtask'] = number
+        cycle['implementer'] = author
+    if approved:
+        record('subtask_completed', part, task_id, subtask=number, implementer=author,
+               reviewer=reviewer, branch=branch)
+    return approved, reviewer, author, cycles
+
+
+def merge_parallel_part(task, plan, number, part, task_id, folder, branch, side_branch, author,
+                        unavailable, conf, quiet=False):
+    """Merge a part built in a side worktree into the task worktree.
+
+    A clean merge with passing checks is done. Otherwise the agent that built the side part resolves
+    the conflict (or fixes the failing checks) and the other agent reviews that resolution.
+    Returns (approved, reviewer, cycles).
+    """
+    phase('merge', task_id, subtask=number)
+    pre_merge = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+    merged = execute(['git', *git_identity(folder), 'merge', '--no-ff', '--no-edit', '-m',
+                      f'ATS: merge part {number}', side_branch], folder, check=False)
+    if merged.returncode == 0:
+        checks = run_checks(conf, folder)
+        if all(c['passed'] for c in checks):
+            record('subtask_merged', f'Part {number} merged cleanly', task_id, subtask=number, branch=branch)
+            return True, None, []
+        problem = ('The combined parts fail these checks; fix them without dropping either part:\n'
+                   + json.dumps([{'command': c['command'], 'output': c['output'][-1500:]}
+                                 for c in checks if not c['passed']], ensure_ascii=False))
+    else:
+        conflicts = execute(['git', 'diff', '--name-only', '--diff-filter=U'], folder, check=False).stdout.split()
+        problem = ('Merging your part into the other part produced conflicts in: ' + ', '.join(conflicts[:30])
+                   + '. Resolve every conflict marker so BOTH parts keep working.')
+    record('merge_conflict', problem[:1200], task_id, subtask=number, implementer=author, branch=branch)
+    prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. Task: {task}\n'
+              f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
+              f'You built part {number} ({part}) in parallel with another part. {problem}\n'
+              'Change only what the integration needs. Do not commit, push or modify .ats.')
+    try:
+        fixer, output = invoke_with_fallback(author, prompt, folder, unavailable, task_id, 'implementation',
+                                             quiet=quiet, fallback=False)
+    except (AgentUsageExhausted, RuntimeError) as exc:
+        record('escalated', str(exc), task_id, subtask=number, branch=branch,
+               blocking_reasons=[f'merge of part {number}: {exc}'])
+        return False, None, []
+    record('implementation', output[-1600:], task_id, implementer=fixer, subtask=number)
+    review_task = (f'{task}\nIntegration of part {number} ({part}) with the parts before it. The diff '
+                   'is that part plus the merge resolution; check that both parts keep working.')
+    try:
+        approved, reviewer, fixer, cycles = review_loop(review_task, task_id, folder, branch, fixer, unavailable,
+                                                        conf, quiet=quiet, base=pre_merge, subtask=number)
+    except RuntimeError as exc:
+        record('escalated', str(exc), task_id, subtask=number, branch=branch,
+               blocking_reasons=[f'merge of part {number}: {exc}'])
+        return False, None, []
+    for cycle in cycles:
+        cycle['subtask'] = number
+        cycle['implementer'] = fixer
+        cycle['merge'] = True
+    if approved:
+        execute(['git', 'add', '-A'], folder)
+        if execute(['git', 'rev-parse', '-q', '--verify', 'MERGE_HEAD'], folder, check=False).returncode == 0:
+            execute(['git', *git_identity(folder), 'commit', '--no-edit'], folder)
+        else:
+            commit_all(folder, f'ATS: integrate part {number}')
+        record('subtask_merged', f'Part {number} merged after a reviewed resolution', task_id,
+               subtask=number, implementer=fixer, reviewer=reviewer, branch=branch)
+    return approved, reviewer, cycles
 
 
 def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, conf,
                  quiet=False):
-    """Alternate authors, handing each bounded change to the other agent for review."""
-    if not valid_plan(plan):
-        raise RuntimeError('Task plan must contain 2 to 20 non-empty subtask strings')
-    history = []
-    reviewer = None
-    attribution = []
-    for number, part in enumerate(plan, 1):
-        other = 'claude' if implementer == 'codex' else 'codex'
+    """Build a split task part by part; independent pairs are built and reviewed in parallel.
+
+    A single part: one agent implements, the other reviews, and the reviewer builds the next part.
+    A pair: both agents implement one part at the same time (the second in its own worktree), each
+    reviews the other's part, then ATS merges the pair (see merge_parallel_part).
+    """
+    waves = plan_waves(plan)
+    if waves is None:
+        raise RuntimeError('Task plan must contain 2 to 20 non-empty parts (strings, or pairs of strings)')
+    total = sum(len(w) for w in waves)
+    history, attribution = [], []
+    reviewer, author, number = None, implementer, 0
+    for wave in waves:
+        other = other_agent(implementer)
         if implementer in unavailable or other in unavailable:
             record('escalated', 'Both agents are required for subtask handoffs', task_id,
-                   subtask=number, branch=branch)
+                   subtask=number + 1, branch=branch)
             return False, reviewer, implementer, history
-        base = index_tree(folder)
-        description = f'{task}\nSubtask {number}/{len(plan)}: {part}'
-        # The reviewer sees only this part's diff; with the plan it does not flag work that belongs
-        # to a later part as missing.
-        review_task = (description + '\nFull plan (review ONLY this part; later parts follow in '
-                       'separate reviews): ' + json.dumps(plan, ensure_ascii=False))
-        phase('implementation', task_id, implementer=implementer, subtask=number)
-        prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. '
-                  f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
-                  f'Implement ONLY this next part: {description}\n'
-                  'Earlier parts have passed independent review. Preserve them. Add tests. '
-                  'Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; '
-                  'ATS commits the work after the last review.'
-                  + knowledge_context()
-                  + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
-                  + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
-        try:
-            author, output = invoke_with_fallback(implementer, prompt, folder, unavailable,
-                                                  task_id, 'implementation', quiet=quiet, fallback=False)
-        except (AgentUsageExhausted, RuntimeError) as exc:
-            record('escalated', str(exc), task_id, subtask=number,
-                   implementer=implementer, branch=branch,
-                   blocking_reasons=[str(exc)])
-            return False, reviewer, implementer, history
-        record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
-        capture_learning_proposals(output, task_id)
-        try:
-            approved, reviewer, author, cycles = review_loop(
-                review_task, task_id, folder, branch, author, unavailable, conf,
-                quiet=quiet, base=base, subtask=number)
-        except RuntimeError as exc:   # e.g. the part produced no changes
-            record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
-                   blocking_reasons=[f'subtask {number}: {exc}'])
-            return False, reviewer, author, history
-        for cycle in cycles:
-            cycle['subtask'] = number
-            cycle['implementer'] = author
-        history.extend(cycles)
-        if not approved:
-            return False, reviewer, author, history
-        record('subtask_completed', part, task_id, subtask=number, implementer=author,
-               reviewer=reviewer, branch=branch)
-        attribution.append(dict(subtask=number, implementer=author, reviewer=reviewer))
-        implementer = reviewer
+        if len(wave) == 1:
+            number += 1
+            approved, reviewer, author, cycles = run_part(
+                task, plan, number, total, wave[0], task_id, folder, branch, implementer, unavailable, conf,
+                base=index_tree(folder), quiet=quiet)
+            history.extend(cycles)
+            if not approved:
+                return False, reviewer, author, history
+            attribution.append(dict(subtask=number, implementer=author, reviewer=reviewer))
+            implementer = reviewer or other
+            continue
+
+        # ---- a pair, in parallel: part `first` here, part `second` in a side worktree
+        first, second = number + 1, number + 2
+        number += 2
+        commit_all(folder, f'ATS: reviewed parts 1-{first - 1}' if first > 1 else 'ATS: start of parallel parts')
+        wave_base = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+        side = folder.parent / f'{folder.name}-part{second}'
+        side_branch = f'{branch}-part{second}'
+        execute(['git', 'worktree', 'add', '-b', side_branch, str(side), wave_base], folder)
+        phase('parallel', task_id, subtasks=[first, second], implementers=[implementer, other])
+        results = {}
+
+        def build(key, *args):
+            try:
+                results[key] = run_part(*args)
+            except Exception as exc:   # never leave the other thread waiting on a crash
+                record('escalated', str(exc), task_id, subtask=args[2], branch=branch,
+                       blocking_reasons=[f'subtask {args[2]}: {exc}'])
+                results[key] = (False, None, args[8], [])
+
+        threads = [
+            threading.Thread(target=build, args=('a', task, plan, first, total, wave[0], task_id, folder, branch,
+                                                 implementer, unavailable, conf, wave_base, quiet,
+                                                 (second, wave[1]))),
+            threading.Thread(target=build, args=('b', task, plan, second, total, wave[1], task_id, side, branch,
+                                                 other, unavailable, conf, wave_base, quiet,
+                                                 (first, wave[0]))),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        (ok_a, reviewer_a, author_a, cycles_a), (ok_b, reviewer_b, author_b, cycles_b) = results['a'], results['b']
+        history.extend(cycles_a + cycles_b)
+        if not (ok_a and ok_b):
+            print(f'ATS: parallel parts {first}/{second} not both approved; side worktree kept: {side}',
+                  file=sys.stderr)
+            return False, reviewer_a or reviewer_b, author_a, history
+        commit_all(folder, f'ATS: part {first}')
+        commit_all(side, f'ATS: part {second}')
+        attribution.append(dict(subtask=first, implementer=author_a, reviewer=reviewer_a))
+        attribution.append(dict(subtask=second, implementer=author_b, reviewer=reviewer_b))
+        merged, merge_reviewer, merge_cycles = merge_parallel_part(
+            task, plan, second, wave[1], task_id, folder, branch, side_branch, author_b, unavailable, conf,
+            quiet=quiet)
+        history.extend(merge_cycles)
+        if not merged:
+            print(f'ATS: merging part {second} needs a human decision; side worktree kept: {side}',
+                  file=sys.stderr)
+            return False, merge_reviewer, author_b, history
+        execute(['git', 'worktree', 'remove', '--force', str(side)], folder, check=False)
+        execute(['git', 'branch', '-D', side_branch], folder, check=False)
+        reviewer, author = reviewer_b, author_b
+        implementer = other   # the next wave starts with the other agent
     record('subtasks_completed', 'All parts independently reviewed; combined diff has not been reviewed',
            task_id, parts=attribution, branch=branch, combined_review=False)
     return True, reviewer, author, history
@@ -1251,9 +1431,12 @@ def task_flow(task, agent, push, quiet=False):
                   f"(maximum diff {conf.get('max_review_diff_chars', 150000)} characters), "
                   "make NO file changes and return ONE LINE ATS_SUBTASKS_JSON: "
                   '["first bounded implementation with tests", "next bounded implementation with tests"]. '
-                  "Use 2 to 20 concrete ordered parts that together complete the task. "
-                  "The two agents will alternate implementing and reviewing each part; "
+                  "Use 2 to 20 concrete ordered parts that together complete the task; "
                   "each part must be independently testable and reviewable. "
+                  "Two parts that do not depend on each other and touch different code may be given as a "
+                  'pair, e.g. ["shared model", ["API endpoint", "settings screen"], "end-to-end test"]: '
+                  "the two agents then build that pair at the same time and review each other's part. "
+                  "Other parts run in order, alternating implementer and reviewer. "
                   "For a small task implement it normally without that marker. "
                   "Change only necessary application files and add tests. "
                   "Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; "

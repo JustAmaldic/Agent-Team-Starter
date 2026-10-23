@@ -56,6 +56,10 @@ Inspect the actual diff and test results yourself. Do not rely on the implemente
 
 - If a task is too large for one complete review (above `max_review_diff_chars`), the implementer changes no files and returns `ATS_SUBTASKS_JSON: [...]`: 2 to 20 concrete, ordered parts that each can be tested and reviewed on their own.
 - The agents alternate: the implementer builds part 1 and the other agent reviews only that part's diff; the reviewer of a part implements the next one. Both agents are required; without both the task escalates.
+- Two parts that do not depend on each other may be planned as a pair (`["model", ["API", "screen"], "e2e test"]`). The agents build the pair **at the same time**, each in its own worktree from the same starting point, and each reviews the other's part. ATS then merges the pair:
+  - a clean merge whose checks pass is done;
+  - on a merge conflict or failing checks, the agent that built the second part resolves it and the other agent reviews the resolution (same approval gate);
+  - if that is not approved, the task escalates and both worktrees are kept.
 - A part that is not approved stops the task; later parts are not started. Every part passes the same approval gate, and the tests run on the combined code after every part.
 - The pull request lists who implemented and reviewed each part and states that the combined change was not reviewed as a whole.
 
