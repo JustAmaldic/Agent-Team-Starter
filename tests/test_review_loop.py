@@ -43,7 +43,7 @@ class ReviewLoopTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_loop(self, script, conf=None, implementer='codex', unavailable=None):
+    def run_loop(self, script, conf=None, implementer='codex', unavailable=None, base='HEAD'):
         """script: list of (expected_agent, purpose_marker, callable(folder) -> output)."""
         steps = list(script)
 
@@ -64,7 +64,7 @@ class ReviewLoopTests(unittest.TestCase):
              patch.object(ats, 'codex_preflight'):
             result = ats.review_loop('task', 'tid', self.folder, 'ats/b', implementer,
                                      unavailable if unavailable is not None else ats.UnavailableAgents(),
-                                     config, quiet=True)
+                                     config, quiet=True, base=base)
         self.assertEqual(steps, [], 'not every scripted agent call happened')
         return result
 
@@ -79,6 +79,18 @@ class ReviewLoopTests(unittest.TestCase):
         self.assertTrue(approved)
         self.assertEqual(reviewer, 'claude')
         self.assertEqual(len(history), 1)
+
+    def test_work_the_agent_committed_itself_is_still_reviewed(self):
+        base = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=self.folder, capture_output=True,
+                              text=True, check=True).stdout.strip()
+        subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qam', 'agent'],
+                       cwd=self.folder, check=True)   # the implementer ran `git commit`
+
+        def review(folder, prompt):
+            self.assertIn('x = 2', prompt)   # the committed change is in the reviewed diff
+            return findings_line() + '\nVERDICT: APPROVE'
+        approved, *_ = self.run_loop([('claude', review)], base=base)
+        self.assertTrue(approved)
 
     def test_markdown_verdict_is_accepted(self):
         approved, *_ = self.run_loop([
