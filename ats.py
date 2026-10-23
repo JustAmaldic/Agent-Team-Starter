@@ -279,6 +279,7 @@ def record(kind, summary, task=None, **fields):
 
 KNOWLEDGE_KINDS = {'finding', 'feedback', 'lesson', 'rule', 'decision', 'pattern'}
 CONFIDENCE_LEVELS = ('low', 'medium', 'high')
+KNOWLEDGE_PRIORITY = {'rule': 0, 'decision': 1, 'lesson': 2, 'pattern': 3, 'feedback': 4, 'finding': 5}
 
 
 def learn(kind, title, observation, evidence, task_id=None, confidence='medium', created_by='human'):
@@ -326,7 +327,9 @@ def knowledge_context(limit=12):
                     records.append(item)
             except (ValueError, OSError):
                 continue
+    # Human rules and decisions first, review findings last; newest first within a kind.
     records.sort(key=lambda item: item.get('created_at', ''), reverse=True)
+    records.sort(key=lambda item: KNOWLEDGE_PRIORITY.get(item.get('kind'), len(KNOWLEDGE_PRIORITY)))
     selected = records[:limit]
     if not selected:
         return ''

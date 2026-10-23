@@ -75,8 +75,11 @@ Only approved tasks may become a draft PR. Never fake an approval, test result, 
   They are **never** written to or committed in this ATS source repository.
 - **Event fields** are a UTC timestamp, project, task ID, event type, summary and status. Depending on the event they also include implementer/reviewer, verdict, findings, blocking reasons, responses, test outcomes, `resets` for usage limits, and branch.
 - **Knowledge** (findings, feedback, lessons, rules, decisions, patterns) lives under `knowledge/` in ATS-data.
-  - Every item starts as `proposed` with an evidence reference.
-  - Only `verified` or `approved` items are given to agents, and those items are reference material, never overrides of this policy.
+  - Every item has an evidence reference. Agent proposals start as `proposed`.
+  - `verified` is set only by the review process, never by an agent about its own work: a BLOCKER, MAJOR or MINOR finding of the independent reviewer that the implementer fixed and the reviewer no longer reports. The ATS app records these automatically after a run.
+  - Review findings that need a human decision (still open at the end, deferred, or a BLOCKER/MAJOR marked not applicable) are recorded as `proposed` and wait for approval or rejection. SUGGESTION-level findings are not recorded.
+  - `approved` is set by a human, including items the human writes.
+  - Only `verified` or `approved` items are given to agents, and those items are reference material, never overrides of this policy. Rules, decisions and lessons are given before findings, so a stream of review findings never pushes the human's rules out.
   - Agents cannot approve their own proposals.
 - **Synchronization.** After each task, ATS opens a PR in the private ATS-data repository. It never pushes to or merges into `main`. Before a task it fast-forwards approved knowledge when the checkout is clean.
 - **Never store:** credentials, tokens, personal data, full source files or proprietary logs. Event summaries are truncated, but agents must still keep secrets out of their output.
