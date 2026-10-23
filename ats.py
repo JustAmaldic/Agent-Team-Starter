@@ -111,8 +111,68 @@ def validate_private_remote(root):
     return gh
 
 
+DATA_LOCK_WAIT = 180          # seconds a task waits for another task's ATS-data sync
+DATA_LOCK_STALE = 15 * 60     # an ATS lock (or git index.lock) this old belongs to a process that died
+
+
+class data_repo_lock:
+    """One ATS process at a time in the shared ATS-data checkout.
+
+    Parallel tasks (the ATS app runs up to max_parallel) all write events and then sync the same
+    ~/.ats-data; without this they collide on git's index.lock ("Another git process seems to be
+    running"). A git index.lock left by a crashed git is removed only when it is old and we hold
+    the ATS lock, so no ATS git can be using it.
+    """
+
+    def __init__(self, root):
+        git_dir = Path(root) / '.git'
+        usable = git_dir.is_dir()   # a .git file (worktree) or no clone: nothing shared to protect
+        self.path = git_dir / 'ats-sync.lock' if usable else None
+        self.index_lock = git_dir / 'index.lock'
+
+    def __enter__(self):
+        if self.path is None:
+            return self
+        deadline = time.time() + DATA_LOCK_WAIT
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - self.path.stat().st_mtime > DATA_LOCK_STALE:
+                        self.path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    continue
+                if time.time() > deadline:
+                    raise RuntimeError('ATS-data is busy with another task (lock ' + str(self.path) + ').')
+                time.sleep(1)
+        try:
+            if time.time() - self.index_lock.stat().st_mtime > DATA_LOCK_STALE:
+                self.index_lock.unlink()
+                print('ATS: removed a stale git index.lock in ATS-data.', file=sys.stderr)
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.path is not None:
+            self.path.unlink(missing_ok=True)
+        return False
+
+
 def sync_private_data():
     """Publish private events in a PR; keep main clean and require human merge."""
+    if PRIVATE_DATA_REPO is None:
+        raise RuntimeError('Clone your private ATS data repository into ~/.ats-data or set ATS_DATA_REPO.')
+    with data_repo_lock(PRIVATE_DATA_REPO):
+        return _sync_private_data()
+
+
+def _sync_private_data():
     if PRIVATE_DATA_REPO is None:
         raise RuntimeError('Clone your private ATS data repository into ~/.ats-data or set ATS_DATA_REPO.')
     root = PRIVATE_DATA_REPO
@@ -163,6 +223,11 @@ def refresh_private_knowledge():
     """Pull approved knowledge before a task, but never overwrite pending local events."""
     if PRIVATE_DATA_REPO is None:
         return
+    with data_repo_lock(PRIVATE_DATA_REPO):
+        _refresh_private_knowledge()
+
+
+def _refresh_private_knowledge():
     root = PRIVATE_DATA_REPO
     validate_private_remote(root)
     branch = execute(['git', 'branch', '--show-current'], root).stdout.strip()
@@ -962,7 +1027,7 @@ def revision_prompt(task, review, findings):
 
 
 def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
-                base_tree='HEAD', subtask=None):
+                base='HEAD', subtask=None):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
 
     Returns (approved, reviewer, implementer, history).
@@ -977,7 +1042,9 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         phase('checks', task_id, **context, cycle=cycle)
         checks = run_checks(conf, folder)
         execute(['git', 'add', '-A'], folder)
-        diff = execute(['git', 'diff', '--cached', base_tree], folder).stdout
+        # Against the commit (or, for a subtask, the tree) the work started from, not HEAD: an agent
+        # that runs `git commit` itself would otherwise make its own work invisible.
+        diff = execute(['git', 'diff', '--cached', base], folder).stdout
         if not diff.strip():
             record('blocked', 'Agent made no changes; worktree preserved for diagnosis', task_id, **context,
                    implementer=implementer, branch=branch)
@@ -1059,12 +1126,30 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
 SUBTASK_EXAMPLE = ["first bounded implementation with tests", "next bounded implementation with tests"]
 
 
+def valid_plan(plan):
+    return (isinstance(plan, list) and 2 <= len(plan) <= 20
+            and all(isinstance(p, str) and p.strip() and not is_placeholder(p) and p not in SUBTASK_EXAMPLE
+                    for p in plan))
+
+
+def subtask_plan(output):
+    """The plan from an ATS_SUBTASKS_JSON line, or None when the agent implemented directly.
+
+    A marker with an unusable plan is an error: the agent chose to split but gave no real parts.
+    """
+    lines = re.findall(r'^\s*ATS_SUBTASKS_JSON:[^\r\n]*$', output, re.MULTILINE)
+    if not lines:
+        return None
+    plan = parse_marked_json(lines[-1], 'ATS_SUBTASKS_JSON')
+    if not valid_plan(plan):
+        raise RuntimeError('Invalid task plan: expected 2 to 20 concrete subtask strings')
+    return [p.strip() for p in plan]
+
+
 def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, conf,
                  quiet=False):
     """Alternate authors, handing each bounded change to the other agent for review."""
-    if (not isinstance(plan, list) or not 2 <= len(plan) <= 20
-            or any(not isinstance(p, str) or not p.strip() or is_placeholder(p)
-                   or p in SUBTASK_EXAMPLE for p in plan)):
+    if not valid_plan(plan):
         raise RuntimeError('Task plan must contain 2 to 20 non-empty subtask strings')
     history = []
     reviewer = None
@@ -1077,13 +1162,20 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             return False, reviewer, implementer, history
         base = index_tree(folder)
         description = f'{task}\nSubtask {number}/{len(plan)}: {part}'
+        # The reviewer sees only this part's diff; with the plan it does not flag work that belongs
+        # to a later part as missing.
+        review_task = (description + '\nFull plan (review ONLY this part; later parts follow in '
+                       'separate reviews): ' + json.dumps(plan, ensure_ascii=False))
         phase('implementation', task_id, implementer=implementer, subtask=number)
         prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. '
                   f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
                   f'Implement ONLY this next part: {description}\n'
                   'Earlier parts have passed independent review. Preserve them. Add tests. '
-                  'Do not commit, push, merge, deploy, trade, expose secrets or modify .ats.'
-                  + knowledge_context())
+                  'Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; '
+                  'ATS commits the work after the last review.'
+                  + knowledge_context()
+                  + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
+                  + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
         try:
             author, output = invoke_with_fallback(implementer, prompt, folder, unavailable,
                                                   task_id, 'implementation', quiet=quiet, fallback=False)
@@ -1094,9 +1186,14 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             return False, reviewer, implementer, history
         record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
         capture_learning_proposals(output, task_id)
-        approved, reviewer, author, cycles = review_loop(
-            description, task_id, folder, branch, author, unavailable, conf,
-            quiet=quiet, base_tree=base, subtask=number)
+        try:
+            approved, reviewer, author, cycles = review_loop(
+                review_task, task_id, folder, branch, author, unavailable, conf,
+                quiet=quiet, base=base, subtask=number)
+        except RuntimeError as exc:   # e.g. the part produced no changes
+            record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
+                   blocking_reasons=[f'subtask {number}: {exc}'])
+            return False, reviewer, author, history
         for cycle in cycles:
             cycle['subtask'] = number
             cycle['implementer'] = author
@@ -1147,6 +1244,7 @@ def task_flow(task, agent, push, quiet=False):
         else:
             execute(['git','worktree','add','-b',branch,str(folder),'HEAD'])
         worktree_created=True
+        base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
         prompt = (f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'}. Task: {task}. "
                   "Assess task size before editing. If it is too large for one complete review "
@@ -1158,7 +1256,8 @@ def task_flow(task, agent, push, quiet=False):
                   "each part must be independently testable and reviewable. "
                   "For a small task implement it normally without that marker. "
                   "Change only necessary application files and add tests. "
-                  "Do not commit, push, merge, deploy, trade, expose secrets or modify .ats."
+                  "Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; "
+                  "ATS commits your work after the review."
                   + knowledge_context()
                   + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: '
                   + '[{"kind":"finding","title":"<title>","observation":"<observation>",'
@@ -1168,23 +1267,21 @@ def task_flow(task, agent, push, quiet=False):
         implementer,result=invoke_with_fallback(agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
         record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
         capture_learning_proposals(result,task_id)
-        cleaned = result.replace(prompt, '')
-        marker_lines = re.findall(r'^\s*ATS_SUBTASKS_JSON:[^\r\n]*$', cleaned, re.MULTILINE)
-        if marker_lines:
-            plan = parse_marked_json(marker_lines[-1], 'ATS_SUBTASKS_JSON')
-            if (not 2 <= len(plan) <= 20
-                    or any(not isinstance(p, str) or not p.strip() or is_placeholder(p)
-                           or p in SUBTASK_EXAMPLE for p in plan)):
-                raise RuntimeError('Invalid task plan: expected 2 to 20 concrete subtask strings')
+        plan = subtask_plan(result.replace(prompt, ''))
+        if plan is not None:
             if index_tree(folder) != initial_tree:
                 raise RuntimeError('Task planning modified files; worktree retained for diagnosis')
             record('task_split', 'Task divided into reviewable parts', task_id, subtasks=plan)
             approved,reviewer,implementer,history=subtask_flow(
                 task,plan,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet)
         else:
-            approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet)
+            approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
+                                                               base=base_commit)
         execute(['git','add','-A'],folder)
-        if local_mode:
+        staged = execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
+        if not staged:
+            pass   # the agent already committed everything itself; nothing left to commit
+        elif local_mode:
             execute(['git', '-c', 'user.name=ATS', '-c', 'user.email=ats@localhost',
                      'commit', '-m', 'ATS: '+task[:65]], folder)
         else:
@@ -1205,9 +1302,13 @@ def task_flow(task, agent, push, quiet=False):
         if not approved:
             print('Independent review/checks incomplete: PR publishing blocked; worktree preserved')
             return
-        attribution = '\n'.join(
-            f"Part {c['subtask']}: implementer {c['implementer']}, reviewer {c['reviewer']}"
-            for c in history if 'subtask' in c)
+        parts = {}
+        for c in history:   # the approving (last) cycle of every part
+            if 'subtask' in c:
+                parts[c['subtask']] = f"Part {c['subtask']}: implementer {c['implementer']}, reviewer {c['reviewer']}"
+        attribution = ('\n'.join(parts[n] for n in sorted(parts))
+                       + '\nEvery part was reviewed on its own diff; the combined change was not reviewed as a whole.'
+                       if parts else '')
         if push:
             phase('pr', task_id, branch=branch)
             execute(['git','push','-u','origin',branch],folder)
