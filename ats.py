@@ -463,9 +463,19 @@ def sandbox_blocked(output):
     return any(re.search(pattern, output, re.IGNORECASE) for pattern in SANDBOX_PATTERNS)
 
 
-def codex_exec_command(prompt):
-    """Use Codex's approval-aware workspace sandbox, including on Windows."""
-    return agent_command('codex', 'exec', '--approve-for-me', prompt)
+def codex_exec_command():
+    """Use Codex's approval-aware workspace sandbox, including on Windows.
+
+    The prompt goes through stdin ('-'), never as an argument: on Windows codex/claude are .cmd
+    shims run by cmd.exe, which caps the command line at 8191 characters (a review prompt with a
+    diff is far longer: "The command line is too long") and mangles newlines and quotes.
+    """
+    return agent_command('codex', 'exec', '--approve-for-me', '-')
+
+
+def claude_print_command():
+    """Claude Code in print mode; without a prompt argument it reads the prompt from stdin."""
+    return agent_command('claude', '-p', '--permission-mode', 'acceptEdits')
 
 
 def codex_preflight(cwd, quiet=False):
@@ -478,8 +488,8 @@ def codex_preflight(cwd, quiet=False):
               'Do not modify any other files. Reply briefly when finished.')
     try:
         result = stream_command(
-            codex_exec_command(prompt),
-            cwd, timeout=120, quiet=quiet)
+            codex_exec_command(),
+            cwd, timeout=120, quiet=quiet, stdin_text=prompt)
         output = (result.stdout or '') + '\n' + (result.stderr or '')
         if result.returncode or not probe.exists() or probe.read_text(encoding='utf-8').strip() != marker:
             if is_usage_exhausted(output):
@@ -667,10 +677,14 @@ def install_agents():
     print('Both agents installed and authenticated.', flush=True)
 
 
-def stream_command(command, cwd, timeout=1800, quiet=False):
-    """Stream both process pipes while retaining full output for ATS checks."""
+def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None):
+    """Stream both process pipes while retaining full output for ATS checks.
+
+    `stdin_text` (the agent prompt) is written to the process's stdin and then closed.
+    """
     process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True,
+                               stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                                encoding='utf-8', errors='replace', bufsize=1)
     chunks = {'stdout': [], 'stderr': []}
     def reader(pipe, key, target):
@@ -686,6 +700,18 @@ def stream_command(command, cwd, timeout=1800, quiet=False):
         threading.Thread(target=reader, args=(process.stdout, 'stdout', sys.stdout), daemon=True),
         threading.Thread(target=reader, args=(process.stderr, 'stderr', sys.stderr), daemon=True),
     ]
+    if stdin_text is not None:
+        def feed():
+            try:
+                process.stdin.write(stdin_text)
+            except (BrokenPipeError, OSError, ValueError):
+                pass   # the process ended early; its exit code tells what happened
+            finally:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+        threads.append(threading.Thread(target=feed, daemon=True))
     for thread in threads:
         thread.start()
     try:
@@ -702,13 +728,13 @@ def stream_command(command, cwd, timeout=1800, quiet=False):
 
 
 def invoke(agent, prompt, cwd, quiet=False, backoff=None):
-    command = codex_exec_command(prompt) if agent == 'codex' else agent_command('claude', '-p', '--permission-mode', 'acceptEdits', prompt)
+    command = codex_exec_command() if agent == 'codex' else claude_print_command()
     if not executable(agent):
         raise RuntimeError(f'{agent} executable missing; run .ats install')
     delays = RATE_LIMIT_BACKOFF if backoff is None else backoff
     attempt = 0
     while True:
-        p = stream_command(command, cwd, timeout=1800, quiet=quiet)
+        p = stream_command(command, cwd, timeout=1800, quiet=quiet, stdin_text=prompt)
         out = (p.stdout or '')+'\n'+(p.stderr or '')
         if p.returncode and is_transient_rate_limit(out) and attempt < len(delays):
             print(f'ATS: {agent} is rate limited; retrying in {delays[attempt]}s '

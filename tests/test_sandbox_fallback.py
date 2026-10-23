@@ -13,15 +13,15 @@ class SandboxFallbackTests(unittest.TestCase):
     def test_codex_command_uses_approval_aware_sandbox(self):
         with patch.object(ats, 'agent_command', side_effect=lambda *args: list(args)):
             self.assertEqual(
-                ats.codex_exec_command('hello'),
-                ['codex', 'exec', '--approve-for-me', 'hello'])
+                ats.codex_exec_command(),
+                ['codex', 'exec', '--approve-for-me', '-'])
             self.assertNotIn('--dangerously-bypass-approvals-and-sandbox',
-                             ats.codex_exec_command('hello'))
+                             ats.codex_exec_command())
 
     def test_preflight_uses_same_command_as_implementation(self):
         with tempfile.TemporaryDirectory() as folder:
             seen = []
-            def fake_stream(command, cwd, timeout, quiet):
+            def fake_stream(command, cwd, timeout, quiet, stdin_text=None):
                 seen.append(command)
                 (pathlib.Path(cwd) / '.ats-codex-preflight').write_text('ATS_PREFLIGHT_OK')
                 return subprocess.CompletedProcess(command, 0, 'done', '')
@@ -31,7 +31,7 @@ class SandboxFallbackTests(unittest.TestCase):
                 ats.codex_preflight(folder, quiet=True)
                 ats.invoke('codex', 'implement task', folder, quiet=True)
             self.assertEqual(seen[0][:3], ['codex', 'exec', '--approve-for-me'])
-            self.assertEqual(seen[1], ['codex', 'exec', '--approve-for-me', 'implement task'])
+            self.assertEqual(seen[1], ['codex', 'exec', '--approve-for-me', '-'])
 
     def test_detects_windows_policy_block(self):
         self.assertTrue(ats.sandbox_blocked('CreateProcess rejected: blocked by policy'))
@@ -48,7 +48,7 @@ class SandboxFallbackTests(unittest.TestCase):
 
     def test_preflight_accepts_verified_write(self):
         with tempfile.TemporaryDirectory() as folder:
-            def fake_stream(command, cwd, timeout, quiet):
+            def fake_stream(command, cwd, timeout, quiet, stdin_text=None):
                 (pathlib.Path(cwd) / '.ats-codex-preflight').write_text('ATS_PREFLIGHT_OK')
                 return subprocess.CompletedProcess(command, 0, 'done', '')
             with patch.object(ats, 'stream_command', side_effect=fake_stream):
