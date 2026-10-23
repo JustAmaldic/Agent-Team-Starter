@@ -52,6 +52,13 @@ Inspect the actual diff and test results yourself. Do not rely on the implemente
 - The reviewer re-reviews the revision and receives the previous findings and answers. A finding stays open (same id) until it is really resolved.
 - The number of cycles is limited by `max_revisions`. After that the task is **escalated** to the user with the blocking reasons.
 
+## Large tasks (split into parts)
+
+- If a task is too large for one complete review (above `max_review_diff_chars`), the implementer changes no files and returns `ATS_SUBTASKS_JSON: [...]`: 2 to 20 concrete, ordered parts that each can be tested and reviewed on their own.
+- The agents alternate: the implementer builds part 1 and the other agent reviews only that part's diff; the reviewer of a part implements the next one. Both agents are required; without both the task escalates.
+- A part that is not approved stops the task; later parts are not started. Every part passes the same approval gate, and the tests run on the combined code after every part.
+- The pull request lists who implemented and reviewed each part and states that the combined change was not reviewed as a whole.
+
 ## Approval gate (enforced)
 
 A task is approved only when **all** of these hold:

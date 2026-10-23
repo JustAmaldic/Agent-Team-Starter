@@ -1016,7 +1016,7 @@ def review_prompt(task, checks, diff, history):
 
 
 def revision_prompt(task, review, findings):
-    return (f"Revise your implementation for task {task!r}. Never push, merge, deploy or modify .ats.\n"
+    return (f"Revise your implementation for task {task!r}. Never commit, push, merge, deploy or modify .ats.\n"
             "Address the review below. Answer EVERY finding with status fixed (with test/file "
             "evidence), not_applicable (with evidence why) or deferred (with an issue/reference). "
             "Deferred BLOCKERs and unanswered BLOCKER/MAJOR findings prevent approval.\n"
@@ -1026,57 +1026,59 @@ def revision_prompt(task, review, findings):
             '\nReview:\n' + review[-12000:])
 
 
-def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False, base='HEAD'):
+def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
+                base='HEAD', subtask=None):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
 
     Returns (approved, reviewer, implementer, history).
     """
+    context = {'subtask': subtask} if subtask is not None else {}
     max_revisions = int(conf.get('max_revisions', 2))
     max_chars = int(conf.get('max_review_diff_chars', 150000))
     history = []
     reviewer = None
     reasons = ['not reviewed']
     for cycle in range(max_revisions + 1):
-        phase('checks', task_id, cycle=cycle)
+        phase('checks', task_id, **context, cycle=cycle)
         checks = run_checks(conf, folder)
         execute(['git', 'add', '-A'], folder)
-        # Against the commit the worktree started from, not HEAD: an agent that runs `git commit`
-        # itself would otherwise make its own work invisible ("Agent made no changes").
+        # Against the commit (or, for a subtask, the tree) the work started from, not HEAD: an agent
+        # that runs `git commit` itself would otherwise make its own work invisible.
         diff = execute(['git', 'diff', '--cached', base], folder).stdout
         if not diff.strip():
-            record('blocked', 'Agent made no changes; worktree preserved for diagnosis', task_id,
+            record('blocked', 'Agent made no changes; worktree preserved for diagnosis', task_id, **context,
                    implementer=implementer, branch=branch)
             raise RuntimeError('Agent made no changes; worktree preserved for diagnosis: ' + str(folder))
         preferred = 'claude' if implementer == 'codex' else 'codex'
         if preferred in unavailable:
             message = f'Independent review unavailable: {preferred} is not available ({unavailable_reason(unavailable, preferred)})'
             print(message, file=sys.stderr)
-            record('review_skipped', message, task_id, implementer=implementer, reviewer=preferred)
+            record('review_skipped', message, task_id, **context, implementer=implementer, reviewer=preferred)
             reasons = ['no independent reviewer available']
             break
         if len(diff) > max_chars:
             message = (f'Diff is {len(diff)} characters, above max_review_diff_chars={max_chars}; '
                        'refusing to review a truncated diff. Split the task or raise the limit.')
             print('ATS: ' + message, file=sys.stderr)
-            record('review_skipped', message, task_id, implementer=implementer, reviewer=preferred)
+            record('review_skipped', message, task_id, **context, implementer=implementer, reviewer=preferred)
             reasons = ['diff too large to review completely']
             break
         tree = index_tree(folder)
-        phase('review', task_id, cycle=cycle, reviewer=preferred, implementer=implementer)
+        phase('review', task_id, **context, cycle=cycle, reviewer=preferred, implementer=implementer)
         try:
             reviewer, review = invoke_with_fallback(preferred, review_prompt(task, checks, diff, history),
                                                     folder, unavailable, task_id, 'review',
                                                     quiet=quiet, fallback=False)
         except AgentUsageExhausted as exc:
             print(str(exc) + ': independent review skipped', file=sys.stderr)
-            record('review_skipped', str(exc), task_id, implementer=implementer,
+            record('review_skipped', str(exc), task_id, **context, implementer=implementer,
                    reviewer=preferred, resets=exc.resets)
             reasons = ['reviewer usage exhausted']
             break
         except RuntimeError as exc:
             restore_if_changed(folder, tree)
             print(f'ATS: review by {preferred} failed: {exc}', file=sys.stderr)
-            record('review_skipped', str(exc)[:1200], task_id, implementer=implementer, reviewer=preferred)
+            record('review_skipped', str(exc)[:1200], task_id, **context, implementer=implementer, reviewer=preferred)
             reasons = ['review failed']
             break
         tampered = restore_if_changed(folder, tree)
@@ -1089,36 +1091,122 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                                     conf, tampered=bool(tampered))
         approved = not reasons
         capture_learning_proposals(review, task_id)
-        record('review_result', review[-8000:], task_id, implementer=implementer, reviewer=reviewer,
+        record('review_result', review[-8000:], task_id, **context, implementer=implementer, reviewer=reviewer,
                approved=approved, verdict=verdict, findings=findings, blocking_reasons=reasons,
                tampered_paths=tampered, tests=checks, cycle=cycle, branch=branch)
         history.append({'cycle': cycle, 'reviewer': reviewer, 'findings': findings, 'responses': []})
         if approved:
-            phase('approved', task_id, cycle=cycle)
+            phase('approved', task_id, **context, cycle=cycle)
             return True, reviewer, implementer, history
         if cycle == max_revisions:
             break
-        phase('revision', task_id, cycle=cycle, implementer=implementer)
+        phase('revision', task_id, **context, cycle=cycle, implementer=implementer)
         try:
             implementer, response = invoke_with_fallback(implementer, revision_prompt(task, review, findings),
                                                          folder, unavailable, task_id, 'revision', quiet=quiet)
         except AgentUsageExhausted as exc:
             print(str(exc), file=sys.stderr)
-            record('blocked', str(exc), task_id, phase='revision', resets=exc.resets)
+            record('blocked', str(exc), task_id, **context, phase='revision', resets=exc.resets)
             reasons = ['revision impossible: ' + str(exc)]
             break
         responses = normalize_responses(parse_marked_json(response, 'ATS_RESPONSES_JSON'))
         history[-1]['responses'] = responses
         answered = {r['id'] for r in responses}
         missing = [f['id'] for f in findings if f['id'] not in answered]
-        record('feedback_response', response[-2000:], task_id, implementer=implementer, cycle=cycle,
+        record('feedback_response', response[-2000:], task_id, **context, implementer=implementer, cycle=cycle,
                responses=responses, unanswered=missing)
         capture_learning_proposals(response, task_id)
     summary = 'Not approved; needs a human decision: ' + '; '.join(reasons)
     print('ATS: ' + summary, file=sys.stderr)
-    record('escalated', summary, task_id, implementer=implementer, reviewer=reviewer,
+    record('escalated', summary, task_id, **context, implementer=implementer, reviewer=reviewer,
            blocking_reasons=reasons, cycles=len(history), branch=branch)
     return False, reviewer, implementer, history
+
+
+SUBTASK_EXAMPLE = ["first bounded implementation with tests", "next bounded implementation with tests"]
+
+
+def valid_plan(plan):
+    return (isinstance(plan, list) and 2 <= len(plan) <= 20
+            and all(isinstance(p, str) and p.strip() and not is_placeholder(p) and p not in SUBTASK_EXAMPLE
+                    for p in plan))
+
+
+def subtask_plan(output):
+    """The plan from an ATS_SUBTASKS_JSON line, or None when the agent implemented directly.
+
+    A marker with an unusable plan is an error: the agent chose to split but gave no real parts.
+    """
+    lines = re.findall(r'^\s*ATS_SUBTASKS_JSON:[^\r\n]*$', output, re.MULTILINE)
+    if not lines:
+        return None
+    plan = parse_marked_json(lines[-1], 'ATS_SUBTASKS_JSON')
+    if not valid_plan(plan):
+        raise RuntimeError('Invalid task plan: expected 2 to 20 concrete subtask strings')
+    return [p.strip() for p in plan]
+
+
+def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, conf,
+                 quiet=False):
+    """Alternate authors, handing each bounded change to the other agent for review."""
+    if not valid_plan(plan):
+        raise RuntimeError('Task plan must contain 2 to 20 non-empty subtask strings')
+    history = []
+    reviewer = None
+    attribution = []
+    for number, part in enumerate(plan, 1):
+        other = 'claude' if implementer == 'codex' else 'codex'
+        if implementer in unavailable or other in unavailable:
+            record('escalated', 'Both agents are required for subtask handoffs', task_id,
+                   subtask=number, branch=branch)
+            return False, reviewer, implementer, history
+        base = index_tree(folder)
+        description = f'{task}\nSubtask {number}/{len(plan)}: {part}'
+        # The reviewer sees only this part's diff; with the plan it does not flag work that belongs
+        # to a later part as missing.
+        review_task = (description + '\nFull plan (review ONLY this part; later parts follow in '
+                       'separate reviews): ' + json.dumps(plan, ensure_ascii=False))
+        phase('implementation', task_id, implementer=implementer, subtask=number)
+        prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. '
+                  f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
+                  f'Implement ONLY this next part: {description}\n'
+                  'Earlier parts have passed independent review. Preserve them. Add tests. '
+                  'Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; '
+                  'ATS commits the work after the last review.'
+                  + knowledge_context()
+                  + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
+                  + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
+        try:
+            author, output = invoke_with_fallback(implementer, prompt, folder, unavailable,
+                                                  task_id, 'implementation', quiet=quiet, fallback=False)
+        except (AgentUsageExhausted, RuntimeError) as exc:
+            record('escalated', str(exc), task_id, subtask=number,
+                   implementer=implementer, branch=branch,
+                   blocking_reasons=[str(exc)])
+            return False, reviewer, implementer, history
+        record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
+        capture_learning_proposals(output, task_id)
+        try:
+            approved, reviewer, author, cycles = review_loop(
+                review_task, task_id, folder, branch, author, unavailable, conf,
+                quiet=quiet, base=base, subtask=number)
+        except RuntimeError as exc:   # e.g. the part produced no changes
+            record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
+                   blocking_reasons=[f'subtask {number}: {exc}'])
+            return False, reviewer, author, history
+        for cycle in cycles:
+            cycle['subtask'] = number
+            cycle['implementer'] = author
+        history.extend(cycles)
+        if not approved:
+            return False, reviewer, author, history
+        record('subtask_completed', part, task_id, subtask=number, implementer=author,
+               reviewer=reviewer, branch=branch)
+        attribution.append(dict(subtask=number, implementer=author, reviewer=reviewer))
+        implementer = reviewer
+    record('subtasks_completed', 'All parts independently reviewed; combined diff has not been reviewed',
+           task_id, parts=attribution, branch=branch, combined_review=False)
+    return True, reviewer, author, history
 
 
 def preset_task_id():
@@ -1159,6 +1247,14 @@ def task_flow(task, agent, push, quiet=False):
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
         prompt = (f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'}. Task: {task}. "
+                  "Assess task size before editing. If it is too large for one complete review "
+                  f"(maximum diff {conf.get('max_review_diff_chars', 150000)} characters), "
+                  "make NO file changes and return ONE LINE ATS_SUBTASKS_JSON: "
+                  '["first bounded implementation with tests", "next bounded implementation with tests"]. '
+                  "Use 2 to 20 concrete ordered parts that together complete the task. "
+                  "The two agents will alternate implementing and reviewing each part; "
+                  "each part must be independently testable and reviewable. "
+                  "For a small task implement it normally without that marker. "
                   "Change only necessary application files and add tests. "
                   "Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; "
                   "ATS commits your work after the review."
@@ -1167,11 +1263,20 @@ def task_flow(task, agent, push, quiet=False):
                   + '[{"kind":"finding","title":"<title>","observation":"<observation>",'
                   + '"evidence":"<evidence>"}] (replace the placeholders, or use []). '
                   + 'Only evidence-backed items, no secrets; proposals are not approved rules.')
+        initial_tree = index_tree(folder)
         implementer,result=invoke_with_fallback(agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
         record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
         capture_learning_proposals(result,task_id)
-        approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
-                                                           base=base_commit)
+        plan = subtask_plan(result.replace(prompt, ''))
+        if plan is not None:
+            if index_tree(folder) != initial_tree:
+                raise RuntimeError('Task planning modified files; worktree retained for diagnosis')
+            record('task_split', 'Task divided into reviewable parts', task_id, subtasks=plan)
+            approved,reviewer,implementer,history=subtask_flow(
+                task,plan,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet)
+        else:
+            approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
+                                                               base=base_commit)
         execute(['git','add','-A'],folder)
         staged = execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
         if not staged:
@@ -1197,6 +1302,13 @@ def task_flow(task, agent, push, quiet=False):
         if not approved:
             print('Independent review/checks incomplete: PR publishing blocked; worktree preserved')
             return
+        parts = {}
+        for c in history:   # the approving (last) cycle of every part
+            if 'subtask' in c:
+                parts[c['subtask']] = f"Part {c['subtask']}: implementer {c['implementer']}, reviewer {c['reviewer']}"
+        attribution = ('\n'.join(parts[n] for n in sorted(parts))
+                       + '\nEvery part was reviewed on its own diff; the combined change was not reviewed as a whole.'
+                       if parts else '')
         if push:
             phase('pr', task_id, branch=branch)
             execute(['git','push','-u','origin',branch],folder)
@@ -1204,7 +1316,7 @@ def task_flow(task, agent, push, quiet=False):
                 print('gh missing: branch pushed but draft PR must be created manually');return
             base=conf.get('base_branch','main')
             outcome=execute(['gh','pr','create','--draft','--base',base,'--head',branch,'--title','ATS: '+task[:65],
-                             '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\nReview/check outcomes in ATS data. Human merge required.'],folder)
+                             '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n{attribution}\nReview/check outcomes in ATS data. Human merge required.'],folder)
             print(outcome.stdout)
             phase('pr_created', task_id, url=outcome.stdout.strip()[-300:])
     except AgentUsageExhausted as exc:
