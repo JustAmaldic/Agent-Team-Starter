@@ -111,8 +111,68 @@ def validate_private_remote(root):
     return gh
 
 
+DATA_LOCK_WAIT = 180          # seconds a task waits for another task's ATS-data sync
+DATA_LOCK_STALE = 15 * 60     # an ATS lock (or git index.lock) this old belongs to a process that died
+
+
+class data_repo_lock:
+    """One ATS process at a time in the shared ATS-data checkout.
+
+    Parallel tasks (the ATS app runs up to max_parallel) all write events and then sync the same
+    ~/.ats-data; without this they collide on git's index.lock ("Another git process seems to be
+    running"). A git index.lock left by a crashed git is removed only when it is old and we hold
+    the ATS lock, so no ATS git can be using it.
+    """
+
+    def __init__(self, root):
+        git_dir = Path(root) / '.git'
+        usable = git_dir.is_dir()   # a .git file (worktree) or no clone: nothing shared to protect
+        self.path = git_dir / 'ats-sync.lock' if usable else None
+        self.index_lock = git_dir / 'index.lock'
+
+    def __enter__(self):
+        if self.path is None:
+            return self
+        deadline = time.time() + DATA_LOCK_WAIT
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - self.path.stat().st_mtime > DATA_LOCK_STALE:
+                        self.path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    continue
+                if time.time() > deadline:
+                    raise RuntimeError('ATS-data is busy with another task (lock ' + str(self.path) + ').')
+                time.sleep(1)
+        try:
+            if time.time() - self.index_lock.stat().st_mtime > DATA_LOCK_STALE:
+                self.index_lock.unlink()
+                print('ATS: removed a stale git index.lock in ATS-data.', file=sys.stderr)
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.path is not None:
+            self.path.unlink(missing_ok=True)
+        return False
+
+
 def sync_private_data():
     """Publish private events in a PR; keep main clean and require human merge."""
+    if PRIVATE_DATA_REPO is None:
+        raise RuntimeError('Clone your private ATS data repository into ~/.ats-data or set ATS_DATA_REPO.')
+    with data_repo_lock(PRIVATE_DATA_REPO):
+        return _sync_private_data()
+
+
+def _sync_private_data():
     if PRIVATE_DATA_REPO is None:
         raise RuntimeError('Clone your private ATS data repository into ~/.ats-data or set ATS_DATA_REPO.')
     root = PRIVATE_DATA_REPO
@@ -163,6 +223,11 @@ def refresh_private_knowledge():
     """Pull approved knowledge before a task, but never overwrite pending local events."""
     if PRIVATE_DATA_REPO is None:
         return
+    with data_repo_lock(PRIVATE_DATA_REPO):
+        _refresh_private_knowledge()
+
+
+def _refresh_private_knowledge():
     root = PRIVATE_DATA_REPO
     validate_private_remote(root)
     branch = execute(['git', 'branch', '--show-current'], root).stdout.strip()
@@ -961,7 +1026,7 @@ def revision_prompt(task, review, findings):
             '\nReview:\n' + review[-12000:])
 
 
-def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False):
+def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False, base='HEAD'):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
 
     Returns (approved, reviewer, implementer, history).
@@ -975,7 +1040,9 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         phase('checks', task_id, cycle=cycle)
         checks = run_checks(conf, folder)
         execute(['git', 'add', '-A'], folder)
-        diff = execute(['git', 'diff', '--cached', 'HEAD'], folder).stdout
+        # Against the commit the worktree started from, not HEAD: an agent that runs `git commit`
+        # itself would otherwise make its own work invisible ("Agent made no changes").
+        diff = execute(['git', 'diff', '--cached', base], folder).stdout
         if not diff.strip():
             record('blocked', 'Agent made no changes; worktree preserved for diagnosis', task_id,
                    implementer=implementer, branch=branch)
@@ -1089,10 +1156,12 @@ def task_flow(task, agent, push, quiet=False):
         else:
             execute(['git','worktree','add','-b',branch,str(folder),'HEAD'])
         worktree_created=True
+        base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
         prompt = (f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'}. Task: {task}. "
                   "Change only necessary application files and add tests. "
-                  "Do not push, merge, deploy, trade, expose secrets or modify .ats."
+                  "Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; "
+                  "ATS commits your work after the review."
                   + knowledge_context()
                   + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: '
                   + '[{"kind":"finding","title":"<title>","observation":"<observation>",'
@@ -1101,9 +1170,13 @@ def task_flow(task, agent, push, quiet=False):
         implementer,result=invoke_with_fallback(agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
         record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
         capture_learning_proposals(result,task_id)
-        approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet)
+        approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
+                                                           base=base_commit)
         execute(['git','add','-A'],folder)
-        if local_mode:
+        staged = execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
+        if not staged:
+            pass   # the agent already committed everything itself; nothing left to commit
+        elif local_mode:
             execute(['git', '-c', 'user.name=ATS', '-c', 'user.email=ats@localhost',
                      'commit', '-m', 'ATS: '+task[:65]], folder)
         else:

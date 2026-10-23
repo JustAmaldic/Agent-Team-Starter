@@ -106,5 +106,31 @@ class AutoPrivateSyncTests(unittest.TestCase):
             sync.assert_called_once_with()
 
 
+
+class DataRepoLockTests(unittest.TestCase):
+    def test_lock_serializes_and_clears_stale_locks(self):
+        import os
+        import time
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            (root / '.git').mkdir()
+            index_lock = root / '.git' / 'index.lock'
+            index_lock.write_text('')
+            old = time.time() - ats.DATA_LOCK_STALE - 60
+            os.utime(index_lock, (old, old))
+            with ats.data_repo_lock(root):
+                self.assertTrue((root / '.git' / 'ats-sync.lock').exists())
+                self.assertFalse(index_lock.exists())   # stale git lock removed
+                with patch.object(ats, 'DATA_LOCK_WAIT', 0), \
+                     self.assertRaisesRegex(RuntimeError, 'busy'):
+                    with ats.data_repo_lock(root):
+                        pass
+            self.assertFalse((root / '.git' / 'ats-sync.lock').exists())
+            fresh = root / '.git' / 'index.lock'
+            fresh.write_text('')
+            with ats.data_repo_lock(root):
+                self.assertTrue(fresh.exists())   # a recent git lock is left alone
+
+
 if __name__ == '__main__':
     unittest.main()
