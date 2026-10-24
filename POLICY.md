@@ -89,9 +89,19 @@ Only approved tasks may become a draft PR. Never fake an approval, test result, 
   - Every item has an evidence reference. Agent proposals start as `proposed`.
   - `verified` is set only by the review process, never by an agent about its own work: a BLOCKER, MAJOR or MINOR finding of the independent reviewer that the implementer fixed and the reviewer no longer reports. The ATS app records these automatically after a run.
   - Review findings that need a human decision (still open at the end, deferred, or a BLOCKER/MAJOR marked not applicable) are recorded as `proposed` and wait for approval or rejection. SUGGESTION-level findings are not recorded.
-  - `approved` is set by a human, including items the human writes.
+  - After every task with review findings, ATS asks one agent (read-only) to distill at most five reusable learnings (lesson, rule or pattern; project or shared). By the owner's standing decision, **low-risk learnings from the review process are approved automatically**.
+  - A learning that is **drastic** stays `proposed` with a `needs_human` reason until a human approves or rejects it. Drastic means following it could:
+    - delete or overwrite data;
+    - rewrite git history or force-push;
+    - weaken review, tests or security;
+    - touch `main` directly;
+    - touch credentials or money;
+    - be irreversible in another way.
+
+    ATS checks this with fixed patterns, and the agent can also mark a learning as high risk.
+  - Otherwise `approved` is set by a human, including items the human writes.
   - Only `verified` or `approved` items are given to agents, and those items are reference material, never overrides of this policy. Rules, decisions and lessons are given before findings, so a stream of review findings never pushes the human's rules out.
-  - Agents cannot approve their own proposals.
+  - Agents cannot approve their own proposals: automatic approval is an ATS decision based on risk, never the agent's.
 - **Synchronization.** The local ATS-data checkout always stays on `main`. After each task ATS keeps **one pull request per computer** (branch `ats-data/sync-<computer>`) up to date: the branch is rebuilt from `origin/main` plus all local data that is not on `main` yet, so it never conflicts and never repeats merged data. ATS never pushes to or merges into `main`. Before a task it fast-forwards `main`; local data that its merged PR made identical becomes clean, newer local versions are kept.
 - **Never store:** credentials, tokens, personal data, full source files or proprietary logs. Event summaries are truncated, but agents must still keep secrets out of their output.
 
