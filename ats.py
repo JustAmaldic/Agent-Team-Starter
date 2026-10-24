@@ -7,6 +7,8 @@ import os
 import re
 import shlex
 import shutil
+import tempfile
+import socket
 import fnmatch
 import hashlib
 import signal
@@ -172,72 +174,124 @@ def sync_private_data():
         return _sync_private_data()
 
 
+DATA_FOLDERS = ('data', 'knowledge')
+
+
+def data_sync_branch():
+    """One rolling sync branch (and PR) per computer, so syncs never pile up as conflicting PRs."""
+    host = re.sub(r'[^a-z0-9-]', '-', socket.gethostname().lower()).strip('-')[:40] or 'host'
+    return 'ats-data/sync-' + host
+
+
+def pending_data(root):
+    """{path: bytes or None (deleted)} for local data that is not on main yet."""
+    status = execute(['git', 'status', '--porcelain', '--untracked-files=all', '-z'], root).stdout
+    pending, entries = {}, status.split('\0')
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        code, path = entry[:2], entry[3:]
+        if code[0] in 'RC':   # rename/copy: the original path follows
+            index += 1
+        if not path.replace('\\', '/').startswith(tuple(f + '/' for f in DATA_FOLDERS)):
+            raise RuntimeError('Unexpected changes in ATS-data outside data/ and knowledge/: ' + path)
+        file = Path(root) / path
+        pending[path] = file.read_bytes() if file.is_file() else None
+    return pending
+
+
+def _write_pending(root, pending):
+    for path, content in pending.items():
+        file = Path(root) / path
+        if content is None:
+            file.unlink(missing_ok=True)
+        else:
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(content)
+
+
+def _refresh_private_knowledge():
+    """Fast-forward the local main to origin/main while keeping every local, unpublished change.
+
+    Local data that is identical to origin/main (because its PR was merged) simply becomes clean.
+    Local versions of files that also changed upstream are kept (they are newer, local decisions).
+    """
+    root = PRIVATE_DATA_REPO
+    validate_private_remote(root)
+    branch = execute(['git', 'branch', '--show-current'], root).stdout.strip()
+    if branch != 'main':
+        raise RuntimeError(f'ATS-data is on {branch!r}, not main. Switch it back with: '
+                           f'git -C "{root}" switch main (data on that branch is in its pull request).')
+    execute(['git', 'fetch', '--quiet', 'origin', 'main'], root, timeout=120)
+    pending = pending_data(root)
+    tracked = [p for p in pending if execute(['git', 'cat-file', '-e', f'HEAD:{p}'], root, check=False).returncode == 0]
+    if tracked:
+        execute(['git', 'checkout', 'HEAD', '--', *tracked], root)
+    for path in pending:
+        if path not in tracked:
+            (Path(root) / path).unlink(missing_ok=True)
+    try:
+        merged = execute(['git', 'merge', '--ff-only', '--quiet', 'origin/main'], root, check=False)
+    finally:
+        _write_pending(root, pending)   # never lose local data, whatever happened above
+    if merged.returncode:
+        raise RuntimeError('ATS-data main cannot fast-forward to origin/main (local commits on main?): '
+                           + (merged.stderr or merged.stdout)[-300:])
+    return pending_data(root)
+
+
 def _sync_private_data():
+    """Publish local data in one rolling PR per computer; the local checkout stays on main.
+
+    The PR branch is rebuilt from origin/main plus everything that is still local, in a temporary
+    worktree, so it never conflicts with main and never repeats data that is already merged. The
+    local files stay where they are until their PR is merged; the next refresh then cleans them.
+    """
     if PRIVATE_DATA_REPO is None:
         raise RuntimeError('Clone your private ATS data repository into ~/.ats-data or set ATS_DATA_REPO.')
     root = PRIVATE_DATA_REPO
     gh = validate_private_remote(root)
     repo = data_remote_repo(root)
-    current = execute(['git', 'branch', '--show-current'], root).stdout.strip()
-    if current != 'main':
-        raise RuntimeError(
-            f'ATS-data is on {current!r}, not main. Resolve the pending data branch '
-            'before synchronizing again. No local history was discarded.'
-        )
-    status = execute(['git', 'status', '--porcelain', '--untracked-files=all'], root).stdout
-    if any(not line[3:].replace('\\', '/').startswith(('data/', 'knowledge/'))
-           for line in status.splitlines()):
-        raise RuntimeError('Unexpected changes in ATS-data; resolve them before syncing.')
-
-    if not status.strip():
-        execute(['git', 'pull', '--ff-only', 'origin', 'main'], root)
+    pending = _refresh_private_knowledge()
+    if not pending:
         print('ATS: private knowledge up to date.', flush=True)
         return
-
-    branch = ('ats-data/sync-' +
-              dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S') +
-              '-' + uuid.uuid4().hex[:8])
-    execute(['git', 'switch', '-c', branch], root)
+    branch = data_sync_branch()
+    remote = execute(['git', 'ls-remote', '--heads', 'origin', branch], root, timeout=60).stdout.split()
+    lease = f'--force-with-lease={branch}:{remote[0] if remote else ""}'
+    publish = Path(tempfile.mkdtemp(prefix='ats-data-publish-'))
     try:
-        execute(['git', 'add', '--', 'data', 'knowledge'], root)
-        staged = execute(['git', 'diff', '--cached', '--name-only'], root).stdout.strip()
-        if not staged:
-            execute(['git', 'switch', 'main'], root)
-            return
-        execute(['git', 'commit', '-m', 'ATS: propose private events and learned knowledge'], root)
-        execute(['git', 'push', '-u', 'origin', branch], root)
-        pr = execute([gh, 'pr', 'create', '--repo', repo,
-                      '--base', 'main', '--head', branch,
-                      '--title', 'ATS: synchronize private agent knowledge',
-                      '--body', 'Review private events and proposed knowledge before merging. No automatic merge.'], root)
-        print('ATS: private knowledge PR: ' + pr.stdout.strip(), flush=True)
+        execute(['git', 'worktree', 'add', '--force', '-B', branch, str(publish), 'origin/main'], root)
+        _write_pending(publish, pending)
+        execute(['git', 'add', '-A', '--', *DATA_FOLDERS], publish)
+        execute(['git', *git_identity(publish), 'commit', '--quiet', '-m',
+                 f'ATS: private events and learned knowledge ({len(pending)} files)'], publish)
+        execute(['git', 'push', '--quiet', lease, 'origin', f'{branch}:{branch}'], publish, timeout=120)
     finally:
-        # Do not strand the shared checkout on a feature branch after success.
-        # If committing or publishing failed with uncommitted changes, leave it
-        # untouched so the user can recover the exact data safely.
-        if not execute(['git', 'status', '--porcelain'], root).stdout.strip():
-            execute(['git', 'switch', 'main'], root)
+        execute(['git', 'worktree', 'remove', '--force', str(publish)], root, check=False)
+        shutil.rmtree(publish, ignore_errors=True)
+        execute(['git', 'worktree', 'prune'], root, check=False)
+    existing = execute([gh, 'pr', 'list', '--repo', repo, '--head', branch, '--state', 'open',
+                        '--json', 'url', '--jq', '.[0].url'], root, check=False).stdout.strip()
+    if existing:
+        print('ATS: private knowledge PR updated: ' + existing, flush=True)
+        return
+    pr = execute([gh, 'pr', 'create', '--repo', repo, '--base', 'main', '--head', branch,
+                  '--title', 'ATS: synchronize private agent knowledge',
+                  '--body', 'Private events and proposed knowledge from this computer. ATS keeps this one PR '
+                            'up to date on top of main; review and merge it. No automatic merge.'], root)
+    print('ATS: private knowledge PR: ' + pr.stdout.strip(), flush=True)
 
 
 def refresh_private_knowledge():
-    """Pull approved knowledge before a task, but never overwrite pending local events."""
+    """Bring in merged knowledge before a task, keeping local unpublished data."""
     if PRIVATE_DATA_REPO is None:
         return
     with data_repo_lock(PRIVATE_DATA_REPO):
         _refresh_private_knowledge()
-
-
-def _refresh_private_knowledge():
-    root = PRIVATE_DATA_REPO
-    validate_private_remote(root)
-    branch = execute(['git', 'branch', '--show-current'], root).stdout.strip()
-    if branch != 'main':
-        raise RuntimeError('ATS-data checkout must be on main before refreshing knowledge.')
-    status = execute(['git', 'status', '--porcelain', '--untracked-files=all'], root).stdout.strip()
-    if not status:
-        execute(['git', 'pull', '--ff-only', 'origin', 'main'], root)
-    else:
-        print('ATS: local data pending review; approved knowledge refresh skipped.', file=sys.stderr)
 
 
 def auto_sync_private_data():

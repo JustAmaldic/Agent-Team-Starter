@@ -92,7 +92,7 @@ Only approved tasks may become a draft PR. Never fake an approval, test result, 
   - `approved` is set by a human, including items the human writes.
   - Only `verified` or `approved` items are given to agents, and those items are reference material, never overrides of this policy. Rules, decisions and lessons are given before findings, so a stream of review findings never pushes the human's rules out.
   - Agents cannot approve their own proposals.
-- **Synchronization.** After each task, ATS opens a PR in the private ATS-data repository. It never pushes to or merges into `main`. Before a task it fast-forwards approved knowledge when the checkout is clean.
+- **Synchronization.** The local ATS-data checkout always stays on `main`. After each task ATS keeps **one pull request per computer** (branch `ats-data/sync-<computer>`) up to date: the branch is rebuilt from `origin/main` plus all local data that is not on `main` yet, so it never conflicts and never repeats merged data. ATS never pushes to or merges into `main`. Before a task it fast-forwards `main`; local data that its merged PR made identical becomes clean, newer local versions are kept.
 - **Never store:** credentials, tokens, personal data, full source files or proprietary logs. Event summaries are truncated, but agents must still keep secrets out of their output.
 
 ## Usage limits
