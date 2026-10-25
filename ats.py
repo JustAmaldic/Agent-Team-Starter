@@ -1118,7 +1118,78 @@ def run_checks(conf, folder):
     return checks
 
 
-def review_prompt(task, checks, diff, history):
+STYLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', 'STYLEGUIDE.md', 'STYLE.md', 'DESIGN.md',
+               'docs/style.md', 'docs/STYLE.md', 'docs/design.md', '.editorconfig', 'pyproject.toml', 'setup.cfg',
+               'ruff.toml', '.ruff.toml', '.flake8', '.prettierrc', '.prettierrc.json', '.prettierrc.js',
+               'prettier.config.js', '.eslintrc', '.eslintrc.json', '.eslintrc.js', 'eslint.config.js',
+               'eslint.config.mjs', 'biome.json', '.stylelintrc', '.stylelintrc.json', 'tailwind.config.js',
+               'tailwind.config.ts', 'tsconfig.json')
+STYLE_SKIP = {'node_modules', '.git', 'dist', 'build', '.venv', 'venv', '.venv-bouw', 'vendor', '__pycache__',
+              '.next', 'coverage', 'site-packages'}
+STYLE_LIMIT = 2500
+_style_cache = {}
+
+
+def _style_sheets(folder, limit=300):
+    found = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in STYLE_SKIP and not d.startswith('.')]
+        for name in files:
+            if name.endswith(('.css', '.scss', '.less')) and not name.endswith('.min.css'):
+                found.append(Path(root) / name)
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def style_context(folder, conf=None):
+    """A short brief so agents keep the project's existing code and visual style.
+
+    Lists the style sources the project has (guides, formatter/linter configs) for the agent to read,
+    the design tokens (CSS custom properties) and fonts the UI already uses, and the project's own
+    style_guide notes from .ats-project.json. Cached per worktree.
+    """
+    folder = Path(folder)
+    key = str(folder.resolve())
+    if key in _style_cache:
+        return _style_cache[key]
+    sources = [name for name in STYLE_FILES if (folder / name).is_file()]
+    tokens, fonts, token_file = [], {}, None
+    for sheet in _style_sheets(folder):
+        try:
+            text = sheet.read_text(encoding='utf-8', errors='replace')[:200000]
+        except OSError:
+            continue
+        found = re.findall(r'(--[\w-]+)\s*:\s*([^;{}\n]{1,60});', ' '.join(re.findall(r':root[^{]*\{([^}]*)\}', text)))
+        if len(found) > len(tokens):
+            tokens, token_file = found, sheet.relative_to(folder).as_posix()
+        for family in re.findall(r'font-family\s*:\s*([^;{}\n]{1,80})', text):
+            fonts[family.strip()] = fonts.get(family.strip(), 0) + 1
+    lines = ['MATCH THE EXISTING STYLE. Before writing, read two or three existing files like the ones you '
+             'change and follow their conventions: naming, structure, formatting, comments, error handling, '
+             'test style and the language and tone of user-facing text. Reuse existing components, helpers, '
+             'CSS classes and design tokens. Do not introduce new colours, fonts, spacing or radius values, UI '
+             'libraries, frameworks or code styles unless the task asks for it; extend what is there instead.']
+    if sources:
+        lines.append('Style sources in this project (read the relevant ones): ' + ', '.join(sources) + '.')
+    if tokens:
+        lines.append(f'Design tokens in {token_file} (use these instead of literal values): '
+                     + '; '.join(f'{n}: {v.strip()}' for n, v in tokens[:40]) + '.')
+    if fonts:
+        lines.append('Fonts in use: ' + ' | '.join(f for f, _ in sorted(fonts.items(), key=lambda x: -x[1])[:3]) + '.')
+    notes = (conf or {}).get('style_guide')
+    if isinstance(notes, list):
+        notes = '\n'.join(str(n) for n in notes)
+    if isinstance(notes, str) and notes.strip():
+        lines.append('Project style notes: ' + notes.strip()[:1500])
+    text = '\n' + '\n'.join(lines)
+    if len(text) > STYLE_LIMIT:
+        text = text[:STYLE_LIMIT].rsplit(';', 1)[0] + ' …'
+    _style_cache[key] = text
+    return text
+
+
+def review_prompt(task, checks, diff, history, style=''):
     previous = ''
     if history:
         last = history[-1]
@@ -1132,6 +1203,10 @@ def review_prompt(task, checks, diff, history):
             "REVIEW-ONLY MODE: do not create, edit or delete any file. ATS checks the workspace "
             "afterwards; any change is reverted and the review is rejected.\n"
             "Inspect the diff and test results below yourself; do not rely on the implementer's summary.\n"
+            "Also check consistency with the existing project: code that departs from its conventions, or UI "
+            "that introduces new colours, fonts, spacing, components or libraries instead of the existing "
+            "ones, is a MINOR finding; visibly inconsistent UI or a new framework/dependency without need is MAJOR."
+            + style + "\n"
             + previous +
             "Write, in this order:\n"
             "1. Findings in prose: severity (BLOCKER, MAJOR, MINOR, SUGGESTION), file:line, issue, why it matters, concrete fix.\n"
@@ -1143,13 +1218,14 @@ def review_prompt(task, checks, diff, history):
             'Checks: ' + json.dumps(checks, ensure_ascii=False) + '\nDiff:\n' + diff)
 
 
-def revision_prompt(task, review, findings):
+def revision_prompt(task, review, findings, style=''):
     return (f"Revise your implementation for task {task!r}. Never commit, push, merge, deploy or modify .ats.\n"
             "Address the review below. Answer EVERY finding with status fixed (with test/file "
             "evidence), not_applicable (with evidence why) or deferred (with an issue/reference). "
             "Deferred BLOCKERs and unanswered BLOCKER/MAJOR findings prevent approval.\n"
             "End with ONE LINE in this shape: "
             'ATS_RESPONSES_JSON: [{"id":"<id>","status":"<status>","note":"<evidence>","reference":"<reference>"}]\n'
+            'Keep matching the existing style of the project.' + style + '\n'
             'Open findings: ' + json.dumps(findings, ensure_ascii=False) +
             '\nReview:\n' + review[-12000:])
 
@@ -1194,7 +1270,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         tree = index_tree(folder)
         phase('review', task_id, **context, cycle=cycle, reviewer=preferred, implementer=implementer)
         try:
-            reviewer, review = invoke_with_fallback(preferred, review_prompt(task, checks, diff, history),
+            reviewer, review = invoke_with_fallback(preferred, review_prompt(task, checks, diff, history, style_context(folder, conf)),
                                                     folder, unavailable, task_id, 'review',
                                                     quiet=quiet, fallback=False)
         except AgentUsageExhausted as exc:
@@ -1230,7 +1306,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             break
         phase('revision', task_id, **context, cycle=cycle, implementer=implementer)
         try:
-            implementer, response = invoke_with_fallback(implementer, revision_prompt(task, review, findings),
+            implementer, response = invoke_with_fallback(implementer, revision_prompt(task, review, findings, style_context(folder, conf)),
                                                          folder, unavailable, task_id, 'revision', quiet=quiet)
         except AgentUsageExhausted as exc:
             print(str(exc), file=sys.stderr)
@@ -1334,6 +1410,7 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
               'Earlier parts have passed independent review. Preserve them. Add tests. '
               'Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; '
               'ATS commits the work after the review.'
+              + style_context(folder, conf)
               + knowledge_context()
               + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
               + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
@@ -1391,7 +1468,8 @@ def merge_parallel_part(task, plan, number, part, task_id, folder, branch, side_
     prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. Task: {task}\n'
               f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
               f'You built part {number} ({part}) in parallel with another part. {problem}\n'
-              'Change only what the integration needs. Do not commit, push or modify .ats.')
+              'Change only what the integration needs. Do not commit, push or modify .ats.'
+              + style_context(folder, conf))
     try:
         fixer, output = invoke_with_fallback(author, prompt, folder, unavailable, task_id, 'implementation',
                                              quiet=quiet, fallback=False)
@@ -1619,6 +1697,7 @@ def task_flow(task, agent, push, quiet=False):
                   "Change only necessary application files and add tests. "
                   "Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; "
                   "ATS commits your work after the review."
+                  + style_context(folder, conf)
                   + knowledge_context()
                   + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: '
                   + '[{"kind":"finding","title":"<title>","observation":"<observation>",'
