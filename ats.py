@@ -404,35 +404,99 @@ CONFIDENCE_LEVELS = ('low', 'medium', 'high')
 KNOWLEDGE_PRIORITY = {'rule': 0, 'decision': 1, 'lesson': 2, 'pattern': 3, 'feedback': 4, 'finding': 5}
 
 
-def learn(kind, title, observation, evidence, task_id=None, confidence='medium', created_by='human'):
-    """Append an evidence-linked proposal; learned rules are never auto-approved."""
+# A learning that would make agents do something drastic always needs a human. Everything else that
+# the review process produces is approved automatically (standing decision of the owner, POLICY.md).
+RISK_PATTERNS = (
+    (r'rm\s+-rf|rmtree|reset\s+--hard|git\s+clean|filter-branch|rebase\s+-i', 'destructive git/file command'),
+    (r'force[- ]?push|push\s+(?:-f\b|--force)|--force-with-lease', 'force push'),
+    (r'\b(?:delete|remove|wipe|purge|drop|truncate|verwijder|wis)\b[^.\n]{0,40}'
+     r'\b(?:branch|worktree|repo|repository|database|table|data|files?|folders?|map|bestanden|history|geschiedenis)\b',
+     'deletes data'),
+    (r'\b(?:skip|disable|bypass|ignore|overslaan|uitzetten|negeer)\b[^.\n]{0,30}'
+     r'\b(?:review|tests?|checks?|security|auth|sandbox|approval|goedkeuring|beveiliging)\b',
+     'weakens review, tests or security'),
+    (r'\b(?:without|zonder)\s+(?:review|tests?|checks?|approval|goedkeuring)', 'weakens review, tests or security'),
+    (r'(?:push|merge|commit)\w*\s+(?:\w+\s+){0,2}(?:to|into|naar|op)\s+main\b|auto-?merge', 'touches main directly'),
+    (r'--dangerously|approve-for-me\s+--yolo|--yolo', 'unsafe agent flags'),
+    (r'\b(?:credentials?|secrets?|passwords?|wachtwoord|api[- ]?keys?|private\s+key)\b', 'credentials'),
+    (r'\b(?:real money|echt geld|live (?:account|trading)|place (?:an )?orders?|deploy(?:ment)? to production)\b',
+     'money or production'),
+)
+LEARNING_SCOPES = ('project', 'shared')
+
+
+def learning_risk(*texts):
+    """Why a learning needs a human, or None when it is low risk."""
+    text = ' '.join(str(t) for t in texts)
+    for pattern, reason in RISK_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return reason
+    return None
+
+
+def knowledge_base():
+    return PRIVATE_DATA_REPO / 'knowledge' if PRIVATE_DATA_REPO else state_directory().parent / 'knowledge'
+
+
+def known_titles():
+    """Titles of the project's and shared knowledge, to avoid storing the same learning twice."""
+    name = cleanname(project().get('project', APP.name))
+    titles = set()
+    for folder in (knowledge_base() / 'projects' / name, knowledge_base() / 'shared'):
+        for path in folder.rglob('*.json') if folder.exists() else ():
+            try:
+                item = read_json(path)
+            except (ValueError, OSError):
+                continue
+            if item.get('status') != 'rejected' and item.get('title'):
+                titles.add(' '.join(str(item['title']).lower().split()))
+    return titles
+
+
+def learn(kind, title, observation, evidence, task_id=None, confidence='medium', created_by='human',
+          scope='project', auto=False, risk=None):
+    """Store an evidence-linked learning.
+
+    auto=True (learnings from the review process): approved right away unless it is risky, in which
+    case it stays 'proposed' with the reason in needs_human. Otherwise it is a proposal.
+    """
     if kind not in KNOWLEDGE_KINDS:
         raise RuntimeError('Invalid learning kind: ' + kind)
     if not evidence.strip():
         raise RuntimeError('Learning requires a supporting evidence reference.')
     if confidence not in CONFIDENCE_LEVELS:
         raise RuntimeError('Invalid confidence: ' + str(confidence))
+    if scope not in LEARNING_SCOPES:
+        raise RuntimeError('Invalid scope: ' + str(scope))
     conf = project()
-    name = cleanname(conf.get('project', APP.name))
+    name = 'shared' if scope == 'shared' else cleanname(conf.get('project', APP.name))
     if not name:
         raise RuntimeError('Project name is required.')
     uid = str(uuid.uuid4())
-    filename = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uid + '.json'
+    now = dt.datetime.now(dt.timezone.utc)
+    filename = now.strftime('%Y%m%dT%H%M%SZ') + '-' + uid + '.json'
     sections = {'finding': 'findings', 'feedback': 'feedback', 'lesson': 'lessons',
                 'rule': 'rules', 'decision': 'decisions', 'pattern': 'patterns'}
-    target = (PRIVATE_DATA_REPO / 'knowledge' if PRIVATE_DATA_REPO else
-              state_directory().parent / 'knowledge') / 'projects' / name / sections[kind]
+    target = (knowledge_base() / 'shared' if scope == 'shared' else knowledge_base() / 'projects' / name) / sections[kind]
     target.mkdir(parents=True, exist_ok=True, mode=0o700)
     item = {'id': uid, 'project': name, 'kind': kind,
             'title': title, 'observation': observation, 'evidence': [evidence],
             'status': 'proposed', 'confidence': confidence,
-            'created_at': dt.datetime.now(dt.timezone.utc).isoformat(),
-            'created_by': created_by, 'task_id': task_id}
+            'created_at': now.isoformat(), 'created_by': created_by, 'task_id': task_id}
+    if auto:
+        reason = risk or learning_risk(title, observation)
+        if reason:
+            item['needs_human'] = reason
+        else:
+            item.update(status='approved', decided_at=now.isoformat(),
+                        decided_by='ATS auto-approval (low risk)',
+                        approval_reference='Standing decision of the owner: low-risk learnings from the review '
+                                           'process are approved automatically; risky ones wait (POLICY.md).')
     (target / filename).write_text(json.dumps(item, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
     return item
 
 
-def knowledge_context(limit=12):
+def knowledge_context(limit=20):
     """Use verified and approved knowledge; never treat unverified proposals as policy."""
     root = (PRIVATE_DATA_REPO / 'knowledge' if PRIVATE_DATA_REPO else
             state_directory().parent / 'knowledge')
@@ -485,14 +549,15 @@ PLACEHOLDER_VALUES = {'...', '…', '<title>', '<observation>', '<evidence>',
                       'test/review/task reference'}
 
 
-def capture_learning_proposals(agent_output, task_id):
-    """Ingest clearly marked structured learnings, never model-authored approved rules.
+def capture_learning_proposals(agent_output, task_id, auto=True):
+    """Ingest clearly marked structured learnings; low-risk ones are approved automatically.
 
     Agent CLIs may echo the prompt (which contains a format example), so only
     the LAST marked line is used and placeholder values are rejected.
     """
     entries = parse_marked_json(agent_output, 'ATS_LEARNINGS_JSON')
     saved = []
+    known = known_titles() if entries else set()
     for entry in entries[:10]:
         if not isinstance(entry, dict) or entry.get('kind') not in KNOWLEDGE_KINDS:
             continue
@@ -503,8 +568,14 @@ def capture_learning_proposals(agent_output, task_id):
             continue
         if any(is_placeholder(v) for v in values):
             continue
+        scope = entry.get('scope') if entry.get('scope') in LEARNING_SCOPES else 'project'
+        flagged = 'marked high risk by the agent' if str(entry.get('risk', '')).lower() == 'high' else None
+        key = ' '.join(title.lower().split())
+        if key in known:
+            continue   # the same learning is already known
+        known.add(key)
         saved.append(learn(entry['kind'], title, observation, evidence, task_id,
-                           created_by='agent'))
+                           created_by='agent', scope=scope, auto=auto, risk=flagged))
     return saved
 
 
@@ -1443,6 +1514,59 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
     return True, reviewer, author, history
 
 
+def distill_learnings(task, task_id, folder, history, preferred, unavailable, quiet=False):
+    """After the reviews: turn the findings into reusable learnings for future tasks.
+
+    One short, read-only agent call (the reviewer, else the other agent). Low-risk learnings are
+    approved automatically; drastic ones wait for a human. Never fails the task.
+    """
+    findings = []
+    for cycle in history:
+        answers = {r.get('id'): r for r in cycle.get('responses') or []}
+        for finding in cycle.get('findings') or []:
+            answer = answers.get(finding.get('id')) or {}
+            findings.append({k: v for k, v in {
+                'id': finding.get('id'), 'severity': finding.get('severity'),
+                'where': f"{finding.get('file') or ''}:{finding.get('line') or ''}".strip(':'),
+                'summary': finding.get('summary'), 'cycle': cycle.get('cycle'), 'part': cycle.get('subtask'),
+                'answer': answer.get('status'), 'note': answer.get('note')}.items() if v not in (None, '')})
+    if not findings:
+        return []
+    known = sorted(known_titles())[:60]
+    prompt = (f'Read {ATS/"POLICY.md"}. You are distilling lessons from a finished ATS task. Do NOT change any '
+              f'files.\nTask: {task}\nReview findings and the implementer\'s answers: '
+              + json.dumps(findings[:40], ensure_ascii=False) +
+              '\nAlready known (do not repeat): ' + json.dumps(known, ensure_ascii=False) +
+              '\nWrite at most 5 learnings that help FUTURE tasks avoid these problems: general and actionable, '
+              'not a description of this change; skip one-off typos. kind: "lesson" (insight), "rule" (always/never '
+              'do X) or "pattern". scope: "shared" when it applies to any project, else "project". risk: "high" only '
+              'if following it could delete or overwrite data, rewrite git history, weaken review/tests/security, '
+              'touch credentials or money, or do something irreversible; otherwise "low". evidence: file:line or '
+              'finding id.\nEnd with ONE LINE: ATS_LEARNINGS_JSON: [{"kind":"lesson","title":"<title>",'
+              '"observation":"<observation>","evidence":"<evidence>","scope":"project","risk":"low"}] '
+              '(replace the placeholders, or use []).')
+    tree = index_tree(folder)
+    try:
+        phase('learning', task_id, agent=preferred)
+        agent, output = invoke_with_fallback(preferred, prompt, folder, unavailable, task_id, 'learning',
+                                             quiet=quiet)
+        saved = capture_learning_proposals(output.replace(prompt, ''), task_id)
+    except Exception as exc:   # learning is a bonus; the task result stands
+        print(f'ATS: distilling learnings skipped: {str(exc)[:200]}', file=sys.stderr)
+        return []
+    finally:
+        changed = restore_if_changed(folder, tree)
+        if changed:
+            print('ATS: the learning step changed files; reverted: ' + ', '.join(changed[:10]), file=sys.stderr)
+    waiting = [item for item in saved if item['status'] == 'proposed']
+    if saved:
+        record('learnings', f'{len(saved)} learnings distilled ({len(waiting)} need a human)', task_id,
+               learnings=[{'id': i['id'], 'title': i['title'], 'status': i['status'],
+                           'needs_human': i.get('needs_human')} for i in saved])
+        print(f'ATS: {len(saved)} learnings stored; {len(waiting)} need your approval.', flush=True)
+    return saved
+
+
 def preset_task_id():
     """ATS_TASK_ID lets a caller know the task id before the run starts."""
     value = os.environ.get('ATS_TASK_ID', '').strip()
@@ -1514,6 +1638,8 @@ def task_flow(task, agent, push, quiet=False):
         else:
             approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
                                                                base=base_commit)
+        distill_learnings(task, task_id, folder, history,
+                          reviewer or ('claude' if implementer == 'codex' else 'codex'), unavailable, quiet=quiet)
         execute(['git','add','-A'],folder)
         staged = execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
         if not staged:
