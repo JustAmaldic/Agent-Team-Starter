@@ -18,3 +18,4 @@ Read `POLICY.md` before implementation or review. This document applies to Codex
 ## Git collaboration rule
 
 For every ATS code or policy change: create a dedicated feature branch from main, commit only on that branch, and open a pull request for review. Never push changes directly to main or merge your own pull request automatically. Follow POLICY.md.
+- Match the existing style: read similar files first, reuse existing components, helpers, CSS classes and design tokens, keep the language and tone of user-facing text, and do not introduce new colours, fonts, libraries or code styles unless the task asks for it.

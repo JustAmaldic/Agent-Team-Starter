@@ -20,6 +20,12 @@ The reviewer must not create, edit or delete any file. **(enforced)** ATS snapsh
 
 Check correctness, edge cases, backwards compatibility, security/secrets, performance, readability, test coverage and project-specific constraints.
 
+**Consistency with the existing project** is part of every review. The implementer follows the conventions of the code around the change and reuses the existing design: components, CSS classes, design tokens (colours, fonts, spacing, radius) and the language and tone of user-facing text. New colours, fonts, components, libraries or code styles are only allowed when the task asks for them.
+- A departure from the conventions is a **MINOR** finding.
+- Visibly inconsistent UI, or a new framework or dependency without need, is **MAJOR**.
+
+ATS gives both agents a short style brief. It lists the project's style guides and formatter or linter configs, the CSS design tokens and fonts in use, and optional `style_guide` notes from `.ats-project.json`.
+
 - **Trading or other financial code:** also assess order execution, position sizing, exchange/API failure, paper-vs-live separation and risk limits.
 - **Apps with user accounts or personal data:** also assess authentication, authorization, privacy and data migration when relevant.
 

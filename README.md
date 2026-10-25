@@ -31,6 +31,13 @@ On Windows, run `powershell -NoProfile -File .ats/setup.ps1` for the PowerShell 
 
 The application needs its own Git repository and remote for `--push`. For non-Git applications omit `--push`; ATS creates a local snapshot and a patch for manual inspection and application. Tasks do not automatically merge pull requests.
 
+Agents keep the existing style of the application. ATS gives them a short style brief:
+- the style guides and formatter or linter configs the project has;
+- the CSS design tokens and fonts in use;
+- optional notes from `.ats-project.json`, for example `"style_guide": ["Dutch UI text", "Black with old-rose accent, no new colours"]`.
+
+Reviewers report inconsistent code or UI as a finding.
+
 ## Privacy and security
 
 ATS stores review events and agent output locally under `~/.ats-state/<project-id>/data/`, not in this source repository. Set `ATS_STATE_DIR` to choose another local state directory. ATS does not auto-push events or source commits. Project prompts, review content, and local logs may contain sensitive data: do not commit them to the public repository.
