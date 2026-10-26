@@ -151,3 +151,9 @@ The `plan` command asks an enabled agent to inspect an isolated temporary worktr
 Approved plan files must contain `{"task":"EXACT TASK DESCRIPTION","waves":["first sequential part",["parallel part A","parallel part B"],"integration and tests"]}`. The CLI validates the task binding and structure before execution. ATS-app stores the plan and passes it with `--plan-file`; it never substitutes a merely decorative UI preview for the actual execution plan. Use distinct files for parallel parts, and retain independent reviews and integration checks.
 
 **Compatibility:** update the ATS-app pinned ATS-core submodule to the commit including these `plan` and `--plan-file` capabilities before enabling the interface. Running a newer app against an older CLI is not supported.
+
+## Google Antigravity CLI provider
+
+Antigravity is an optional fifth agent (disabled by default). Install the official CLI so `agy` is on PATH and run `agy` interactively once to authenticate. Enable it with `.ats agents --enable antigravity`. It supports implementation, planning, independent review, fallback and separate worktrees. ATS uses headless JSON output and validates the terminal status, exit code and denied permissions. Implementations use `--mode=accept-edits`; planning and review use `--mode=plan`. ATS does not use `--dangerously-skip-permissions`.
+
+An optional `ATS_ANTIGRAVITY_MODEL` environment variable chooses a model slug from `agy models`. Headless mode may require narrowly scoped permission rules for shell commands; permissions are not automatically broadened. See [official docs](https://www.antigravity.google/docs/cli/headless/).
