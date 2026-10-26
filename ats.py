@@ -988,12 +988,15 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None):
     if agent not in commands:
         raise RuntimeError(f'Unsupported agent: {agent}')
     command = commands[agent]()
+    if agent == 'opencode':
+        command.append(prompt)
     if not executable(agent):
         raise RuntimeError(f'{agent} executable missing; run .ats install')
     delays = RATE_LIMIT_BACKOFF if backoff is None else backoff
     attempt = 0
     while True:
-        p = stream_command(command, cwd, timeout=1800, quiet=quiet, stdin_text=prompt)
+        p = stream_command(command, cwd, timeout=1800, quiet=quiet,
+                           stdin_text=None if agent == 'opencode' else prompt)
         out = (p.stdout or '')+'\n'+(p.stderr or '')
         if p.returncode and is_transient_rate_limit(out) and attempt < len(delays):
             print(f'ATS: {agent} is rate limited; retrying in {delays[attempt]}s '
@@ -1318,7 +1321,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             raise RuntimeError('Agent made no changes; worktree preserved for diagnosis: ' + str(folder))
         preferred = alternate_agent(implementer, unavailable)
         if preferred is None:
-            message = f'Independent review unavailable: {preferred} is not available ({unavailable_reason(unavailable, preferred)})'
+            message = 'Independent review unavailable: no other enabled agent is available'
             print(message, file=sys.stderr)
             record('review_skipped', message, task_id, **context, implementer=implementer, reviewer=preferred)
             reasons = ['no independent reviewer available']
