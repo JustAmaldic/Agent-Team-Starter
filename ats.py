@@ -1438,7 +1438,7 @@ def should_preplan(task, mode='auto'):
     words = len(text.split())
     separate_goals = sum(text.lower().count(term) for term in (
         ' and ', ' also ', ' daarnaast ', ' bovendien ', ' weekly ',
-        ' wekelijks ', ' en ', ';', '\\n-', '\\n1.', '\\n2.'))
+        ' wekelijks ', ' en ', ';', '\n-', '\n1.', '\n2.'))
     return words >= 65 or (words >= 28 and separate_goals >= 2)
 
 
@@ -1458,7 +1458,7 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
     baseline = index_tree(folder)
     prompt = (
         f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. Plan ONLY, do not edit any files. '
-        f'Project: {APP.name}. Task: {task}\\n'
+        f'Project: {APP.name}. Task: {task}\n'
         'Inspect the code to divide this task into 2-20 concrete implementable parts '
         'with tests and independently reviewable outcomes. '
         'Return exactly ONE LINE starting ATS_SUBTASKS_JSON: followed by valid JSON. '
@@ -1467,6 +1467,7 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         '["Implement independent inbox safety scorer in dedicated files", '
         '"Implement weekly newsletter audit in separate files"], '
         '"Integrate, run tests, and verify all parts together"]. '
+        'Prefer at least one safe independent pair when two components have disjoint ownership. '
         'Put dependencies BEFORE dependent work. '
         'Only group two parts as a pair when they touch disjoint files and can run '
         'in parallel safely; if uncertain use consecutive strings. '
@@ -1480,7 +1481,7 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
     for attempt in range(2):
         try:
             planner, output = invoke_with_fallback(
-                agent, prompt + (f'\\nYour prior plan was unusable: {last_problem}. '
+                agent, prompt + (f'\nYour prior plan was unusable: {last_problem}. '
                                  'Correct the JSON and return only the marker line.'
                                  if last_problem else ''),
                 folder, unavailable, task_id, 'planning', quiet=quiet)
