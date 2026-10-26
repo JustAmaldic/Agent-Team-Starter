@@ -1849,15 +1849,21 @@ def task_flow(task, agent, push, quiet=False, parallel='auto'):
                   + '[{"kind":"finding","title":"<title>","observation":"<observation>",'
                   + '"evidence":"<evidence>"}] (replace the placeholders, or use []). '
                   + 'Only evidence-backed items, no secrets; proposals are not approved rules.')
-        initial_tree = index_tree(folder)
-        implementer,result=invoke_with_fallback(agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
-        record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
-        capture_learning_proposals(result,task_id)
-        plan = subtask_plan(result.replace(prompt, ''))
-        if plan is not None:
-            if index_tree(folder) != initial_tree:
+        if preflight_plan is not None:
+            plan = preflight_plan
+            implementer = agent
+        else:
+            initial_tree = index_tree(folder)
+            implementer,result=invoke_with_fallback(
+                agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
+            record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
+            capture_learning_proposals(result,task_id)
+            plan = subtask_plan(result.replace(prompt, ''))
+            if plan is not None and index_tree(folder) != initial_tree:
                 raise RuntimeError('Task planning modified files; worktree retained for diagnosis')
-            record('task_split', 'Task divided into reviewable parts', task_id, subtasks=plan)
+        if plan is not None:
+            if preflight_plan is None:
+                record('task_split', 'Task divided into reviewable parts', task_id, subtasks=plan)
             approved,reviewer,implementer,history=subtask_flow(
                 task,plan,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet)
         else:
@@ -1938,7 +1944,7 @@ def child_run(argv):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks')
     p=sub.add_parser('event');p.add_argument('kind');p.add_argument('summary');p.add_argument('--task')
     p=sub.add_parser('run');p.add_argument('argv',nargs=argparse.REMAINDER)
     p=sub.add_parser('agents', help='List, enable or disable coding agents')
@@ -1969,7 +1975,7 @@ def main():
             print(json.dumps({'enabled': selected, 'supported': list(SUPPORTED_AGENTS),
                               'installed': {name: bool(executable(name)) for name in SUPPORTED_AGENTS}},
                              indent=2))
-        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet)
+        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
         elif args.command=='learn':learn(args.kind,args.title,args.observation,args.evidence,args.task,args.confidence,'human')
