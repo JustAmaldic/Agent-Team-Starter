@@ -1806,6 +1806,48 @@ def preset_task_id():
         raise RuntimeError('ATS_TASK_ID must be a UUID: ' + value)
 
 
+def preview_task_plan(task, agent='auto', quiet=True):
+    """Run ATS's actual preflight planner in a disposable read-only snapshot."""
+    repository = execute(['git', 'rev-parse', '--show-toplevel'], check=False)
+    local_mode = repository.returncode != 0
+    if not local_mode and Path(repository.stdout.strip()).resolve() != APP.resolve():
+        raise RuntimeError('Run ATS from the project repository root')
+    selected = select(task) if agent == 'auto' else agent
+    if selected not in enabled_agents():
+        raise RuntimeError('Selected planning agent is disabled')
+    unavailable = UnavailableAgents()
+    task_id = str(uuid.uuid4())
+    folder = APP.parent / f'{APP.name}-ats-plan-{task_id[:8]}'
+    try:
+        if local_mode:
+            make_local_workspace(folder, 'ats/plan-' + task_id[:8])
+        else:
+            execute(['git', 'worktree', 'add', '--detach', str(folder), 'HEAD'])
+        plan = preplan_task(task, task_id, folder, selected, unavailable, project(),
+                            quiet=quiet, mode='auto' if should_preplan(task) else 'always')
+        print('ATS_PLAN_JSON: ' + json.dumps(plan, ensure_ascii=False), flush=True)
+        return plan
+    finally:
+        if local_mode:
+            shutil.rmtree(folder, ignore_errors=True)
+        else:
+            execute(['git', 'worktree', 'remove', '--force', str(folder)], check=False)
+
+
+def provided_task_plan(path, task):
+    """Validate explicit user-edited plan from the app; never trust plan file paths as code."""
+    source = Path(path).expanduser().resolve()
+    if not source.is_file() or source.stat().st_size > 32768:
+        raise RuntimeError('Plan file missing or too large')
+    payload = json.loads(source.read_text(encoding='utf-8'))
+    if not isinstance(payload, dict) or payload.get('task') != task:
+        raise RuntimeError('Plan is not bound to the requested task')
+    plan = payload.get('waves')
+    if not valid_plan(plan):
+        raise RuntimeError('Invalid custom task plan (2-20 parts, up to 2 per wave)')
+    return plan
+
+
 def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None):
     conf=project()
     risk = intelligence.risk_profile(task)
