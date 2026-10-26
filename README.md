@@ -99,3 +99,21 @@ See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 ## Shared event contract v1
 
 The canonical event, phase and run-state vocabulary is documented in `contracts/events.v1.json` and loaded by `ats_contract.py`. ATS-app keeps a mirrored file at `ats_host/contracts/events.v1.json` and checks compatibility when its pinned ATS submodule is available. Live `phase` messages require timestamp, task ID and event type; persisted event files also require a project. Unknown event types can be kept by consumers without changing run status. Keep both files in sync whenever adding a stage or event.
+
+## Automatic parallel task planning
+
+By default (`--parallel auto`), ATS now asks an enabled agent to plan a multi-feature or long task **before implementation**. A structured `ATS_SUBTASKS_JSON` plan uses strings for sequential steps and two-element arrays for genuinely independent, parallel parts. The existing execution engine gives the pair to separate enabled agents in separate Git worktrees. Each part undergoes independent review; ATS then integrates the work and executes configured checks. Parallelism is never inferred merely because a task mentions multiple features: the planner should isolate file ownership and put dependencies first.
+
+```bash
+.ats task "Build independent inbox-safety scanning and a weekly signup audit" --parallel always
+.ats task "Fix CSS spacing" --parallel never
+.ats task "Extend ARC inbox security, login alerts and weekly privacy report" --parallel auto
+```
+
+- `auto` (default): request a structured preflight plan for longer or clearly multi-goal descriptions; prefer safe parallel pairs, but execute sequential waves when parts depend on each other.
+- `always`: demand a valid plan with **at least one** independently executable parallel pair. When the planner cannot justify one, ATS refuses implementation rather than forcing unsafe concurrency.
+- `never`: skip preflight and use the legacy small-task implementation flow (which can still explicitly return a subtask plan).
+
+The planner gets two attempts to return valid JSON. Missing/malformed plans abort complex work **without beginning implementation**. The planning call is checked for workspace modifications and they are reverted. If fewer than two coding agents are enabled, preflight parallel planning reports a clear error. Existing tests and independent reviewer approval remain mandatory, and no automatic merge or deployment is introduced.
+
+**Important:** `--parallel always` is a planning preference, not permission to edit overlapping files simultaneously. During parallel waves, ATS uses two worktrees and checks integration. A failed review, conflict or unavailable reviewer blocks publishing; inspect the retained worktrees. When using ATS-app, the default `auto` setting applies without a new UI flag.
