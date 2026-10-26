@@ -40,7 +40,7 @@ def app_directory():
 
 APP = app_directory()
 
-SUPPORTED_AGENTS = ('codex', 'claude', 'gemini', 'opencode')
+SUPPORTED_AGENTS = ('codex', 'claude', 'gemini', 'opencode', 'antigravity')
 DEFAULT_AGENTS = ('codex', 'claude')
 
 
@@ -730,7 +730,7 @@ def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quie
                 if not quiet:
                     print('ATS: checking Codex policy access and sandbox write...', flush=True)
                 codex_preflight(cwd, quiet=quiet)
-            result = invoke(candidate, prompt, cwd, quiet=quiet)
+            result = invoke(candidate, prompt, cwd, quiet=quiet, **({'purpose': purpose} if candidate == 'antigravity' else {}))
             if candidate == 'codex' and sandbox_blocked(result):
                 raise AgentSandboxBlocked('Codex reported a sandbox or policy block.')
             if not quiet:
@@ -783,7 +783,9 @@ def claude_authenticated(output):
 
 
 def executable(name):
-    if os.name == 'nt' and name in ('npm', *SUPPORTED_AGENTS):
+    if name == 'antigravity':
+        name = 'agy'
+    if os.name == 'nt' and name in ('npm', 'codex', 'claude', 'gemini', 'opencode', 'agy'):
         return shutil.which(name + '.cmd') or shutil.which(name + '.exe') or shutil.which(name)
     return shutil.which(name)
 
@@ -891,8 +893,8 @@ def install_agents():
         if result.returncode or not claude_authenticated(result.stdout):
             raise RuntimeError('Claude Code login not completed')
     for name in selected:
-        if name in ('gemini', 'opencode') and not executable(name):
-            raise RuntimeError(f'{name} CLI missing: install it and authenticate before using ATS')
+        if name in ('gemini', 'opencode', 'antigravity') and not executable(name):
+            raise RuntimeError(f'{name} CLI missing: install it and authenticate before using ATS (Antigravity uses the agy command)')
     print('Enabled agents ready.', flush=True)
 
 
@@ -946,7 +948,56 @@ def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None):
                                        ''.join(chunks['stdout']), ''.join(chunks['stderr']))
 
 
-def invoke(agent, prompt, cwd, quiet=False, backoff=None):
+def parse_antigravity_result(stdout, stderr='', returncode=0):
+    """The agy JSON status is authoritative even on exit code zero."""
+    try:
+        payload = json.loads(stdout.strip())
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError('Antigravity did not return valid headless JSON: ' + str(exc)) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError('Antigravity returned an unexpected JSON payload.')
+    status = str(payload.get('status', '')).upper()
+    response = payload.get('response')
+    if status != 'SUCCESS' or returncode:
+        message = str(payload.get('error') or stderr or response or 'unknown error')[-1400:]
+        if is_usage_exhausted(message):
+            raise AgentUsageExhausted('antigravity', usage_reset_hint(message))
+        if sandbox_blocked(message) or 'permission' in message.lower() or 'soft-denied' in message.lower():
+            raise AgentSandboxBlocked('Antigravity blocked a tool or permission: ' + message)
+        raise RuntimeError(f'Antigravity headless status {status or "unknown"}: ' + message)
+    if not isinstance(response, str) or not response.strip():
+        raise RuntimeError('Antigravity finished without an actionable text response.')
+    if 'soft-denied' in stderr.lower() or 'permission denied' in stderr.lower() or 'requires approval' in stderr.lower():
+        raise AgentSandboxBlocked('Antigravity tool permissions require explicit configuration: ' + stderr[-800:])
+    return response
+
+
+def invoke_antigravity(prompt, cwd, quiet=False, backoff=None, purpose='implementation'):
+    """Call Google's headless agy CLI with explicit safety modes and structured result checks."""
+    binary = executable('antigravity')
+    if not binary:
+        raise RuntimeError('Antigravity CLI (agy) missing; install and authenticate it first.')
+    if purpose in ('review', 'planning'):
+        mode = 'plan'
+    else:
+        mode = 'accept-edits'
+    command = [binary, '-p', prompt, '--output-format', 'json',
+               '--mode=' + mode, '--print-timeout', '25m']
+    delays = RATE_LIMIT_BACKOFF if backoff is None else backoff
+    attempt = 0
+    while True:
+        result = stream_command(command, cwd, timeout=1800, quiet=quiet)
+        combined = (result.stdout or '') + '\\n' + (result.stderr or '')
+        if result.returncode and is_transient_rate_limit(combined) and attempt < len(delays):
+            time.sleep(delays[attempt])
+            attempt += 1
+            continue
+        return parse_antigravity_result(result.stdout, result.stderr, result.returncode)
+
+
+def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementation'):
+    if agent == 'antigravity':
+        return invoke_antigravity(prompt, cwd, quiet=quiet, backoff=backoff, purpose=purpose)
     commands = {
         'codex': codex_exec_command,
         'claude': claude_print_command,
