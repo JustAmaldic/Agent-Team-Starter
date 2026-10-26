@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_FILES = (
-    '.gitignore', 'AGENTS.md', 'CLAUDE.md', 'LICENSE', 'POLICY.md', 'SECURITY.md', 'ats.py',
+    '.gitignore', 'AGENTS.md', 'CLAUDE.md', 'LICENSE', 'POLICY.md', 'SECURITY.md', 'ats.py', 'ats_contract.py',
     'config.example.json', 'project-config.example.json', 'requirements.txt',
     'setup-shell.sh', 'setup.ps1',
     '.github/workflows/ci.yml',
@@ -16,6 +16,8 @@ PUBLIC_DIRS = {
     'shell': {'.zsh'},
     'tests': {'.py'},
     'scripts': {'.py'},
+    'ats_modules': {'.py'},
+    'contracts': {'.json'},
 }
 DENIED_PARTS = {'.git', 'data', '.ats-state', '__pycache__', '.venv', '.env'}
 DENIED_EXTENSIONS = {'.pem', '.key', '.p12', '.pfx'}
