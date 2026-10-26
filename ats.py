@@ -545,6 +545,8 @@ def learn(kind, title, observation, evidence, task_id=None, confidence='medium',
             'title': title, 'observation': observation, 'evidence': [evidence],
             'status': 'proposed', 'confidence': confidence,
             'created_at': now.isoformat(), 'created_by': created_by, 'task_id': task_id}
+    if not auto and created_by == 'agent':
+        item['needs_human'] = risk or 'Agent proposal requires human approval'
     if auto:
         reason = risk or learning_risk(title, observation)
         if reason:
