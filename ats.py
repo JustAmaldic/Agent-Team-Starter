@@ -19,6 +19,8 @@ import time
 import uuid
 from pathlib import Path
 
+import ats_intelligence as intelligence
+
 from ats_contract import accepted_event, valid_phase
 
 ATS = Path(__file__).resolve().parent
@@ -1018,6 +1020,11 @@ def select(task):
             if agent in scores and e.get('event_type')=='review_result':
                 scores[agent] += 1 if e.get('approved') else -1
         except (ValueError,OSError): pass
+    metrics = intelligence.performance(intelligence.read_events(DATA / cleanname(conf.get('project', APP.name)) / 'events'))
+    relevant = set(intelligence.categories(task))
+    for row in metrics:
+        if row['reliable'] and row['agent'] in scores and row['category'] in relevant:
+            scores[row['agent']] += round(4 * row['approval_rate'] - min(3, row['revisions'] / row['samples']))
     return max(scores,key=lambda n:(scores[n],n==conf.get('default_agent','codex')))
 
 NON_GIT_EXCLUDED_NAMES = {
@@ -1799,8 +1806,11 @@ def preset_task_id():
         raise RuntimeError('ATS_TASK_ID must be a UUID: ' + value)
 
 
-def task_flow(task, agent, push, quiet=False, parallel='auto'):
+def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None):
     conf=project()
+    risk = intelligence.risk_profile(task)
+    if risk['require_human_approval'] and not approved_risk:
+        raise RuntimeError('High-risk task requires --approve-risk after reviewing: ' + json.dumps(risk))
     repository = execute(['git', 'rev-parse', '--show-toplevel'], check=False)
     local_mode = repository.returncode != 0
     if not local_mode and Path(repository.stdout.strip()).resolve() != APP.resolve():
@@ -1814,7 +1824,8 @@ def task_flow(task, agent, push, quiet=False, parallel='auto'):
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
-    record('assigned',task,task_id,implementer=agent,branch=branch)
+    record('assigned',task,task_id,implementer=agent,branch=branch,task_categories=intelligence.categories(task))
+    record('risk_profile', 'Risk-based execution profile', task_id, **risk)
     if not any(executable(name) for name in enabled_agents()):
         raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
     worktree_created=False
@@ -1826,8 +1837,15 @@ def task_flow(task, agent, push, quiet=False, parallel='auto'):
             execute(['git','worktree','add','-b',branch,str(folder),'HEAD'])
         worktree_created=True
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
-        preflight_plan = preplan_task(task, task_id, folder, agent, unavailable, conf,
-                                       quiet=quiet, mode=parallel)
+        if plan_file:
+            candidate = json.loads(Path(plan_file).expanduser().read_text(encoding='utf-8'))
+            preflight_plan = candidate.get('subtasks') if isinstance(candidate, dict) else candidate
+            if not valid_plan(preflight_plan):
+                raise RuntimeError('Invalid editable plan: expected 2-20 bounded subtasks')
+            record('task_split', 'Human-approved editable plan', task_id, subtasks=preflight_plan)
+        else:
+            preflight_plan = preplan_task(task, task_id, folder, agent, unavailable, conf,
+                                         quiet=quiet, mode=parallel)
         phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
         prompt = (f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'}. Task: {task}. "
                   "Assess task size before editing. If it is too large for one complete review "
@@ -1945,7 +1963,11 @@ def child_run(argv):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file')
+    p=sub.add_parser('risk');p.add_argument('description',nargs='+')
+    sub.add_parser('performance')
+    p=sub.add_parser('feedback');p.add_argument('comments_json');p.add_argument('--existing-ids')
+    p=sub.add_parser('knowledge-check');p.add_argument('items_json');p.add_argument('relations_json')
     p=sub.add_parser('event');p.add_argument('kind');p.add_argument('summary');p.add_argument('--task')
     p=sub.add_parser('run');p.add_argument('argv',nargs=argparse.REMAINDER)
     p=sub.add_parser('agents', help='List, enable or disable coding agents')
@@ -1976,7 +1998,20 @@ def main():
             print(json.dumps({'enabled': selected, 'supported': list(SUPPORTED_AGENTS),
                               'installed': {name: bool(executable(name)) for name in SUPPORTED_AGENTS}},
                              indent=2))
-        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel)
+        elif args.command=='risk':
+            print(json.dumps(intelligence.risk_profile(' '.join(args.description)),indent=2))
+        elif args.command=='performance':
+            directory = DATA / cleanname(project().get('project', APP.name)) / 'events'
+            print(json.dumps(intelligence.performance(intelligence.read_events(directory)),indent=2))
+        elif args.command=='feedback':
+            comments = json.loads(Path(args.comments_json).read_text(encoding='utf-8'))
+            ids = json.loads(Path(args.existing_ids).read_text(encoding='utf-8')) if args.existing_ids else []
+            print(json.dumps(intelligence.pr_feedback_items(comments, ids),indent=2))
+        elif args.command=='knowledge-check':
+            items = json.loads(Path(args.items_json).read_text(encoding='utf-8'))
+            relations = json.loads(Path(args.relations_json).read_text(encoding='utf-8'))
+            print(json.dumps(intelligence.relation_issues(items, relations),indent=2))
+        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
         elif args.command=='learn':learn(args.kind,args.title,args.observation,args.evidence,args.task,args.confidence,'human')
