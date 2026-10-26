@@ -117,3 +117,22 @@ By default (`--parallel auto`), ATS now asks an enabled agent to plan a multi-fe
 The planner gets two attempts to return valid JSON. Missing/malformed plans abort complex work **without beginning implementation**. The planning call is checked for workspace modifications and they are reverted. If fewer than two coding agents are enabled, preflight parallel planning reports a clear error. Existing tests and independent reviewer approval remain mandatory, and no automatic merge or deployment is introduced.
 
 **Important:** `--parallel always` is a planning preference, not permission to edit overlapping files simultaneously. During parallel waves, ATS uses two worktrees and checks integration. A failed review, conflict or unavailable reviewer blocks publishing; inspect the retained worktrees. When using ATS-app, the default `auto` setting applies without a new UI flag.
+
+## Intelligence foundation (experimental)
+
+The following commands provide inspectable, deterministic foundations for the next ATS features:
+
+```bash
+.ats risk "Update OAuth token refresh"                  # risk classification before running
+.ats task "Update OAuth token refresh" --approve-risk  # deliberate human acknowledgement
+.ats performance                                      # historical agent performance by task type
+.ats task "Implement the feature" --plan-file plan.json
+.ats feedback github-comments.json                    # PR comment candidates with stable IDs
+.ats knowledge-check knowledge.json relations.json    # contradictions and superseded items
+```
+
+`plan.json` contains a JSON list of two to twenty strings (or pairs of independent strings), using the existing ATS parallel subtask schema. It can be edited and reviewed before the task starts. High-risk tasks are blocked unless `--approve-risk` is passed, but that flag is not a substitute for independent review, tests or a deployment approval. Risk detection is a conservative keyword-based starting point; it does not yet analyze changed file paths after implementation.
+
+Performance scores use completed task events and a minimum of three samples per agent/category before influencing routing. Revision and token statistics are estimates based on available event records; missing usage is not treated as measured zero consumption. Defects reappearing in later PRs are not tracked yet.
+
+Feedback and knowledge-check commands currently accept exported JSON, not automatic GitHub webhook ingestion or a persisted knowledge graph. Contradictions are flagged for humans, never deleted or auto-resolved. The interactive planning editor, graph viewer, secure approval workflow and direct GitHub callback processing remain follow-up application features.
