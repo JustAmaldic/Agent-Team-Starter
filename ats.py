@@ -1300,7 +1300,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         reasons = evaluate_approval(verdict, checks, findings, history, reviewer, implementer,
                                     conf, tampered=bool(tampered))
         approved = not reasons
-        capture_learning_proposals(review, task_id)
+        capture_learning_proposals(review, task_id, auto=not classify_task(task)['human_gate'])
         record('review_result', review[-8000:], task_id, **context, implementer=implementer, reviewer=reviewer,
                approved=approved, verdict=verdict, findings=findings, blocking_reasons=reasons,
                tampered_paths=tampered, tests=checks, cycle=cycle, branch=branch)
@@ -1325,7 +1325,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         missing = [f['id'] for f in findings if f['id'] not in answered]
         record('feedback_response', response[-2000:], task_id, **context, implementer=implementer, cycle=cycle,
                responses=responses, unanswered=missing)
-        capture_learning_proposals(response, task_id)
+        capture_learning_proposals(response, task_id, auto=not classify_task(task)['human_gate'])
     summary = 'Not approved; needs a human decision: ' + '; '.join(reasons)
     print('ATS: ' + summary, file=sys.stderr)
     record('escalated', summary, task_id, **context, implementer=implementer, reviewer=reviewer,
@@ -1428,7 +1428,7 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
                blocking_reasons=[f'subtask {number}: {exc}'])
         return False, None, implementer, []
     record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
-    capture_learning_proposals(output, task_id)
+    capture_learning_proposals(output, task_id, auto=not classify_task(task)['human_gate'])
     try:
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
@@ -1634,7 +1634,7 @@ def distill_learnings(task, task_id, folder, history, preferred, unavailable, qu
         phase('learning', task_id, agent=preferred)
         agent, output = invoke_with_fallback(preferred, prompt, folder, unavailable, task_id, 'learning',
                                              quiet=quiet)
-        saved = capture_learning_proposals(output.replace(prompt, ''), task_id)
+        saved = capture_learning_proposals(output.replace(prompt, ''), task_id, auto=not classify_task(task)['human_gate'])
     except Exception as exc:   # learning is a bonus; the task result stands
         print(f'ATS: distilling learnings skipped: {str(exc)[:200]}', file=sys.stderr)
         return []
@@ -1715,7 +1715,7 @@ def task_flow(task, agent, push, quiet=False):
             record('risk_assessed', 'Risk profile requires human merge and additional checks',task_id,risk=risk)
         implementer,result=invoke_with_fallback(agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
         record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
-        capture_learning_proposals(result,task_id)
+        capture_learning_proposals(result,task_id,auto=not risk['human_gate'])
         plan = subtask_plan(result.replace(prompt, ''))
         if plan is not None:
             if index_tree(folder) != initial_tree:
