@@ -1427,6 +1427,95 @@ def subtask_plan(output):
     return plan
 
 
+def should_preplan(task, mode='auto'):
+    """Decide before implementation whether to request a structured multi-agent plan."""
+    if mode == 'never':
+        return False
+    if mode == 'always':
+        return True
+    text = task.strip()
+    # Multi-feature requests and longer tasks deserve independent work packages.
+    words = len(text.split())
+    separate_goals = sum(text.lower().count(term) for term in (
+        ' and ', ' also ', ' daarnaast ', ' bovendien ', ' weekly ',
+        ' wekelijks ', ' en ', ';', '\n-', '\n1.', '\n2.'))
+    return words >= 65 or (words >= 28 and separate_goals >= 2)
+
+
+def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
+                 mode='auto'):
+    """Plan before editing, validate, and make a safe execution decision.
+
+    A complex task never silently falls through to an unbounded one-agent
+    implementation if the planning response was missing or malformed.
+    """
+    if not should_preplan(task, mode):
+        return None
+    if len(enabled_agents()) < 2:
+        raise RuntimeError('Automatic parallel planning requires two enabled agents.')
+    print('ATS: planning bounded work before implementation...', flush=True)
+    phase('planning', task_id, agent=agent)
+    baseline = index_tree(folder)
+    prompt = (
+        f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. Plan ONLY, do not edit any files. '
+        f'Project: {APP.name}. Task: {task}\n'
+        'Inspect the code to divide this task into 2-20 concrete implementable parts '
+        'with tests and independently reviewable outcomes. '
+        'Return exactly ONE LINE starting ATS_SUBTASKS_JSON: followed by valid JSON. '
+        'The JSON format is a list of task strings and independent pairs of task strings. '
+        'Example: ATS_SUBTASKS_JSON: ["Inspect shared interfaces and add tests", '
+        '["Implement independent inbox safety scorer in dedicated files", '
+        '"Implement weekly newsletter audit in separate files"], '
+        '"Integrate, run tests, and verify all parts together"]. '
+        'Prefer at least one safe independent pair when two components have disjoint ownership. '
+        'Put dependencies BEFORE dependent work. '
+        'Only group two parts as a pair when they touch disjoint files and can run '
+        'in parallel safely; if uncertain use consecutive strings. '
+        'Never have two agents modify the same file concurrently. '
+        'Every part needs a testable acceptance criterion; include file boundaries '
+        'where they are known. Do not include credentials, raw email data, '
+        'deployment, live trading, or deletion without explicit approval. '
+        'Do not implement any changes. Do not add explanations outside the JSON line.'
+    )
+    last_problem = None
+    for attempt in range(2):
+        try:
+            planner, output = invoke_with_fallback(
+                agent, prompt + (f'\nYour prior plan was unusable: {last_problem}. '
+                                 'Correct the JSON and return only the marker line.'
+                                 if last_problem else ''),
+                folder, unavailable, task_id, 'planning', quiet=quiet)
+        finally:
+            modified = restore_if_changed(folder, baseline)
+            if modified:
+                record('planning_warning',
+                       'Planner modified files; reverted: ' + ', '.join(modified[:10]),
+                       task_id, planner=agent)
+        try:
+            plan = subtask_plan(output)
+        except RuntimeError as exc:
+            last_problem = str(exc)
+            continue
+        if plan is not None:
+            waves = plan_waves(plan)
+            if mode == 'always' and not any(len(wave) == 2 for wave in waves):
+                last_problem = 'No safe parallel pair was proposed'
+                continue
+            record('task_split', 'Validated preflight plan before implementation',
+                   task_id, planner=planner, subtasks=plan,
+                   parallel_pairs=sum(len(wave) == 2 for wave in waves))
+            phase('planned', task_id, waves=len(waves),
+                  parallel_pairs=sum(len(wave) == 2 for wave in waves))
+            print(f'ATS: {sum(len(w) for w in waves)} parts in {len(waves)} waves; '
+                  f'{sum(len(w) == 2 for w in waves)} parallel pairs.', flush=True)
+            return plan
+        last_problem = 'ATS_SUBTASKS_JSON marker missing'
+    raise RuntimeError(
+        'Preflight planner did not return a safe, valid task plan after two attempts: '
+        + str(last_problem) + '. No implementation started.'
+    )
+
+
 def other_agent(agent):
     return alternate_agent(agent)
 
@@ -1710,7 +1799,7 @@ def preset_task_id():
         raise RuntimeError('ATS_TASK_ID must be a UUID: ' + value)
 
 
-def task_flow(task, agent, push, quiet=False):
+def task_flow(task, agent, push, quiet=False, parallel='auto'):
     conf=project()
     repository = execute(['git', 'rev-parse', '--show-toplevel'], check=False)
     local_mode = repository.returncode != 0
@@ -1737,6 +1826,8 @@ def task_flow(task, agent, push, quiet=False):
             execute(['git','worktree','add','-b',branch,str(folder),'HEAD'])
         worktree_created=True
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+        preflight_plan = preplan_task(task, task_id, folder, agent, unavailable, conf,
+                                       quiet=quiet, mode=parallel)
         phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
         prompt = (f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'}. Task: {task}. "
                   "Assess task size before editing. If it is too large for one complete review "
@@ -1759,15 +1850,21 @@ def task_flow(task, agent, push, quiet=False):
                   + '[{"kind":"finding","title":"<title>","observation":"<observation>",'
                   + '"evidence":"<evidence>"}] (replace the placeholders, or use []). '
                   + 'Only evidence-backed items, no secrets; proposals are not approved rules.')
-        initial_tree = index_tree(folder)
-        implementer,result=invoke_with_fallback(agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
-        record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
-        capture_learning_proposals(result,task_id)
-        plan = subtask_plan(result.replace(prompt, ''))
-        if plan is not None:
-            if index_tree(folder) != initial_tree:
+        if preflight_plan is not None:
+            plan = preflight_plan
+            implementer = agent
+        else:
+            initial_tree = index_tree(folder)
+            implementer,result=invoke_with_fallback(
+                agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
+            record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
+            capture_learning_proposals(result,task_id)
+            plan = subtask_plan(result.replace(prompt, ''))
+            if plan is not None and index_tree(folder) != initial_tree:
                 raise RuntimeError('Task planning modified files; worktree retained for diagnosis')
-            record('task_split', 'Task divided into reviewable parts', task_id, subtasks=plan)
+        if plan is not None:
+            if preflight_plan is None:
+                record('task_split', 'Task divided into reviewable parts', task_id, subtasks=plan)
             approved,reviewer,implementer,history=subtask_flow(
                 task,plan,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet)
         else:
@@ -1848,7 +1945,7 @@ def child_run(argv):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks')
     p=sub.add_parser('event');p.add_argument('kind');p.add_argument('summary');p.add_argument('--task')
     p=sub.add_parser('run');p.add_argument('argv',nargs=argparse.REMAINDER)
     p=sub.add_parser('agents', help='List, enable or disable coding agents')
@@ -1879,7 +1976,7 @@ def main():
             print(json.dumps({'enabled': selected, 'supported': list(SUPPORTED_AGENTS),
                               'installed': {name: bool(executable(name)) for name in SUPPORTED_AGENTS}},
                              indent=2))
-        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet)
+        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
         elif args.command=='learn':learn(args.kind,args.title,args.observation,args.evidence,args.task,args.confidence,'human')
