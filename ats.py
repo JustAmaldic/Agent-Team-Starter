@@ -293,11 +293,6 @@ def _refresh_private_knowledge():
 DATA_PUSH_ATTEMPTS = 3
 
 
-def data_sync_mode():
-    """'push' (default): commit straight to ATS-data main. 'pr': one rolling PR per computer."""
-    return 'pr' if os.environ.get('ATS_DATA_SYNC', '').strip().lower() == 'pr' else 'push'
-
-
 def _publish_commit(root, pending, ref):
     """A commit of origin/main plus the local data, made in a temporary worktree (local main untouched)."""
     publish = Path(tempfile.mkdtemp(prefix='ats-data-publish-'))
@@ -316,11 +311,10 @@ def _drop_worktree(root, publish):
 
 
 def _sync_private_data():
-    """Publish local data to ATS-data; the local checkout stays on main and never loses data.
+    """Push private data directly to main, never create a data PR.
 
-    Default: push one commit (origin/main + all local data) straight to main. If another computer
-    pushed first, ATS fetches and tries again on top of it. If main is protected, ATS falls back to
-    one rolling PR per computer (also the mode when ATS_DATA_SYNC=pr).
+    Concurrent pushes are retried against the newest main. Failure retains
+    pending local files and leaves the application task outcome unchanged.
     """
     if PRIVATE_DATA_REPO is None:
         raise RuntimeError('Clone your private ATS data repository into ~/.ats-data or set ATS_DATA_REPO.')
@@ -331,31 +325,35 @@ def _sync_private_data():
     if not pending:
         print('ATS: private knowledge up to date.', flush=True)
         return
-    branch = data_sync_branch()
-    if data_sync_mode() == 'push':
-        problem = ''
-        for _ in range(DATA_PUSH_ATTEMPTS):
-            publish = _publish_commit(root, pending, 'origin/main')
-            try:
-                pushed = execute(['git', 'push', '--quiet', 'origin', 'HEAD:main'], publish, check=False, timeout=120)
-            finally:
-                _drop_worktree(root, publish)
-            if pushed.returncode == 0:
-                pending = _refresh_private_knowledge()   # local copies now equal main: clean
-                print(f'ATS: private knowledge pushed to ATS-data main'
-                      f'{" (" + str(len(pending)) + " newer local files left)" if pending else ""}.', flush=True)
-                _close_old_sync_pr(gh, repo, branch, root)
+    last_problem = ''
+    for _ in range(DATA_PUSH_ATTEMPTS):
+        publish = _publish_commit(root, pending, 'origin/main')
+        try:
+            pushed = execute(['git', 'push', '--quiet', 'origin', 'HEAD:main'],
+                             publish, check=False, timeout=120)
+        finally:
+            _drop_worktree(root, publish)
+        if pushed.returncode == 0:
+            pending = _refresh_private_knowledge()
+            print('ATS: private knowledge pushed directly to ' + repo + '/main'
+                  + (' (' + str(len(pending)) + ' newer local files pending)'
+                     if pending else '') + '.', flush=True)
+            _close_old_sync_pr(gh, repo, data_sync_branch(), root)
+            return
+        last_problem = (pushed.stderr or pushed.stdout or 'unknown git push error').strip()
+        lowered = last_problem.lower()
+        if any(term in lowered for term in ('non-fast-forward', 'fetch first', 'stale info',
+                                            'failed to push some refs')):
+            pending = _refresh_private_knowledge()
+            if not pending:
                 return
-            problem = (pushed.stderr or pushed.stdout).strip()
-            if 'non-fast-forward' in problem or 'fetch first' in problem or 'rejected' in problem and 'protected' not in problem:
-                pending = _refresh_private_knowledge()   # someone else pushed: rebuild on top of it
-                if not pending:
-                    return
-                continue
-            break
-        print('ATS: direct push to ATS-data main refused; using a pull request instead. '
-              + problem[-200:], file=sys.stderr)
-    _sync_by_pull_request(gh, repo, branch, root, pending)
+            continue
+        break
+    raise RuntimeError(
+        'ATS-data direct push to ' + repo + '/main failed. No PR was created; '
+        'local events and knowledge are retained for retry with .ats data-sync. '
+        'Check write permissions and main branch protection. Git: ' + last_problem[-400:]
+    )
 
 
 def _close_old_sync_pr(gh, repo, branch, root):
@@ -367,26 +365,6 @@ def _close_old_sync_pr(gh, repo, branch, root):
                  'ATS now pushes ATS-data straight to main; this data is already there.'], root, check=False)
 
 
-def _sync_by_pull_request(gh, repo, branch, root, pending):
-    remote = execute(['git', 'ls-remote', '--heads', 'origin', branch], root, timeout=60).stdout.split()
-    lease = f'--force-with-lease={branch}:{remote[0] if remote else ""}'
-    publish = _publish_commit(root, pending, 'origin/main')
-    try:
-        execute(['git', 'push', '--quiet', lease, 'origin', f'HEAD:refs/heads/{branch}'], publish, timeout=120)
-    finally:
-        _drop_worktree(root, publish)
-    existing = execute([gh, 'pr', 'list', '--repo', repo, '--head', branch, '--state', 'open',
-                        '--json', 'url', '--jq', '.[0].url'], root, check=False).stdout.strip()
-    if existing:
-        print('ATS: private knowledge PR updated: ' + existing, flush=True)
-        return
-    pr = execute([gh, 'pr', 'create', '--repo', repo, '--base', 'main', '--head', branch,
-                  '--title', 'ATS: synchronize private agent knowledge',
-                  '--body', 'Private events and proposed knowledge from this computer. ATS keeps this one PR '
-                            'up to date on top of main; review and merge it. No automatic merge.'], root)
-    print('ATS: private knowledge PR: ' + pr.stdout.strip(), flush=True)
-
-
 def refresh_private_knowledge():
     """Bring in merged knowledge before a task, keeping local unpublished data."""
     if PRIVATE_DATA_REPO is None:
@@ -396,7 +374,7 @@ def refresh_private_knowledge():
 
 
 def auto_sync_private_data():
-    """Best-effort PR creation after tasks; never hide the application's result."""
+    """Best-effort direct data push after tasks; never hide the application's result."""
     if PRIVATE_DATA_REPO is None:
         print('ATS: no private ATS-data clone configured; task history stays local.',
               file=sys.stderr)
