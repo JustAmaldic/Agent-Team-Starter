@@ -1880,11 +1880,11 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
         worktree_created=True
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         if plan_file:
-            candidate = json.loads(Path(plan_file).expanduser().read_text(encoding='utf-8'))
-            preflight_plan = candidate.get('subtasks') if isinstance(candidate, dict) else candidate
-            if not valid_plan(preflight_plan):
-                raise RuntimeError('Invalid editable plan: expected 2-20 bounded subtasks')
-            record('task_split', 'Human-approved editable plan', task_id, subtasks=preflight_plan)
+            preflight_plan = provided_task_plan(plan_file, task)
+            record('task_split', 'Human-approved editable plan', task_id, subtasks=preflight_plan,
+                   source='app_plan')
+            phase('planned', task_id, waves=len(plan_waves(preflight_plan)),
+                  parallel_pairs=sum(len(w) == 2 for w in plan_waves(preflight_plan)))
         else:
             preflight_plan = preplan_task(task, task_id, folder, agent, unavailable, conf,
                                          quiet=quiet, mode=parallel)
@@ -2006,6 +2006,7 @@ def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
     p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file')
+    p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('performance')
     p=sub.add_parser('feedback');p.add_argument('comments_json');p.add_argument('--existing-ids')
@@ -2054,6 +2055,7 @@ def main():
             relations = json.loads(Path(args.relations_json).read_text(encoding='utf-8'))
             print(json.dumps(intelligence.relation_issues(items, relations),indent=2))
         elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file)
+        elif args.command=='plan':preview_task_plan(' '.join(args.description), args.agent)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
         elif args.command=='learn':learn(args.kind,args.title,args.observation,args.evidence,args.task,args.confidence,'human')
