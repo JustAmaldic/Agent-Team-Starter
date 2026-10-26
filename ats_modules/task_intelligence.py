@@ -46,14 +46,35 @@ def suggest_plan(task):
     profile = classify_task(task)
     checks = ["Existing project test_commands", *profile["required_checks"]]
     complexity = "L" if profile["level"] == "high" or len(task) > 600 else "M" if len(task) > 130 else "S"
+    steps = [{"id": "scope", "title": "Inspect relevant code and acceptance criteria",
+              "depends_on": [], "checks": [], "agent": "auto"}]
+    categories = profile["categories"]
+    risks = profile["risks"]
+    additions = []
+    if "security" in risks:
+        additions.append(("security", "Map authentication, authorization and trust boundaries"))
+    if "database" in risks:
+        additions.append(("migration", "Plan reversible migration and data integrity checks"))
+    if "financial" in risks:
+        additions.append(("financial", "Validate order safety and paper-mode risk limits"))
+    if "frontend" in categories:
+        additions.append(("interface", "Inspect existing components, style tokens and accessibility"))
+    if "architecture" in categories or "refactoring" in categories:
+        additions.append(("architecture", "Identify module boundaries and compatibility risks"))
+    if "testing" in categories:
+        additions.append(("testplan", "Select representative unit and integration tests"))
+    for ident, title in additions:
+        steps.append({"id": ident, "title": title,
+                      "depends_on": ["scope"], "checks": [], "agent": "auto"})
+    dependencies = [item[0] for item in additions] or ["scope"]
+    steps.extend([
+        {"id": "implementation", "title": "Implement the requested change in bounded parts",
+         "depends_on": dependencies, "checks": [], "agent": "auto"},
+        {"id": "verification", "title": "Run tests and independent review",
+         "depends_on": ["implementation"], "checks": checks, "agent": "auto"}])
     return {"task": task, "complexity": complexity, "risk": profile,
-            "steps": [
-                {"id": "scope", "title": "Inspect relevant code and acceptance criteria",
-                 "depends_on": [], "checks": [], "agent": "auto"},
-                {"id": "implementation", "title": "Implement the requested change in bounded parts",
-                 "depends_on": ["scope"], "checks": [], "agent": "auto"},
-                {"id": "verification", "title": "Run tests and independent review",
-                 "depends_on": ["implementation"], "checks": checks, "agent": "auto"}]}
+            "steps": steps}
+
 
 
 def validate_plan(plan):
