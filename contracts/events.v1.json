@@ -1,0 +1,86 @@
+{
+  "version": "ats.event.v1",
+  "description": "Immutable ATS producer events and host run state vocabulary. Unknown extension fields permitted.",
+  "required": [
+    "timestamp",
+    "project",
+    "task_id",
+    "event_type"
+  ],
+  "event_types": [
+    "assigned",
+    "phase",
+    "implementation",
+    "review_result",
+    "feedback_response",
+    "error",
+    "blocked",
+    "escalated",
+    "usage_exhausted",
+    "sandbox_blocked",
+    "review_skipped",
+    "learning_proposed",
+    "program_started",
+    "program_stopped"
+  ],
+  "phase_stages": [
+    "implementation",
+    "checks",
+    "review",
+    "revision",
+    "approved",
+    "pr",
+    "pr_created",
+    "patch",
+    "finished"
+  ],
+  "active_run_stages": [
+    "queued",
+    "starting",
+    "assigned",
+    "implementation",
+    "checks",
+    "review",
+    "revision",
+    "approved",
+    "pr"
+  ],
+  "terminal_run_stages": [
+    "done",
+    "escalated",
+    "blocked",
+    "error",
+    "cancelled",
+    "interrupted"
+  ],
+  "inbox_run_stages": [
+    "escalated",
+    "blocked",
+    "error",
+    "interrupted"
+  ],
+  "severity": [
+    "BLOCKER",
+    "MAJOR",
+    "MINOR",
+    "SUGGESTION"
+  ],
+  "response_statuses": [
+    "fixed",
+    "not_applicable",
+    "deferred"
+  ],
+  "knowledge_statuses": [
+    "proposed",
+    "verified",
+    "approved",
+    "rejected",
+    "superseded"
+  ],
+  "rules": {
+    "producer": "ATS CLI owns event generation, review verdict and approval gate",
+    "consumer": "ATS-app projects validated events into a UI read model; it does not redefine ATS approval",
+    "unknown_events": "preserve unknown event types for forward compatibility; ignore in projections",
+    "knowledge": "agent observations must carry evidence and cannot override policy"
+  }
+}
