@@ -245,12 +245,37 @@ def _refresh_private_knowledge():
     return pending_data(root)
 
 
-def _sync_private_data():
-    """Publish local data in one rolling PR per computer; the local checkout stays on main.
+DATA_PUSH_ATTEMPTS = 3
 
-    The PR branch is rebuilt from origin/main plus everything that is still local, in a temporary
-    worktree, so it never conflicts with main and never repeats data that is already merged. The
-    local files stay where they are until their PR is merged; the next refresh then cleans them.
+
+def data_sync_mode():
+    """'push' (default): commit straight to ATS-data main. 'pr': one rolling PR per computer."""
+    return 'pr' if os.environ.get('ATS_DATA_SYNC', '').strip().lower() == 'pr' else 'push'
+
+
+def _publish_commit(root, pending, ref):
+    """A commit of origin/main plus the local data, made in a temporary worktree (local main untouched)."""
+    publish = Path(tempfile.mkdtemp(prefix='ats-data-publish-'))
+    execute(['git', 'worktree', 'add', '--force', '--detach', str(publish), ref], root)
+    _write_pending(publish, pending)
+    execute(['git', 'add', '-A', '--', *DATA_FOLDERS], publish)
+    execute(['git', *git_identity(publish), 'commit', '--quiet', '-m',
+             f'ATS: private events and learned knowledge ({len(pending)} files)'], publish)
+    return publish
+
+
+def _drop_worktree(root, publish):
+    execute(['git', 'worktree', 'remove', '--force', str(publish)], root, check=False)
+    shutil.rmtree(publish, ignore_errors=True)
+    execute(['git', 'worktree', 'prune'], root, check=False)
+
+
+def _sync_private_data():
+    """Publish local data to ATS-data; the local checkout stays on main and never loses data.
+
+    Default: push one commit (origin/main + all local data) straight to main. If another computer
+    pushed first, ATS fetches and tries again on top of it. If main is protected, ATS falls back to
+    one rolling PR per computer (also the mode when ATS_DATA_SYNC=pr).
     """
     if PRIVATE_DATA_REPO is None:
         raise RuntimeError('Clone your private ATS data repository into ~/.ats-data or set ATS_DATA_REPO.')
@@ -262,20 +287,49 @@ def _sync_private_data():
         print('ATS: private knowledge up to date.', flush=True)
         return
     branch = data_sync_branch()
+    if data_sync_mode() == 'push':
+        problem = ''
+        for _ in range(DATA_PUSH_ATTEMPTS):
+            publish = _publish_commit(root, pending, 'origin/main')
+            try:
+                pushed = execute(['git', 'push', '--quiet', 'origin', 'HEAD:main'], publish, check=False, timeout=120)
+            finally:
+                _drop_worktree(root, publish)
+            if pushed.returncode == 0:
+                pending = _refresh_private_knowledge()   # local copies now equal main: clean
+                print(f'ATS: private knowledge pushed to ATS-data main'
+                      f'{" (" + str(len(pending)) + " newer local files left)" if pending else ""}.', flush=True)
+                _close_old_sync_pr(gh, repo, branch, root)
+                return
+            problem = (pushed.stderr or pushed.stdout).strip()
+            if 'non-fast-forward' in problem or 'fetch first' in problem or 'rejected' in problem and 'protected' not in problem:
+                pending = _refresh_private_knowledge()   # someone else pushed: rebuild on top of it
+                if not pending:
+                    return
+                continue
+            break
+        print('ATS: direct push to ATS-data main refused; using a pull request instead. '
+              + problem[-200:], file=sys.stderr)
+    _sync_by_pull_request(gh, repo, branch, root, pending)
+
+
+def _close_old_sync_pr(gh, repo, branch, root):
+    """After a direct push, a sync PR left over from the PR mode is no longer needed."""
+    number = execute([gh, 'pr', 'list', '--repo', repo, '--head', branch, '--state', 'open',
+                      '--json', 'number', '--jq', '.[0].number'], root, check=False).stdout.strip()
+    if number:
+        execute([gh, 'pr', 'close', number, '--repo', repo, '--delete-branch', '--comment',
+                 'ATS now pushes ATS-data straight to main; this data is already there.'], root, check=False)
+
+
+def _sync_by_pull_request(gh, repo, branch, root, pending):
     remote = execute(['git', 'ls-remote', '--heads', 'origin', branch], root, timeout=60).stdout.split()
     lease = f'--force-with-lease={branch}:{remote[0] if remote else ""}'
-    publish = Path(tempfile.mkdtemp(prefix='ats-data-publish-'))
+    publish = _publish_commit(root, pending, 'origin/main')
     try:
-        execute(['git', 'worktree', 'add', '--force', '-B', branch, str(publish), 'origin/main'], root)
-        _write_pending(publish, pending)
-        execute(['git', 'add', '-A', '--', *DATA_FOLDERS], publish)
-        execute(['git', *git_identity(publish), 'commit', '--quiet', '-m',
-                 f'ATS: private events and learned knowledge ({len(pending)} files)'], publish)
-        execute(['git', 'push', '--quiet', lease, 'origin', f'{branch}:{branch}'], publish, timeout=120)
+        execute(['git', 'push', '--quiet', lease, 'origin', f'HEAD:refs/heads/{branch}'], publish, timeout=120)
     finally:
-        execute(['git', 'worktree', 'remove', '--force', str(publish)], root, check=False)
-        shutil.rmtree(publish, ignore_errors=True)
-        execute(['git', 'worktree', 'prune'], root, check=False)
+        _drop_worktree(root, publish)
     existing = execute([gh, 'pr', 'list', '--repo', repo, '--head', branch, '--state', 'open',
                         '--json', 'url', '--jq', '.[0].url'], root, check=False).stdout.strip()
     if existing:

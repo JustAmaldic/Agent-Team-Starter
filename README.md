@@ -59,7 +59,7 @@ Without these variables ATS behaves exactly as before.
 
 ## Optional: private shared history
 
-To share events and reviewed learnings between machines, create a **private** GitHub repository and clone it to `~/.ats-data` (or set `ATS_DATA_REPO` to the clone). ATS verifies with `gh` that the repository is private and keeps one pull request per computer up to date with new data after each task (rebuilt on top of `main`, so it never conflicts); it never pushes to `main`. Set `ATS_DATA_REMOTE=OWNER/REPO` to pin the expected repository. `python scripts/bootstrap_private_data.py --repo OWNER/REPO` creates and seeds one.
+To share events and reviewed learnings between machines, create a **private** GitHub repository and clone it to `~/.ats-data` (or set `ATS_DATA_REPO` to the clone). ATS verifies with `gh` that the repository is private and pushes new data straight to the data repository's `main` after each task (a normal push on top of the latest `main`, never a force-push; set `ATS_DATA_SYNC=pr` to get one pull request per computer instead, which is also the fallback when `main` is protected). Application repositories are never pushed to `main`. Set `ATS_DATA_REMOTE=OWNER/REPO` to pin the expected repository. `python scripts/bootstrap_private_data.py --repo OWNER/REPO` creates and seeds one.
 
 ## Development
 
