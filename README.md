@@ -77,3 +77,7 @@ MIT, see [LICENSE](LICENSE).
 ## Security
 
 See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## Internal modules
+
+`ats.py` remains the stable command-line entry point. Pure quota, transient-limit and sandbox classifiers now live under `ats_modules/agent_limits.py` and are re-exported from `ats.py` for compatibility. The public source export must include `ats_modules/` and `contracts/`. Run `python -m unittest discover -s tests -v` after refactors.
