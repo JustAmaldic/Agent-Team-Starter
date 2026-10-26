@@ -15,7 +15,7 @@ def proc(cmd, output=''):
 
 
 class AutoPrivateSyncTests(unittest.TestCase):
-    def test_auto_sync_attempts_private_pr(self):
+    def test_auto_sync_attempts_private_push(self):
         with patch.object(ats, 'PRIVATE_DATA_REPO', pathlib.Path('/tmp/ats-data')), \
              patch.object(ats, 'sync_private_data') as sync:
             ats.auto_sync_private_data()
@@ -148,35 +148,13 @@ class RollingDataSyncTests(unittest.TestCase):
         self.git('fetch', '-q', 'origin', cwd=self.local)
         return set(self.git('ls-tree', '-r', '--name-only', 'origin/ats-data/sync-pc', cwd=self.local).split())
 
-    def test_one_rolling_pr_that_never_conflicts_and_keeps_local_data(self):
-        os.environ['ATS_DATA_SYNC'] = 'pr'
-        self.addCleanup(os.environ.pop, 'ATS_DATA_SYNC', None)
-        self.write('data/ARC/events/e1.json', '{"n": 1}\n')
-        self.write('knowledge/decided.json', '{"status": "approved", "at": 1}\n')
-        ats.sync_private_data()
-        self.assertEqual(len(self.prs), 1)
-        self.assertEqual(self.git('branch', '--show-current', cwd=self.local).strip(), 'main')
-        self.assertTrue((self.local / 'data/ARC/events/e1.json').exists())   # nothing vanished locally
-        # more work and the same decision taken again later: the SAME PR is updated, not a new one
-        self.write('data/ARC/events/e2.json', '{"n": 2}\n')
-        self.write('knowledge/decided.json', '{"status": "approved", "at": 2}\n')
-        ats.sync_private_data()
-        self.assertEqual(len(self.prs), 1)
-        self.assertEqual(self.branch_files(), {'knowledge/decided.json', 'data/ARC/events/e1.json',
-                                               'data/ARC/events/e2.json'})
-        # meanwhile main moved on (another PR merged): the sync branch is rebuilt on top of it
-        self.write('knowledge/other.json', '{}\n', folder=self.other)
-        self.git('add', '-A', cwd=self.other)
-        self.git('commit', '-q', '-m', 'other', cwd=self.other)
-        self.git('push', '-q', 'origin', 'main', cwd=self.other)
-        ats.sync_private_data()
-        self.merge_pr()   # merges without conflicts
-        merged = self.git('show', 'origin/main:knowledge/decided.json', cwd=self.other)
-        self.assertIn('"at": 2', merged)
-        # after the merge the local copies are identical to main: clean, nothing left to publish
-        ats.sync_private_data()
-        self.assertEqual(self.git('status', '--porcelain', cwd=self.local), '')
-        self.assertTrue((self.local / 'knowledge/other.json').exists())
+    def test_legacy_pr_mode_setting_still_pushes_directly(self):
+        with patch.dict(os.environ, {'ATS_DATA_SYNC': 'pr'}):
+            self.write('data/ARC/events/new.json', '{"new": true}\n')
+            ats.sync_private_data()
+        self.assertEqual(self.prs, [])
+        self.git('pull', '-q', 'origin', 'main', cwd=self.other)
+        self.assertTrue((self.other / 'data/ARC/events/new.json').exists())
 
     def test_direct_push_lands_on_main_without_a_pr_and_cleans_local(self):
         self.write('data/ARC/events/e1.json', '{"n": 1}\n')
@@ -203,13 +181,14 @@ class RollingDataSyncTests(unittest.TestCase):
             self.assertTrue((self.other / name).exists(), name)
         self.assertEqual(self.git('status', '--porcelain', cwd=self.local), '')
 
-    def test_protected_main_falls_back_to_a_pull_request(self):
+    def test_protected_main_fails_closed_without_pr_or_data_loss(self):
         self.refuse_push = True
         self.write('data/ARC/events/e1.json', '{}\n')
-        ats.sync_private_data()
-        self.assertEqual(len(self.prs), 1)
-        self.assertIn('data/ARC/events/e1.json', self.branch_files())
+        with self.assertRaisesRegex(RuntimeError, 'No PR was created'):
+            ats.sync_private_data()
+        self.assertEqual(self.prs, [])
         self.assertTrue((self.local / 'data/ARC/events/e1.json').exists())
+        self.assertEqual(self.git('branch', '--show-current', cwd=self.local).strip(), 'main')
 
     def test_refresh_keeps_a_newer_local_version_of_a_file_changed_upstream(self):
         self.write('knowledge/decided.json', '{"status": "rejected"}\n', folder=self.other)
