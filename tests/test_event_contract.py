@@ -13,7 +13,7 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(accepted_event({'event_type': 'review_result'}))
 
     def test_review_and_pr_phase_vocabulary(self):
-        for phase in ('implementation', 'review', 'pr_created', 'patch', 'finished'):
+        for phase in ('implementation', 'review', 'merge', 'parallel', 'learning', 'pr_created', 'patch', 'finished'):
             self.assertTrue(valid_phase(phase))
         self.assertFalse(valid_phase('unknown-agent-phase'))
 
