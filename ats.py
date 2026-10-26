@@ -19,6 +19,8 @@ import time
 import uuid
 from pathlib import Path
 
+from ats_modules.task_intelligence import classify_task, suggest_plan, validate_plan
+
 from ats_contract import accepted_event, valid_phase
 
 ATS = Path(__file__).resolve().parent
@@ -940,18 +942,26 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None):
 
 def select(task):
     conf=project()
+    profile=classify_task(task)
     scores={'codex':0,'claude':0}
     keywords={'codex':['test','bug','python','fix'], 'claude':['architecture','design','refactor']}
     keywords.update(conf.get('routing',{}))
     for agent, words in keywords.items():
         if agent in scores: scores[agent] += sum(2 for x in words if x.lower() in task.lower())
-    events=sorted((DATA / cleanname(conf.get('project', APP.name)) / 'events').glob('*.json'))[-100:]
+    events=sorted((DATA / cleanname(conf.get('project', APP.name)) / 'events').glob('*.json'))[-200:]
+    outcomes={a: [] for a in scores}
     for file in events:
         try:
             e=read_json(file); agent=e.get('implementer')
             if agent in scores and e.get('event_type')=='review_result':
                 scores[agent] += 1 if e.get('approved') else -1
+                if e.get('approved') is not None:
+                    outcomes[agent].append(e)
         except (ValueError,OSError): pass
+    for candidate, history in outcomes.items():
+        similar=[e for e in history if set(e.get('task_categories', [])) & set(profile['categories'])]
+        # Only evidence-backed reviewed outcomes contribute to category routing.
+        scores[candidate] += sum(3 if e['approved'] else -3 for e in similar[-30:])
     return max(scores,key=lambda n:(scores[n],n==conf.get('default_agent','codex')))
 
 NON_GIT_EXCLUDED_NAMES = {
@@ -1657,7 +1667,8 @@ def task_flow(task, agent, push, quiet=False):
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
-    record('assigned',task,task_id,implementer=agent,branch=branch)
+    risk=classify_task(task)
+    record('assigned',task,task_id,implementer=agent,branch=branch,task_categories=risk['categories'],risk=risk)
     if not (executable('codex') or executable('claude')):
         raise RuntimeError('Neither agent executable found; run .ats install')
     worktree_created=False
@@ -1692,6 +1703,8 @@ def task_flow(task, agent, push, quiet=False):
                   + '"evidence":"<evidence>"}] (replace the placeholders, or use []). '
                   + 'Only evidence-backed items, no secrets; proposals are not approved rules.')
         initial_tree = index_tree(folder)
+        if risk['human_gate']:
+            record('risk_assessed', 'Risk profile requires human merge and additional checks',task_id,risk=risk)
         implementer,result=invoke_with_fallback(agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)
         record('implementation',result[-1600:],task_id,implementer=implementer,branch=branch)
         capture_learning_proposals(result,task_id)
@@ -1783,6 +1796,8 @@ def main():
     p=sub.add_parser('event');p.add_argument('kind');p.add_argument('summary');p.add_argument('--task')
     p=sub.add_parser('run');p.add_argument('argv',nargs=argparse.REMAINDER)
     sub.add_parser('sync');sub.add_parser('doctor');sub.add_parser('install');sub.add_parser('data-sync')
+    p=sub.add_parser('plan');p.add_argument('description',nargs='+')
+    p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     p=sub.add_parser('learn');p.add_argument('kind',choices=sorted(KNOWLEDGE_KINDS));p.add_argument('title');p.add_argument('observation');p.add_argument('--evidence',required=True);p.add_argument('--task');p.add_argument('--confidence',choices=CONFIDENCE_LEVELS,default='medium')
     args=parser.parse_args()
     if os.environ.get('ATS_APP') and not APP.is_dir():
@@ -1803,6 +1818,8 @@ def main():
             install_requirements()
             install_agents()
         elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet)
+        elif args.command=='plan':print(json.dumps(suggest_plan(' '.join(args.description)),indent=2))
+        elif args.command=='risk':print(json.dumps(classify_task(' '.join(args.description)),indent=2))
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
         elif args.command=='learn':learn(args.kind,args.title,args.observation,args.evidence,args.task,args.confidence,'human')
