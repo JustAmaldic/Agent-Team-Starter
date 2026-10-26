@@ -983,6 +983,11 @@ def invoke_antigravity(prompt, cwd, quiet=False, backoff=None, purpose='implemen
         mode = 'accept-edits'
     command = [binary, '-p', prompt, '--output-format', 'json',
                '--mode=' + mode, '--print-timeout', '25m']
+    model = os.environ.get('ATS_ANTIGRAVITY_MODEL', '').strip()
+    if model:
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}', model):
+            raise RuntimeError('Invalid Antigravity model slug')
+        command.extend(['--model', model])
     delays = RATE_LIMIT_BACKOFF if backoff is None else backoff
     attempt = 0
     while True:
