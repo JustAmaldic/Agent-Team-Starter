@@ -37,6 +37,49 @@ def app_directory():
 
 
 APP = app_directory()
+
+SUPPORTED_AGENTS = ('codex', 'claude', 'gemini', 'opencode')
+DEFAULT_AGENTS = ('codex', 'claude')
+
+
+def agents_config_path():
+    return APP / '.ats-agents.json'
+
+
+def enabled_agents():
+    path = agents_config_path()
+    if not path.exists():
+        return list(DEFAULT_AGENTS)
+    try:
+        config = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f'Invalid {path}: {exc}') from exc
+    agents = config.get('enabled') if isinstance(config, dict) else None
+    if not isinstance(agents, list) or not agents or any(
+        not isinstance(a, str) or a not in SUPPORTED_AGENTS for a in agents
+    ) or len(agents) != len(set(agents)):
+        raise RuntimeError(f'{path}: enabled must be a non-empty list of unique supported agents')
+    return agents
+
+
+def configure_agents(enable=(), disable=()):
+    selected = enabled_agents()
+    for name in (*enable, *disable):
+        if name not in SUPPORTED_AGENTS:
+            raise RuntimeError(f'Unknown agent: {name}')
+    for name in enable:
+        if name not in selected:
+            selected.append(name)
+    selected = [name for name in selected if name not in disable]
+    if not selected:
+        raise RuntimeError('At least one agent must remain enabled')
+    path = agents_config_path()
+    path.write_text(json.dumps({'enabled': selected}, indent=2) + '\n', encoding='utf-8')
+    return selected
+
+
+def alternate_agent(agent, unavailable=()):
+    return next((name for name in enabled_agents() if name != agent and name not in unavailable), None)
 def state_directory():
     """Keep project-specific agent output outside the Git repository."""
     root = Path(os.environ.get('ATS_STATE_DIR', str(Path.home() / '.ats-state'))).expanduser()
@@ -687,12 +730,18 @@ def codex_preflight(cwd, quiet=False):
 
 def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quiet=False,
                          fallback=True):
-    other = 'claude' if agent == 'codex' else 'codex'
-    reasons = {}
-    resets = []
-    for candidate in ((agent, other) if fallback else (agent,)):
+    selected = enabled_agents()
+    if agent not in selected:
+        raise RuntimeError(f'Agent {agent} is disabled. Configure it with .ats agents --enable {agent}')
+    candidates = [agent] + ([name for name in selected if name != agent] if fallback else [])
+    reasons, resets = {}, []
+    for candidate in candidates:
         if candidate in unavailable:
             reasons[candidate] = unavailable_reason(unavailable, candidate)
+            continue
+        if not executable(candidate):
+            mark_unavailable(unavailable, candidate, 'missing CLI')
+            reasons[candidate] = 'missing CLI'
             continue
         try:
             if not quiet:
@@ -724,7 +773,7 @@ def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quie
         if not fallback:
             raise AgentUsageExhausted(agent, resets[0].split(': ', 1)[-1] if resets else None)
         raise BothAgentsExhausted('; '.join(resets) or None)
-    raise RuntimeError('No usable agent available: ' +
+    raise RuntimeError('No usable enabled agent available: ' +
                        ', '.join(f'{a} {r}' for a, r in sorted(reasons.items())))
 
 
@@ -754,7 +803,7 @@ def claude_authenticated(output):
 
 
 def executable(name):
-    if os.name == 'nt' and name in ('npm', 'codex', 'claude'):
+    if os.name == 'nt' and name in ('npm', *SUPPORTED_AGENTS):
         return shutil.which(name + '.cmd') or shutil.which(name + '.exe') or shutil.which(name)
     return shutil.which(name)
 
@@ -828,37 +877,43 @@ def install_requirements():
 
 
 def install_agents():
-    print('ATS: configuring Codex first, then Claude Code.', flush=True)
-    if not executable('codex'):
+    selected = enabled_agents()
+    print('ATS: configuring enabled agents: ' + ', '.join(selected), flush=True)
+    if 'codex' in selected and not executable('codex'):
         if executable('npm'):
             execute([executable('npm'), 'install', '-g', '@openai/codex'], capture=False)
         elif shutil.which('brew'):
             execute(['brew', 'install', '--cask', 'codex'], capture=False)
         else:
             raise RuntimeError('Install Node.js/npm or Homebrew before installing Codex')
-    if not executable('codex'):
-        raise RuntimeError('Codex installed but not on PATH; reopen terminal and retry')
-    if execute(agent_command('codex', 'login', 'status'), check=False).returncode:
-        execute(agent_command('codex', 'login'), capture=False)
-    if execute(agent_command('codex', 'login', 'status'), check=False).returncode:
-        raise RuntimeError('Codex login not completed')
-    print('Codex ready. Moving to Claude Code.', flush=True)
-    if not executable('claude'):
+    if 'codex' in selected:
+        if not executable('codex'):
+            raise RuntimeError('Codex installed but not on PATH; reopen terminal and retry')
+        if execute(agent_command('codex', 'login', 'status'), check=False).returncode:
+            execute(agent_command('codex', 'login'), capture=False)
+        if execute(agent_command('codex', 'login', 'status'), check=False).returncode:
+            raise RuntimeError('Codex login not completed')
+        print('Codex ready.', flush=True)
+    if 'claude' in selected and not executable('claude'):
         if shutil.which('brew'):
             execute(['brew', 'install', '--cask', 'claude-code'], capture=False)
         elif executable('npm'):
             execute([executable('npm'), 'install', '-g', '@anthropic-ai/claude-code'], capture=False)
         else:
             raise RuntimeError('Install Homebrew or Node.js/npm before installing Claude Code')
-    if not executable('claude'):
-        raise RuntimeError('Claude Code installed but not on PATH; reopen terminal and retry')
-    result = execute(agent_command('claude', 'auth', 'status'), check=False)
-    if result.returncode or not claude_authenticated(result.stdout):
-        execute(agent_command('claude', 'auth', 'login'), capture=False)
-    result = execute(agent_command('claude', 'auth', 'status'), check=False)
-    if result.returncode or not claude_authenticated(result.stdout):
-        raise RuntimeError('Claude Code login not completed')
-    print('Both agents installed and authenticated.', flush=True)
+    if 'claude' in selected:
+        if not executable('claude'):
+            raise RuntimeError('Claude Code installed but not on PATH; reopen terminal and retry')
+        result = execute(agent_command('claude', 'auth', 'status'), check=False)
+        if result.returncode or not claude_authenticated(result.stdout):
+            execute(agent_command('claude', 'auth', 'login'), capture=False)
+        result = execute(agent_command('claude', 'auth', 'status'), check=False)
+        if result.returncode or not claude_authenticated(result.stdout):
+            raise RuntimeError('Claude Code login not completed')
+    for name in selected:
+        if name in ('gemini', 'opencode') and not executable(name):
+            raise RuntimeError(f'{name} CLI missing: install it and authenticate before using ATS')
+    print('Enabled agents ready.', flush=True)
 
 
 def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None):
@@ -912,13 +967,24 @@ def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None):
 
 
 def invoke(agent, prompt, cwd, quiet=False, backoff=None):
-    command = codex_exec_command() if agent == 'codex' else claude_print_command()
+    commands = {
+        'codex': codex_exec_command,
+        'claude': claude_print_command,
+        'gemini': lambda: agent_command('gemini', '-p', ''),
+        'opencode': lambda: agent_command('opencode', 'run'),
+    }
+    if agent not in commands:
+        raise RuntimeError(f'Unsupported agent: {agent}')
+    command = commands[agent]()
+    if agent == 'opencode':
+        command.append(prompt)
     if not executable(agent):
         raise RuntimeError(f'{agent} executable missing; run .ats install')
     delays = RATE_LIMIT_BACKOFF if backoff is None else backoff
     attempt = 0
     while True:
-        p = stream_command(command, cwd, timeout=1800, quiet=quiet, stdin_text=prompt)
+        p = stream_command(command, cwd, timeout=1800, quiet=quiet,
+                           stdin_text=None if agent == 'opencode' else prompt)
         out = (p.stdout or '')+'\n'+(p.stderr or '')
         if p.returncode and is_transient_rate_limit(out) and attempt < len(delays):
             print(f'ATS: {agent} is rate limited; retrying in {delays[attempt]}s '
@@ -940,7 +1006,7 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None):
 
 def select(task):
     conf=project()
-    scores={'codex':0,'claude':0}
+    scores={name: 0 for name in enabled_agents()}
     keywords={'codex':['test','bug','python','fix'], 'claude':['architecture','design','refactor']}
     keywords.update(conf.get('routing',{}))
     for agent, words in keywords.items():
@@ -1241,9 +1307,9 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             record('blocked', 'Agent made no changes; worktree preserved for diagnosis', task_id, **context,
                    implementer=implementer, branch=branch)
             raise RuntimeError('Agent made no changes; worktree preserved for diagnosis: ' + str(folder))
-        preferred = 'claude' if implementer == 'codex' else 'codex'
-        if preferred in unavailable:
-            message = f'Independent review unavailable: {preferred} is not available ({unavailable_reason(unavailable, preferred)})'
+        preferred = alternate_agent(implementer, unavailable)
+        if preferred is None:
+            message = 'Independent review unavailable: no other enabled agent is available'
             print(message, file=sys.stderr)
             record('review_skipped', message, task_id, **context, implementer=implementer, reviewer=preferred)
             reasons = ['no independent reviewer available']
@@ -1362,7 +1428,7 @@ def subtask_plan(output):
 
 
 def other_agent(agent):
-    return 'claude' if agent == 'codex' else 'codex'
+    return alternate_agent(agent)
 
 
 def git_identity(folder):
@@ -1505,8 +1571,8 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
     history, attribution = [], []
     reviewer, author, number = None, implementer, 0
     for wave in waves:
-        other = other_agent(implementer)
-        if implementer in unavailable or other in unavailable:
+        other = alternate_agent(implementer, unavailable)
+        if implementer in unavailable or other is None:
             record('escalated', 'Both agents are required for subtask handoffs', task_id,
                    subtask=number + 1, branch=branch)
             return False, reviewer, implementer, history
@@ -1652,14 +1718,16 @@ def task_flow(task, agent, push, quiet=False):
         raise RuntimeError('Run ATS from the application repository root')
     if local_mode and push:
         raise RuntimeError('This project is not a Git repository. Run .ats task without --push; local changes will be exported as a patch.')
+    if agent != 'auto' and agent not in enabled_agents():
+        raise RuntimeError(f'{agent} is disabled. Use .ats agents --enable {agent}')
     agent=select(task) if agent=='auto' else agent
     task_id=preset_task_id() or str(uuid.uuid4())
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
     record('assigned',task,task_id,implementer=agent,branch=branch)
-    if not (executable('codex') or executable('claude')):
-        raise RuntimeError('Neither agent executable found; run .ats install')
+    if not any(executable(name) for name in enabled_agents()):
+        raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
     worktree_created=False
     try:
         if local_mode:
@@ -1705,8 +1773,9 @@ def task_flow(task, agent, push, quiet=False):
         else:
             approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
                                                                base=base_commit)
+        learning_agent = reviewer or alternate_agent(implementer) or implementer
         distill_learnings(task, task_id, folder, history,
-                          reviewer or ('claude' if implementer == 'codex' else 'codex'), unavailable, quiet=quiet)
+                          learning_agent, unavailable, quiet=quiet)
         execute(['git','add','-A'],folder)
         staged = execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
         if not staged:
@@ -1779,9 +1848,12 @@ def child_run(argv):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto','codex','claude'],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages')
     p=sub.add_parser('event');p.add_argument('kind');p.add_argument('summary');p.add_argument('--task')
     p=sub.add_parser('run');p.add_argument('argv',nargs=argparse.REMAINDER)
+    p=sub.add_parser('agents', help='List, enable or disable coding agents')
+    p.add_argument('--enable', choices=SUPPORTED_AGENTS, action='append', default=[])
+    p.add_argument('--disable', choices=SUPPORTED_AGENTS, action='append', default=[])
     sub.add_parser('sync');sub.add_parser('doctor');sub.add_parser('install');sub.add_parser('data-sync')
     p=sub.add_parser('learn');p.add_argument('kind',choices=sorted(KNOWLEDGE_KINDS));p.add_argument('title');p.add_argument('observation');p.add_argument('--evidence',required=True);p.add_argument('--task');p.add_argument('--confidence',choices=CONFIDENCE_LEVELS,default='medium')
     args=parser.parse_args()
@@ -1802,6 +1874,11 @@ def main():
         if args.command=='install':
             install_requirements()
             install_agents()
+        elif args.command=='agents':
+            selected = configure_agents(args.enable, args.disable) if args.enable or args.disable else enabled_agents()
+            print(json.dumps({'enabled': selected, 'supported': list(SUPPORTED_AGENTS),
+                              'installed': {name: bool(executable(name)) for name in SUPPORTED_AGENTS}},
+                             indent=2))
         elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
@@ -1811,7 +1888,7 @@ def main():
             record('program_started',' '.join(argv)[:500]);exitcode=child_run(argv)
             record('program_stopped',f'exit code {exitcode}',exit_code=exitcode)
         elif args.command=='doctor':
-            print(json.dumps({'app':str(APP),'ats':str(ATS),'cli':{x:bool(executable(x)) for x in ('git','codex','claude','gh')},'project_config':project()},indent=2))
+            print(json.dumps({'app':str(APP),'ats':str(ATS),'cli':{x:bool(executable(x)) for x in ('git',*SUPPORTED_AGENTS,'gh')},'enabled_agents':enabled_agents(),'project_config':project()},indent=2))
         else: print('ATS synchronized')
     finally:
         if args.command == 'task':
