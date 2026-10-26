@@ -19,6 +19,8 @@ import time
 import uuid
 from pathlib import Path
 
+from ats_contract import accepted_event, valid_phase
+
 ATS = Path(__file__).resolve().parent
 
 
@@ -381,6 +383,8 @@ def emit(item):
 
 def phase(stage, task_id, **fields):
     """Live-only stage marker (not stored as an event file)."""
+    if not valid_phase(stage):
+        raise ValueError('Unknown ATS event phase: ' + str(stage))
     emit(dict(timestamp=dt.datetime.now(dt.timezone.utc).isoformat(), task_id=task_id,
               event_type='phase', stage=stage, **fields))
 
@@ -394,6 +398,8 @@ def record(kind, summary, task=None, **fields):
     uid = str(uuid.uuid4())
     item = dict(timestamp=now, project=name, task_id=task or uid, event_type=kind,
                 summary=summary, event_id=uid, **fields)
+    if not accepted_event(item, persisted=True):
+        raise ValueError('Invalid ATS persistent event envelope')
     (target / f'{now.replace(":", "-")}-{uid}.json').write_text(
         json.dumps(item, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
     emit(item)

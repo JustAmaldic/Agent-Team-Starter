@@ -77,3 +77,7 @@ MIT, see [LICENSE](LICENSE).
 ## Security
 
 See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## Shared event contract v1
+
+The canonical event, phase and run-state vocabulary is documented in `contracts/events.v1.json` and loaded by `ats_contract.py`. ATS-app keeps a mirrored file at `ats_host/contracts/events.v1.json` and checks compatibility when its pinned ATS submodule is available. Live `phase` messages require timestamp, task ID and event type; persisted event files also require a project. Unknown event types can be kept by consumers without changing run status. Keep both files in sync whenever adding a stage or event.
