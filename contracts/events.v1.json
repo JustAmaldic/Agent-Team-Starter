@@ -20,7 +20,13 @@
     "review_skipped",
     "learning_proposed",
     "program_started",
-    "program_stopped"
+    "program_stopped",
+    "task_split",
+    "planning_warning",
+    "subtask_completed",
+    "subtask_merged",
+    "subtasks_completed",
+    "merge_conflict"
   ],
   "phase_stages": [
     "implementation",
@@ -34,7 +40,9 @@
     "finished",
     "merge",
     "parallel",
-    "learning"
+    "learning",
+    "planning",
+    "planned"
   ],
   "active_run_stages": [
     "queued",
