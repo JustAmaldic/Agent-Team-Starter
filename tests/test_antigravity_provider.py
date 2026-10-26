@@ -49,6 +49,24 @@ class AntigravityProviderTests(unittest.TestCase):
         self.assertIn('--output-format', calls[0])
         self.assertNotIn('--dangerously-skip-permissions', calls[0])
 
+    def test_optional_model_is_passed_to_cli(self):
+        def fake_stream(command, cwd, **kwargs):
+            self.assertEqual(command[-2:], ['--model', 'gemini-3.8-flash-medium'])
+            return subprocess.CompletedProcess(command, 0,
+                json.dumps({'status': 'SUCCESS', 'response': 'done'}), '')
+        with patch.object(ats, 'executable', return_value='/usr/bin/agy'), \
+             patch.dict(ats.os.environ, {'ATS_ANTIGRAVITY_MODEL': 'gemini-3.8-flash-medium'}), \
+             patch.object(ats, 'stream_command', side_effect=fake_stream):
+            self.assertEqual(ats.invoke_antigravity('Fix tests', pathlib.Path('.'), quiet=True), 'done')
+
+    def test_invalid_model_setting_fails_without_invoking_cli(self):
+        with patch.object(ats, 'executable', return_value='/usr/bin/agy'), \
+             patch.dict(ats.os.environ, {'ATS_ANTIGRAVITY_MODEL': '--dangerously-skip-permissions'}), \
+             patch.object(ats, 'stream_command') as stream:
+            with self.assertRaisesRegex(RuntimeError, 'Invalid Antigravity model slug'):
+                ats.invoke_antigravity('Fix tests', pathlib.Path('.'), quiet=True)
+            stream.assert_not_called()
+
     def test_windows_uses_agy_shim(self):
         with patch.object(ats.os, 'name', 'nt'), \
              patch.object(ats.shutil, 'which', side_effect=lambda name: 'C:/agy.cmd' if name == 'agy.cmd' else None):
