@@ -1205,7 +1205,14 @@ def review_prompt(task, checks, diff, history, style=''):
                     "author's responses (null = no answer):\n" + json.dumps(items, ensure_ascii=False) +
                     "\nVerify every one against the diff. Keep a finding open (same id) unless it is "
                     "really resolved; an unanswered BLOCKER/MAJOR or a deferred BLOCKER stays open.\n")
+    risk = classify_task(task)
+    extra_risk_review = (
+        "HIGH-RISK TASK: independently check each item below. Missing evidence is a MAJOR finding: "
+        + "; ".join(risk["required_checks"]) + ".\\n"
+        if risk["human_gate"] else ""
+    )
     return (f"Review ONLY these application changes for task {task!r} using {ATS/'POLICY.md'}.\n"
+            + extra_risk_review +
             "REVIEW-ONLY MODE: do not create, edit or delete any file. ATS checks the workspace "
             "afterwards; any change is reverted and the review is rejected.\n"
             "Inspect the diff and test results below yourself; do not rely on the implementer's summary.\n"
