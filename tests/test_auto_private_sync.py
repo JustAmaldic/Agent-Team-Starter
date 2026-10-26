@@ -1,3 +1,4 @@
+import os
 import pathlib
 import subprocess
 import sys
@@ -88,10 +89,21 @@ class RollingDataSyncTests(unittest.TestCase):
         self.git('clone', '-q', str(self.origin), str(self.local), cwd=base)
         self.identity(self.local)
         self.prs = []
+        self.before_push = None   # hook: runs just before the first direct push to main
+        self.refuse_push = None   # simulate a protected main branch
         real = ats.execute
 
         def execute(cmd, cwd=None, **kwargs):
+            if cmd[:2] == ['git', 'push'] and cmd[-1] == 'HEAD:main':
+                if self.refuse_push:
+                    return subprocess.CompletedProcess(
+                        cmd, 1, '', 'remote: error: GH006: Protected branch update failed for refs/heads/main.')
+                if self.before_push:
+                    hook, self.before_push = self.before_push, None
+                    hook()
             if cmd[0] == 'gh':
+                if cmd[1:3] == ['pr', 'close']:
+                    return proc(cmd, '')
                 if cmd[1:3] == ['pr', 'list']:
                     return proc(cmd, self.prs[-1] + '\n' if self.prs else '')
                 if cmd[1:3] == ['pr', 'create']:
@@ -137,6 +149,8 @@ class RollingDataSyncTests(unittest.TestCase):
         return set(self.git('ls-tree', '-r', '--name-only', 'origin/ats-data/sync-pc', cwd=self.local).split())
 
     def test_one_rolling_pr_that_never_conflicts_and_keeps_local_data(self):
+        os.environ['ATS_DATA_SYNC'] = 'pr'
+        self.addCleanup(os.environ.pop, 'ATS_DATA_SYNC', None)
         self.write('data/ARC/events/e1.json', '{"n": 1}\n')
         self.write('knowledge/decided.json', '{"status": "approved", "at": 1}\n')
         ats.sync_private_data()
@@ -163,6 +177,39 @@ class RollingDataSyncTests(unittest.TestCase):
         ats.sync_private_data()
         self.assertEqual(self.git('status', '--porcelain', cwd=self.local), '')
         self.assertTrue((self.local / 'knowledge/other.json').exists())
+
+    def test_direct_push_lands_on_main_without_a_pr_and_cleans_local(self):
+        self.write('data/ARC/events/e1.json', '{"n": 1}\n')
+        self.write('knowledge/decided.json', '{"status": "approved"}\n')
+        ats.sync_private_data()
+        self.assertEqual(self.prs, [])
+        self.git('pull', '-q', 'origin', 'main', cwd=self.other)
+        self.assertTrue((self.other / 'data/ARC/events/e1.json').exists())
+        self.assertIn('approved', (self.other / 'knowledge/decided.json').read_text())
+        self.assertEqual(self.git('status', '--porcelain', cwd=self.local), '')
+        self.assertEqual(self.git('branch', '--show-current', cwd=self.local).strip(), 'main')
+
+    def test_direct_push_retries_on_top_of_another_computer(self):
+        def other_computer_pushes():
+            self.write('data/HB/events/other.json', '{}\n', folder=self.other)
+            self.git('add', '-A', cwd=self.other)
+            self.git('commit', '-q', '-m', 'other computer', cwd=self.other)
+            self.git('push', '-q', 'origin', 'main', cwd=self.other)
+        self.before_push = other_computer_pushes
+        self.write('data/ARC/events/mine.json', '{}\n')
+        ats.sync_private_data()
+        self.git('pull', '-q', 'origin', 'main', cwd=self.other)
+        for name in ('data/HB/events/other.json', 'data/ARC/events/mine.json'):
+            self.assertTrue((self.other / name).exists(), name)
+        self.assertEqual(self.git('status', '--porcelain', cwd=self.local), '')
+
+    def test_protected_main_falls_back_to_a_pull_request(self):
+        self.refuse_push = True
+        self.write('data/ARC/events/e1.json', '{}\n')
+        ats.sync_private_data()
+        self.assertEqual(len(self.prs), 1)
+        self.assertIn('data/ARC/events/e1.json', self.branch_files())
+        self.assertTrue((self.local / 'data/ARC/events/e1.json').exists())
 
     def test_refresh_keeps_a_newer_local_version_of_a_file_changed_upstream(self):
         self.write('knowledge/decided.json', '{"status": "rejected"}\n', folder=self.other)
