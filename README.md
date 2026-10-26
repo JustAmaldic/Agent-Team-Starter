@@ -1,10 +1,10 @@
 # Agent Team Starter (ATS)
 
-ATS is a Python command-line coordinator for Codex CLI and Claude Code. It can create isolated application worktrees, run tests and an independent review, and optionally open a draft pull request for an application with a Git remote. Projects without Git can use isolated local snapshots and reviewable patches.
+ATS is a Python command-line coordinator for configurable coding agents (Codex CLI, Claude Code, Gemini CLI and OpenCode). It can create isolated application worktrees, run tests and an independent review, and optionally open a draft pull request for an application with a Git remote. Projects without Git can use isolated local snapshots and reviewable patches.
 
 ## Requirements
 
-Python 3.10+, Git, Node.js/npm for installing agent CLIs, and optionally GitHub CLI (`gh`) for application pull requests. Codex and Claude Code authentication and subscriptions are independent.
+Python 3.10+, Git, Node.js/npm for installing agent CLIs, and optionally GitHub CLI (`gh`) for application pull requests. Agent authentication and subscriptions are independent. Codex and Claude are enabled by default, preserving the existing setup.
 
 ## Install
 
@@ -20,6 +20,24 @@ source ~/.zshrc
 ```
 
 On Windows, run `powershell -NoProfile -File .ats/setup.ps1` for the PowerShell shortcut, and open a new terminal. Use `py -3 .ats/ats.py doctor` without a shell shortcut.
+
+## Choose your agents
+
+Agent selection is stored per application in `.ats-agents.json`. Existing projects default to Codex and Claude until you change it.
+
+```bash
+.ats agents                            # list enabled agents and installed CLIs
+.ats agents --enable gemini             # add Gemini to the pool
+.ats agents --enable opencode           # add OpenCode
+.ats agents --disable claude            # do not select or launch Claude
+.ats agents --enable claude --disable codex
+.ats install                            # configure only enabled agents
+.ats task "Improve tests" --agent gemini
+```
+
+Multiple `--enable` and `--disable` flags can be combined. ATS refuses to disable the last agent or run a task with a disabled agent. `auto` routing and usage/sandbox fallback choose from enabled agents only. Gemini CLI and OpenCode require their CLI and authentication to be installed separately; `.ats install` checks that these are available.
+
+**Independent reviews:** for automatic cross-agent review, enable at least two agents with working CLIs. With a single agent ATS may implement a change, but it will not approve or publish a PR without independent review. Multiple agents may work in separate Git worktrees during a split task.
 
 ## Tasks
 
