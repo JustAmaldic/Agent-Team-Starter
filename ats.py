@@ -1806,6 +1806,48 @@ def preset_task_id():
         raise RuntimeError('ATS_TASK_ID must be a UUID: ' + value)
 
 
+def preview_task_plan(task, agent='auto', quiet=True):
+    """Run ATS's actual preflight planner in a disposable read-only snapshot."""
+    repository = execute(['git', 'rev-parse', '--show-toplevel'], check=False)
+    local_mode = repository.returncode != 0
+    if not local_mode and Path(repository.stdout.strip()).resolve() != APP.resolve():
+        raise RuntimeError('Run ATS from the project repository root')
+    selected = select(task) if agent == 'auto' else agent
+    if selected not in enabled_agents():
+        raise RuntimeError('Selected planning agent is disabled')
+    unavailable = UnavailableAgents()
+    task_id = str(uuid.uuid4())
+    folder = APP.parent / f'{APP.name}-ats-plan-{task_id[:8]}'
+    try:
+        if local_mode:
+            make_local_workspace(folder, 'ats/plan-' + task_id[:8])
+        else:
+            execute(['git', 'worktree', 'add', '--detach', str(folder), 'HEAD'])
+        plan = preplan_task(task, task_id, folder, selected, unavailable, project(),
+                            quiet=quiet, mode='auto' if should_preplan(task) else 'always')
+        print('ATS_PLAN_JSON: ' + json.dumps(plan, ensure_ascii=False), flush=True)
+        return plan
+    finally:
+        if local_mode:
+            shutil.rmtree(folder, ignore_errors=True)
+        else:
+            execute(['git', 'worktree', 'remove', '--force', str(folder)], check=False)
+
+
+def provided_task_plan(path, task):
+    """Validate explicit user-edited plan from the app; never trust plan file paths as code."""
+    source = Path(path).expanduser().resolve()
+    if not source.is_file() or source.stat().st_size > 32768:
+        raise RuntimeError('Plan file missing or too large')
+    payload = json.loads(source.read_text(encoding='utf-8'))
+    if not isinstance(payload, dict) or payload.get('task') != task:
+        raise RuntimeError('Plan is not bound to the requested task')
+    plan = payload.get('waves')
+    if not valid_plan(plan):
+        raise RuntimeError('Invalid custom task plan (2-20 parts, up to 2 per wave)')
+    return plan
+
+
 def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None):
     conf=project()
     risk = intelligence.risk_profile(task)
@@ -1838,11 +1880,11 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
         worktree_created=True
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         if plan_file:
-            candidate = json.loads(Path(plan_file).expanduser().read_text(encoding='utf-8'))
-            preflight_plan = candidate.get('subtasks') if isinstance(candidate, dict) else candidate
-            if not valid_plan(preflight_plan):
-                raise RuntimeError('Invalid editable plan: expected 2-20 bounded subtasks')
-            record('task_split', 'Human-approved editable plan', task_id, subtasks=preflight_plan)
+            preflight_plan = provided_task_plan(plan_file, task)
+            record('task_split', 'Human-approved editable plan', task_id, subtasks=preflight_plan,
+                   source='app_plan')
+            phase('planned', task_id, waves=len(plan_waves(preflight_plan)),
+                  parallel_pairs=sum(len(w) == 2 for w in plan_waves(preflight_plan)))
         else:
             preflight_plan = preplan_task(task, task_id, folder, agent, unavailable, conf,
                                          quiet=quiet, mode=parallel)
@@ -1964,6 +2006,7 @@ def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
     p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file')
+    p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('performance')
     p=sub.add_parser('feedback');p.add_argument('comments_json');p.add_argument('--existing-ids')
@@ -2012,6 +2055,7 @@ def main():
             relations = json.loads(Path(args.relations_json).read_text(encoding='utf-8'))
             print(json.dumps(intelligence.relation_issues(items, relations),indent=2))
         elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file)
+        elif args.command=='plan':preview_task_plan(' '.join(args.description), args.agent)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
         elif args.command=='learn':learn(args.kind,args.title,args.observation,args.evidence,args.task,args.confidence,'human')
