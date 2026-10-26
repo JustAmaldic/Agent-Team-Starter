@@ -18,7 +18,7 @@ class TaskIntelligenceTests(unittest.TestCase):
     def test_plan_is_editable_and_dependencies_are_ordered(self):
         result = suggest_plan("Refactor architecture of Python application")
         self.assertTrue(validate_plan(result))
-        self.assertEqual(result["steps"][2]["depends_on"], ["implementation"])
+        self.assertEqual(result["steps"][-1]["depends_on"], ["implementation"])
         result["steps"][0]["title"] = "Inspect the relevant existing modules"
         self.assertTrue(validate_plan(result))
 
