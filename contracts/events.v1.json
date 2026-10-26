@@ -31,7 +31,10 @@
     "pr",
     "pr_created",
     "patch",
-    "finished"
+    "finished",
+    "merge",
+    "parallel",
+    "learning"
   ],
   "active_run_stages": [
     "queued",
