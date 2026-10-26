@@ -136,3 +136,18 @@ The following commands provide inspectable, deterministic foundations for the ne
 Performance scores use completed task events and a minimum of three samples per agent/category before influencing routing. Revision and token statistics are estimates based on available event records; missing usage is not treated as measured zero consumption. Defects reappearing in later PRs are not tracked yet.
 
 Feedback and knowledge-check commands currently accept exported JSON, not automatic GitHub webhook ingestion or a persisted knowledge graph. Contradictions are flagged for humans, never deleted or auto-resolved. The interactive planning editor, graph viewer, secure approval workflow and direct GitHub callback processing remain follow-up application features.
+
+## Visual ATS-app planner handoff
+
+ATS-app can ask the **real** CLI planner for preview waves and send a user-edited, validated plan back to the task run:
+
+```bash
+python .ats/ats.py plan "Improve ARC inbox security and add a weekly privacy audit"
+python .ats/ats.py task "Improve ARC inbox security and add a weekly privacy audit" --plan-file /path/to/approved-plan.json
+```
+
+The `plan` command asks an enabled agent to inspect an isolated temporary worktree, emits one `ATS_PLAN_JSON:` line, and removes that preview worktree afterward. No implementation starts during preview.
+
+Approved plan files must contain `{"task":"EXACT TASK DESCRIPTION","waves":["first sequential part",["parallel part A","parallel part B"],"integration and tests"]}`. The CLI validates the task binding and structure before execution. ATS-app stores the plan and passes it with `--plan-file`; it never substitutes a merely decorative UI preview for the actual execution plan. Use distinct files for parallel parts, and retain independent reviews and integration checks.
+
+**Compatibility:** update the ATS-app pinned ATS-core submodule to the commit including these `plan` and `--plan-file` capabilities before enabling the interface. Running a newer app against an older CLI is not supported.
