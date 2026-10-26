@@ -3,7 +3,6 @@
   "description": "Immutable ATS producer events and host run state vocabulary. Unknown extension fields permitted.",
   "required": [
     "timestamp",
-    "project",
     "task_id",
     "event_type"
   ],
@@ -82,5 +81,11 @@
     "consumer": "ATS-app projects validated events into a UI read model; it does not redefine ATS approval",
     "unknown_events": "preserve unknown event types for forward compatibility; ignore in projections",
     "knowledge": "agent observations must carry evidence and cannot override policy"
-  }
+  },
+  "persisted_required": [
+    "timestamp",
+    "project",
+    "task_id",
+    "event_type"
+  ]
 }
