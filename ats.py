@@ -941,28 +941,36 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None):
 
 
 def select(task):
-    conf=project()
-    profile=classify_task(task)
-    scores={'codex':0,'claude':0}
-    keywords={'codex':['test','bug','python','fix'], 'claude':['architecture','design','refactor']}
-    keywords.update(conf.get('routing',{}))
+    """Use bounded, reviewed and category-matched historical outcomes for routing."""
+    conf = project()
+    profile = classify_task(task)
+    scores = {'codex': 0, 'claude': 0}
+    keywords = {'codex': ['test', 'bug', 'python', 'fix'],
+                'claude': ['architecture', 'design', 'refactor']}
+    keywords.update(conf.get('routing', {}))
     for agent, words in keywords.items():
-        if agent in scores: scores[agent] += sum(2 for x in words if x.lower() in task.lower())
-    events=sorted((DATA / cleanname(conf.get('project', APP.name)) / 'events').glob('*.json'))[-200:]
-    outcomes={a: [] for a in scores}
+        if agent in scores:
+            scores[agent] += sum(2 for word in words if word.lower() in task.lower())
+    events = sorted((DATA / cleanname(conf.get('project', APP.name)) / 'events').glob('*.json'))[-500:]
+    assigned = {}
+    reviews = []
     for file in events:
         try:
-            e=read_json(file); agent=e.get('implementer')
-            if agent in scores and e.get('event_type')=='review_result':
-                scores[agent] += 1 if e.get('approved') else -1
-                if e.get('approved') is not None:
-                    outcomes[agent].append(e)
-        except (ValueError,OSError): pass
-    for candidate, history in outcomes.items():
-        similar=[e for e in history if set(e.get('task_categories', [])) & set(profile['categories'])]
-        # Only evidence-backed reviewed outcomes contribute to category routing.
-        scores[candidate] += sum(3 if e['approved'] else -3 for e in similar[-30:])
-    return max(scores,key=lambda n:(scores[n],n==conf.get('default_agent','codex')))
+            event = read_json(file)
+            if event.get('event_type') == 'assigned':
+                assigned[event.get('task_id')] = event.get('task_categories') or classify_task(event.get('summary', ''))['categories']
+            elif event.get('event_type') == 'review_result':
+                reviews.append(event)
+        except (ValueError, OSError, KeyError):
+            continue
+    for event in reviews[-100:]:
+        implementer = event.get('implementer')
+        if implementer not in scores or type(event.get('approved')) is not bool:
+            continue
+        task_categories = set(assigned.get(event.get('task_id'), []))
+        if task_categories & set(profile['categories']):
+            scores[implementer] += 3 if event['approved'] else -3
+    return max(scores, key=lambda name: (scores[name], name == conf.get('default_agent', 'codex')))
 
 NON_GIT_EXCLUDED_NAMES = {
     '.ats', '.git', '.venv', 'venv', 'node_modules', '__pycache__',
