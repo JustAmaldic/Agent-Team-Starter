@@ -986,13 +986,16 @@ def invoke_antigravity(prompt, cwd, quiet=False, backoff=None, purpose='implemen
     delays = RATE_LIMIT_BACKOFF if backoff is None else backoff
     attempt = 0
     while True:
-        result = stream_command(command, cwd, timeout=1800, quiet=quiet)
-        combined = (result.stdout or '') + '\\n' + (result.stderr or '')
+        result = stream_command(command, cwd, timeout=1800, quiet=True)
+        combined = (result.stdout or '') + '\n' + (result.stderr or '')
         if result.returncode and is_transient_rate_limit(combined) and attempt < len(delays):
             time.sleep(delays[attempt])
             attempt += 1
             continue
-        return parse_antigravity_result(result.stdout, result.stderr, result.returncode)
+        text = parse_antigravity_result(result.stdout, result.stderr, result.returncode)
+        if not quiet:
+            print(text, flush=True)
+        return text
 
 
 def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementation'):
