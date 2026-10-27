@@ -989,7 +989,7 @@ def invoke_antigravity(prompt, cwd, quiet=False, backoff=None, purpose='implemen
         mode = 'accept-edits'
     command = [binary, '-p', prompt, '--output-format', 'json',
                '--mode=' + mode, '--print-timeout', '25m']
-    model = os.environ.get('ATS_ANTIGRAVITY_MODEL', '').strip()
+    model = selected_agent_model('antigravity') or os.environ.get('ATS_ANTIGRAVITY_MODEL', '').strip()
     if model:
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}', model):
             raise RuntimeError('Invalid Antigravity model slug')
@@ -1009,6 +1009,15 @@ def invoke_antigravity(prompt, cwd, quiet=False, backoff=None, purpose='implemen
         return text
 
 
+def selected_agent_model(agent):
+    value = os.environ.get('ATS_MODEL_' + agent.upper(), '').strip()
+    if not value:
+        return None
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/:-]{0,127}', value):
+        raise RuntimeError(f'Invalid configured model ID for {agent}')
+    return value
+
+
 def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementation'):
     if agent == 'antigravity':
         return invoke_antigravity(prompt, cwd, quiet=quiet, backoff=backoff, purpose=purpose)
@@ -1021,6 +1030,12 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementatio
     if agent not in commands:
         raise RuntimeError(f'Unsupported agent: {agent}')
     command = commands[agent]()
+    model = selected_agent_model(agent)
+    if model:
+        if agent == 'codex':
+            command[-1:-1] = ['--model', model]
+        else:
+            command.extend(['--model', model])
     if agent == 'opencode':
         command.append(prompt)
     if not executable(agent):
