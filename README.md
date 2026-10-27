@@ -157,3 +157,7 @@ Approved plan files must contain `{"task":"EXACT TASK DESCRIPTION","waves":["fir
 Antigravity is an optional fifth agent (disabled by default). Install the official CLI so `agy` is on PATH and run `agy` interactively once to authenticate. Enable it with `.ats agents --enable antigravity`. It supports implementation, planning, independent review, fallback and separate worktrees. ATS uses headless JSON output and validates the terminal status, exit code and denied permissions. Implementations use `--mode=accept-edits`; planning and review use `--mode=plan`. ATS does not use `--dangerously-skip-permissions`.
 
 An optional `ATS_ANTIGRAVITY_MODEL` environment variable chooses a model slug from `agy models`. Headless mode may require narrowly scoped permission rules for shell commands; permissions are not automatically broadened. See [official docs](https://www.antigravity.google/docs/cli/headless/).
+
+## Host-controlled agent availability
+
+ATS-app passes a comma-separated `ATS_BLOCKED_AGENTS` environment variable for quota-exhausted CLIs, such as `claude`. ATS excludes these from all new agent selection and cross-agent review, independent of the persisted enabled-agent settings. The host clears its block at the expected subscription reset and new ATS runs can select Claude again. CLI usage still follows existing usage-limit error handling. This does not relax independent reviews or use Claude while it is marked unavailable.
