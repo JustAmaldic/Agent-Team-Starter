@@ -48,24 +48,30 @@ def agents_config_path():
     return APP / '.ats-agents.json'
 
 
-def enabled_agents():
+def enabled_agents(include_blocked=False):
+    """Return selectable agents; keep configured roster intact across temporary quota limits."""
     path = agents_config_path()
     if not path.exists():
-        return list(DEFAULT_AGENTS)
-    try:
-        config = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(f'Invalid {path}: {exc}') from exc
-    agents = config.get('enabled') if isinstance(config, dict) else None
-    if not isinstance(agents, list) or not agents or any(
-        not isinstance(a, str) or a not in SUPPORTED_AGENTS for a in agents
-    ) or len(agents) != len(set(agents)):
-        raise RuntimeError(f'{path}: enabled must be a non-empty list of unique supported agents')
-    return agents
+        configured = list(DEFAULT_AGENTS)
+    else:
+        try:
+            config = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f'Invalid {path}: {exc}') from exc
+        configured = config.get('enabled') if isinstance(config, dict) else None
+        if not isinstance(configured, list) or not configured or any(
+            not isinstance(a, str) or a not in SUPPORTED_AGENTS for a in configured
+        ) or len(configured) != len(set(configured)):
+            raise RuntimeError(f'{path}: enabled must be a non-empty list of unique supported agents')
+    if include_blocked:
+        return configured
+    blocked = {name.strip().lower() for name in os.environ.get('ATS_BLOCKED_AGENTS', '').split(',')
+               if name.strip()}
+    return [name for name in configured if name not in blocked]
 
 
 def configure_agents(enable=(), disable=()):
-    selected = enabled_agents()
+    selected = enabled_agents(include_blocked=True)
     for name in (*enable, *disable):
         if name not in SUPPORTED_AGENTS:
             raise RuntimeError(f'Unknown agent: {name}')
@@ -1046,6 +1052,8 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementatio
 def select(task):
     conf=project()
     scores={name: 0 for name in enabled_agents()}
+    if not scores:
+        raise RuntimeError('No available agents: check the host weekly usage limits.')
     keywords={'codex':['test','bug','python','fix'], 'claude':['architecture','design','refactor']}
     keywords.update(conf.get('routing',{}))
     for agent, words in keywords.items():
