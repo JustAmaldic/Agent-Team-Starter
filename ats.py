@@ -51,7 +51,8 @@ def agents_config_path():
 def enabled_agents():
     path = agents_config_path()
     if not path.exists():
-        return list(DEFAULT_AGENTS)
+        blocked = {name.strip().lower() for name in os.environ.get('ATS_BLOCKED_AGENTS', '').split(',') if name.strip()}
+        return [name for name in DEFAULT_AGENTS if name not in blocked]
     try:
         config = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError) as exc:
@@ -61,7 +62,8 @@ def enabled_agents():
         not isinstance(a, str) or a not in SUPPORTED_AGENTS for a in agents
     ) or len(agents) != len(set(agents)):
         raise RuntimeError(f'{path}: enabled must be a non-empty list of unique supported agents')
-    return agents
+    blocked = {name.strip().lower() for name in os.environ.get('ATS_BLOCKED_AGENTS', '').split(',') if name.strip()}
+    return [name for name in agents if name not in blocked]
 
 
 def configure_agents(enable=(), disable=()):
