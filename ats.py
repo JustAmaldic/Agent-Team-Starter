@@ -1033,8 +1033,7 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementatio
     model = selected_agent_model(agent)
     if model:
         if agent == 'codex':
-            command.insert(2, '--model')
-            command.insert(3, model)
+            command[-1:-1] = ['--model', model]
         else:
             command.extend(['--model', model])
     if agent == 'opencode':
