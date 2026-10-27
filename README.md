@@ -161,3 +161,7 @@ An optional `ATS_ANTIGRAVITY_MODEL` environment variable chooses a model slug fr
 ## Host-controlled agent availability
 
 ATS-app passes a comma-separated `ATS_BLOCKED_AGENTS` environment variable for quota-exhausted CLIs, such as `claude`. ATS excludes these from all new agent selection and cross-agent review, independent of the persisted enabled-agent settings. The host clears its block at the expected subscription reset and new ATS runs can select Claude again. CLI usage still follows existing usage-limit error handling. This does not relax independent reviews or use Claude while it is marked unavailable.
+
+## Per-agent model overrides
+
+ATS-app can supply a model ID independently for each enabled CLI through `ATS_MODEL_CODEX`, `ATS_MODEL_CLAUDE`, `ATS_MODEL_GEMINI`, `ATS_MODEL_OPENCODE` and `ATS_MODEL_ANTIGRAVITY`. A blank setting preserves the provider's default. Nonempty values must be valid model IDs accepted by the selected CLI. The CLI invocation receives `--model <model-id>`; unsupported model IDs fail visibly instead of quietly choosing a different model. The selected model does not bypass review, sandboxing, agent enablement or quota limits.
