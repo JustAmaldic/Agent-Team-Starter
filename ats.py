@@ -1908,6 +1908,88 @@ def provided_task_plan(path, task):
     return plan
 
 
+def fresh_base(conf):
+    """The ref a new task starts from: origin/<base_branch> right after a fetch.
+
+    Starting from the local HEAD made work begin on an old main whenever the local checkout was
+    behind GitHub, which caused most merge conflicts. Without a usable remote it is HEAD.
+    """
+    base = conf.get('base_branch', 'main')
+    if 'origin' not in execute(['git', 'remote'], check=False).stdout.split():
+        return 'HEAD'
+    fetched = execute(['git', 'fetch', '--quiet', 'origin', base], check=False, timeout=120)
+    ref = f'origin/{base}'
+    if fetched.returncode == 0 and execute(['git', 'rev-parse', '--verify', '--quiet', ref], check=False).returncode == 0:
+        return ref
+    print(f'ATS: could not fetch {ref}; starting from the local HEAD.', file=sys.stderr)
+    return 'HEAD'
+
+
+def update_from_base(task, task_id, folder, branch, conf, implementer, unavailable, quiet=False):
+    """Bring the latest base branch into the task branch before it is published.
+
+    Already up to date: nothing to do. A clean merge whose checks pass: done. A conflict or failing
+    checks: the implementer resolves it and the other agent reviews the whole change on top of the
+    new base (same approval gate). Returns (ok, review cycles).
+    """
+    base = conf.get('base_branch', 'main')
+    ref = f'origin/{base}'
+    if execute(['git', 'fetch', '--quiet', 'origin', base], folder, check=False, timeout=120).returncode:
+        print(f'ATS: could not fetch {ref}; publishing without updating the branch.', file=sys.stderr)
+        return True, []
+    if execute(['git', 'merge-base', '--is-ancestor', ref, 'HEAD'], folder, check=False).returncode == 0:
+        return True, []
+    phase('update', task_id, base=ref)
+    merged = execute(['git', *git_identity(folder), 'merge', '--no-ff', '--no-edit', '-m', f'ATS: merge {ref}', ref],
+                     folder, check=False)
+    if merged.returncode == 0:
+        checks = run_checks(conf, folder)
+        if all(c['passed'] for c in checks):
+            record('base_merged', f'{ref} merged cleanly into the task branch', task_id, branch=branch)
+            print(f'ATS: branch updated with {ref}.', flush=True)
+            return True, []
+        problem = (f'After merging the latest {base} into your branch these checks fail; fix them so your change '
+                   f'works on top of the new {base}:\n'
+                   + json.dumps([{'command': c['command'], 'output': c['output'][-1500:]}
+                                 for c in checks if not c['passed']], ensure_ascii=False))
+    else:
+        conflicts = execute(['git', 'diff', '--name-only', '--diff-filter=U'], folder, check=False).stdout.split()
+        problem = (f'While you worked, {base} changed. Merging it into your branch produced conflicts in: '
+                   + ', '.join(conflicts[:30]) + f'. Resolve every conflict marker: keep everything that is new on '
+                   f'{base} and re-apply the intent of your change on top of it.')
+    record('merge_conflict', problem[:1200], task_id, implementer=implementer, branch=branch, base=ref)
+    fixer = implementer if implementer not in unavailable else ('claude' if implementer == 'codex' else 'codex')
+    prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. Task: {task}\n{problem}\n'
+              'Change only what the update needs. Do not commit, push or modify .ats; ATS commits after the review.'
+              + style_context(folder, conf))
+    try:
+        fixer, output = invoke_with_fallback(fixer, prompt, folder, unavailable, task_id, 'implementation',
+                                             quiet=quiet)
+    except (AgentUsageExhausted, RuntimeError) as exc:
+        record('escalated', str(exc), task_id, branch=branch, blocking_reasons=[f'update with {ref}: {exc}'])
+        return False, []
+    record('implementation', output[-1600:], task_id, implementer=fixer, branch=branch)
+    review_task = (f'{task}\n(Update: the branch was merged with the latest {base}. The diff is the whole change '
+                   f'on top of the new {base}; check it is still correct, including the conflict resolution.)')
+    try:
+        approved, reviewer, fixer, cycles = review_loop(review_task, task_id, folder, branch, fixer, unavailable,
+                                                        conf, quiet=quiet, base=ref)
+    except RuntimeError as exc:
+        record('escalated', str(exc), task_id, branch=branch, blocking_reasons=[f'update with {ref}: {exc}'])
+        return False, []
+    for cycle in cycles:
+        cycle['update'] = ref
+    if approved:
+        execute(['git', 'add', '-A'], folder)
+        if execute(['git', 'rev-parse', '-q', '--verify', 'MERGE_HEAD'], folder, check=False).returncode == 0:
+            execute(['git', *git_identity(folder), 'commit', '--no-edit'], folder)
+        else:
+            commit_all(folder, f'ATS: update with {ref}')
+        record('base_merged', f'{ref} merged after a reviewed resolution', task_id, implementer=fixer,
+               reviewer=reviewer, branch=branch)
+    return approved, cycles
+
+
 def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None):
     conf=project()
     risk = intelligence.risk_profile(task)
@@ -1936,7 +2018,9 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             make_local_workspace(folder, branch)
             print('ATS: project has no Git repository; using an isolated local snapshot.', flush=True)
         else:
-            execute(['git','worktree','add','-b',branch,str(folder),'HEAD'])
+            start = fresh_base(conf)
+            execute(['git','worktree','add','-b',branch,str(folder),start])
+            print(f'ATS: task branch starts from {start}.', flush=True)
         worktree_created=True
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         if plan_file:
@@ -2026,6 +2110,15 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
                        + '\nEvery part was reviewed on its own diff; the combined change was not reviewed as a whole.'
                        if parts else '')
         if push:
+            updated, update_cycles = update_from_base(task, task_id, folder, branch, conf, implementer,
+                                                      unavailable, quiet=quiet)
+            history.extend(update_cycles)
+            if not updated:
+                message = (f"Not published: the branch could not be updated with the latest "
+                           f"{conf.get('base_branch', 'main')} without a human decision; worktree preserved")
+                record('escalated', message, task_id, branch=branch, blocking_reasons=[message])
+                print('ATS: ' + message, file=sys.stderr)
+                return
             phase('pr', task_id, branch=branch)
             execute(['git','push','-u','origin',branch],folder)
             if not shutil.which('gh'):
