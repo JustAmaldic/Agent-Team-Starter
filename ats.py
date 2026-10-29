@@ -2079,7 +2079,8 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
     return approved, cycles
 
 
-def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None):
+def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None,
+              resume_from=None):
     conf=project()
     risk = intelligence.risk_profile(task)
     if risk['require_human_approval'] and not approved_risk:
@@ -2097,13 +2098,42 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
+    resumed = None
+    if resume_from:
+        if local_mode or not plan_file:
+            raise RuntimeError('Checkpoint resume needs a Git project and original plan file')
+        try:
+            source_id = str(uuid.UUID(resume_from))
+        except ValueError as exc:
+            raise RuntimeError('Invalid resume source ID') from exc
+        plan_for_resume = provided_task_plan(plan_file, task)
+        source = checkpoints.read_checkpoint(DATA, source_id)
+        if not source:
+            raise RuntimeError('No reviewed checkpoint available for this source run')
+        folder = (APP.parent / f'{APP.name}-ats-{source_id[:8]}').resolve()
+        if str(folder) != source.get('worktree') or not folder.is_dir():
+            raise RuntimeError('Checkpoint worktree does not match original project')
+        branch = execute(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], folder).stdout.strip()
+        if not branch.startswith('ats/'):
+            raise RuntimeError('Resumed branch is not managed by ATS')
+        if execute(['git', 'rev-parse', '--show-toplevel'], folder).stdout.strip() != str(folder):
+            raise RuntimeError('Resumed folder is not a Git worktree')
+        head = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+        resumed = checkpoints.verified_resume(DATA, source_id, plan_for_resume, folder, head)
+        if not resumed:
+            raise RuntimeError('Source checkpoint is stale or invalid. Existing code was not modified')
     record('assigned',task,task_id,implementer=agent,branch=branch,task_categories=intelligence.categories(task))
     record('risk_profile', 'Risk-based execution profile', task_id, **risk)
     if not any(executable(name) for name in enabled_agents()):
         raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
     worktree_created=False
     try:
-        if local_mode:
+        if resumed:
+            record('resumed', 'Restored verified reviewed checkpoint', task_id,
+                   source_run=resume_from, completed=resumed['completed'],
+                   completed_nodes=resumed.get('completed_nodes', []), branch=branch)
+            print(f'ATS: resuming {resumed["completed"]} reviewed parts on {branch}.', flush=True)
+        elif local_mode:
             make_local_workspace(folder, branch)
             print('ATS: project has no Git repository; using an isolated local snapshot.', flush=True)
         else:
@@ -2159,15 +2189,17 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             if preflight_plan is None:
                 record('task_split', 'Task divided into reviewable parts', task_id, subtasks=plan)
             approved,reviewer,implementer,history=subtask_flow(
-                task,plan,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet)
+                task,plan,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,resumed=resumed)
         else:
             approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
                                                                base=base_commit)
         learning_agent = reviewer or alternate_agent(implementer) or implementer
         distill_learnings(task, task_id, folder, history,
                           learning_agent, unavailable, quiet=quiet)
-        execute(['git','add','-A'],folder)
-        staged = execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
+        # Never commit edits that have not passed independent review.
+        if approved:
+            execute(['git','add','-A'],folder)
+        staged = approved and execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
         if not staged:
             pass   # the agent already committed everything itself; nothing left to commit
         elif local_mode:
@@ -2247,7 +2279,7 @@ def child_run(argv):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file');p.add_argument('--resume-from')
     p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('performance')
@@ -2296,7 +2328,7 @@ def main():
             items = json.loads(Path(args.items_json).read_text(encoding='utf-8'))
             relations = json.loads(Path(args.relations_json).read_text(encoding='utf-8'))
             print(json.dumps(intelligence.relation_issues(items, relations),indent=2))
-        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file)
+        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file,args.resume_from)
         elif args.command=='plan':preview_task_plan(' '.join(args.description), args.agent)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
