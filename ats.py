@@ -1827,44 +1827,95 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
         # ---- a pair, in parallel: part `first` here, part `second` in a side worktree
         first, second = number + 1, number + 2
         number += 2
-        commit_all(folder, f'ATS: reviewed parts 1-{first - 1}' if first > 1 else 'ATS: start of parallel parts')
-        wave_base = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+        pending = {p['subtask']: p for p in (resumed or {}).get('pending', [])
+                   if p['subtask'] in (first, second)}
+        if not resumed:
+            commit_all(folder, f'ATS: reviewed parts 1-{first - 1}' if first > 1 else 'ATS: start of parallel parts')
+        wave_base = (next(iter(pending.values()))['wave_base'] if pending else
+                     execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip())
         side = folder.parent / f'{folder.name}-part{second}'
         side_branch = f'{branch}-part{second}'
         if side.exists():
-            raise RuntimeError('Parallel side worktree already exists; inspect it before resuming: ' + str(side))
-        execute(['git', 'worktree', 'add', '-b', side_branch, str(side), wave_base], folder)
+            if not resumed:
+                raise RuntimeError('Parallel side worktree unexpectedly exists: ' + str(side))
+            actual_branch = execute(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], side).stdout.strip()
+            if actual_branch != side_branch:
+                raise RuntimeError('Parallel side branch differs from the checkpoint')
+        else:
+            if second in pending:
+                raise RuntimeError('Approved parallel node worktree disappeared; cannot reuse review')
+            execute(['git', 'worktree', 'add', '-b', side_branch, str(side), wave_base], folder)
         phase('parallel', task_id, subtasks=[first, second], implementers=[implementer, other])
         results = {}
 
+        def from_checkpoint(number, location):
+            saved = pending.get(number)
+            if not saved:
+                return None
+            if Path(saved['worktree']).resolve() != location.resolve():
+                raise RuntimeError('Approved DAG node worktree location changed')
+            head = execute(['git', 'rev-parse', 'HEAD'], location).stdout.strip()
+            dirty = execute(['git', 'status', '--porcelain'], location).stdout.strip()
+            if head != saved['commit'] or dirty:
+                raise RuntimeError('Approved DAG node snapshot changed: cannot skip review')
+            record('subtask_resumed', 'Reusing independently reviewed parallel node',
+                   task_id, subtask=number, implementer=saved['implementer'],
+                   reviewer=saved['reviewer'], branch=branch)
+            return True, saved['reviewer'], saved['implementer'], []
+
+        reuse_a = from_checkpoint(first, folder)
+        reuse_b = from_checkpoint(second, side)
+        if reuse_a:
+            results['a'] = reuse_a
+        if reuse_b:
+            results['b'] = reuse_b
+
         def build(key, *args):
             try:
-                results[key] = run_part(*args)
-            except Exception as exc:   # never leave the other thread waiting on a crash
+                results[key] = run_part(*args, resume_work=bool(resumed))
+            except Exception as exc:
                 record('escalated', str(exc), task_id, subtask=args[2], branch=branch,
                        blocking_reasons=[f'subtask {args[2]}: {exc}'])
                 results[key] = (False, None, args[8], [])
 
-        threads = [
-            threading.Thread(target=build, args=('a', task, plan, first, total, wave[0], task_id, folder, branch,
-                                                 implementer, unavailable, conf, wave_base, quiet,
-                                                 (second, wave[1]))),
-            threading.Thread(target=build, args=('b', task, plan, second, total, wave[1], task_id, side, branch,
-                                                 other, unavailable, conf, wave_base, quiet,
-                                                 (first, wave[0]))),
-        ]
+        threads = []
+        if not reuse_a:
+            threads.append(threading.Thread(
+                target=build, args=('a', task, plan, first, total, wave[0], task_id, folder, branch,
+                                    implementer, unavailable, conf, wave_base, quiet, (second, wave[1]))))
+        if not reuse_b:
+            threads.append(threading.Thread(
+                target=build, args=('b', task, plan, second, total, wave[1], task_id, side, branch,
+                                    other, unavailable, conf, wave_base, quiet, (first, wave[0]))))
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
         (ok_a, reviewer_a, author_a, cycles_a), (ok_b, reviewer_b, author_b, cycles_b) = results['a'], results['b']
         history.extend(cycles_a + cycles_b)
+        if ok_a:
+            commit_all(folder, f'ATS: part {first}')
+        if ok_b:
+            commit_all(side, f'ATS: part {second}')
         if not (ok_a and ok_b):
-            print(f'ATS: parallel parts {first}/{second} not both approved; side worktree kept: {side}',
+            approved_pending = []
+            for ok, number_in_pair, directory, writer, judge in (
+                    (ok_a, first, folder, author_a, reviewer_a),
+                    (ok_b, second, side, author_b, reviewer_b)):
+                if ok and judge:
+                    approved_pending.append({
+                        'subtask': number_in_pair, 'worktree': str(directory.resolve()),
+                        'commit': execute(['git', 'rev-parse', 'HEAD'], directory).stdout.strip(),
+                        'wave_base': wave_base, 'implementer': writer, 'reviewer': judge,
+                    })
+            if approved_pending:
+                checkpoints.save_checkpoint(
+                    DATA, task_id, plan, folder,
+                    execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip(),
+                    first - 1, attribution, pending=approved_pending)
+            print(f'ATS: part {first}/{second} pending; only unapproved DAG nodes require repair',
                   file=sys.stderr)
             return False, reviewer_a or reviewer_b, author_a, history
-        commit_all(folder, f'ATS: part {first}')
-        commit_all(side, f'ATS: part {second}')
         attribution.append(dict(subtask=first, implementer=author_a, reviewer=reviewer_a))
         attribution.append(dict(subtask=second, implementer=author_b, reviewer=reviewer_b))
         merged, merge_reviewer, merge_cycles = merge_parallel_part(
