@@ -1810,7 +1810,8 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             number += 1
             approved, reviewer, author, cycles = run_part(
                 task, plan, number, total, wave[0], task_id, folder, branch, implementer, unavailable, conf,
-                base=index_tree(folder), quiet=quiet, resume_work=bool(resumed))
+                base=(execute(['git', 'rev-parse', 'HEAD^{tree}'], folder).stdout.strip()
+                      if resumed else index_tree(folder)), quiet=quiet, resume_work=bool(resumed))
             history.extend(cycles)
             if not approved:
                 return False, reviewer, author, history
