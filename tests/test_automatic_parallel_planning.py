@@ -52,6 +52,10 @@ class PreflightPlanningTests(unittest.TestCase):
         self.assertEqual(len(ats.plan_waves(plan)[1]), 2)
         self.assertEqual(agent.call_count, 1)
         self.assertIn('Plan ONLY, do not edit any files', agent.call_args.args[1])
+        self.assertIn('shortest safe critical path', agent.call_args.args[1])
+        self.assertIn('write sets are disjoint', agent.call_args.args[1])
+        self.assertIn('require each other', agent.call_args.args[1])
+        self.assertIn('final integration and cross-feature test pass', agent.call_args.args[1])
         self.assertIn('parallel_pairs', record.call_args.kwargs)
 
     def test_missing_plan_fails_without_running_implementation(self):
