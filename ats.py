@@ -2176,6 +2176,9 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             raise RuntimeError('Resumed branch is not managed by ATS')
         if execute(['git', 'rev-parse', '--show-toplevel'], folder).stdout.strip() != str(folder):
             raise RuntimeError('Resumed folder is not a Git worktree')
+        roots = execute(['git', 'worktree', 'list', '--porcelain'], APP).stdout.splitlines()
+        if 'worktree ' + str(folder) not in roots:
+            raise RuntimeError('Resumed worktree is not attached to the original Git repository')
         head = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         resumed = checkpoints.verified_resume(DATA, source_id, plan_for_resume, folder, head)
         if not resumed:
