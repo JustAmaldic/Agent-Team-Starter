@@ -58,3 +58,59 @@ def load_checkpoint(data, task_id, plan, worktree, head):
             or value.get("commit") != head or type(value.get("completed")) is not int):
         return None
     return value
+
+
+def read_checkpoint(data, task_id):
+    """Read an untrusted prior record; caller must verify plan, worktree and HEAD."""
+    path = checkpoint_path(data, task_id)
+    if not path.is_file() or path.stat().st_size > 65536:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return None
+    return value
+
+
+def completed_node_ids(plan, completed):
+    """Map reviewed batch prefixes to exact DAG task IDs, without marking partial pairs done."""
+    from ats_modules import dag
+    if not isinstance(plan, dict) or plan.get("plan_version") != 2:
+        return []
+    batches = dag.execution_batches(plan)
+    result = []
+    for batch in batches:
+        if len(result) + len(batch) > completed:
+            break
+        result.extend(node["id"] for node in batch)
+    if len(result) != completed:
+        raise ValueError("Checkpoint splits a parallel DAG batch")
+    return result
+
+
+def verified_resume(data, source_id, plan, worktree, head):
+    """Resume only checkpointed reviewed work from the same immutable code snapshot."""
+    record = load_checkpoint(data, source_id, plan, worktree, head)
+    if not record:
+        return None
+    from ats_modules import dag
+    total = len(dag.validate_dag(plan)["tasks"]) if isinstance(plan, dict) else sum(
+        len(w) if isinstance(w, list) else 1 for w in plan)
+    count = record["completed"]
+    if not 0 < count <= total:
+        return None
+    attribution = record.get("attribution")
+    if not isinstance(attribution, list) or len(attribution) != count:
+        return None
+    numbers = [a.get("subtask") for a in attribution if isinstance(a, dict)
+               and a.get("implementer") and a.get("reviewer")]
+    if numbers != list(range(1, count + 1)):
+        return None
+    if isinstance(plan, dict):
+        try:
+            record["completed_nodes"] = completed_node_ids(plan, count)
+        except ValueError:
+            return None
+    return record
