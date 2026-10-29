@@ -16,7 +16,7 @@ def checkpoint_path(data, task_id):
     return Path(data) / "checkpoints" / (task_id + ".json")
 
 
-def save_checkpoint(data, task_id, plan, worktree, commit, completed, attribution):
+def save_checkpoint(data, task_id, plan, worktree, commit, completed, attribution, pending=None):
     """Save only after reviewed code has been committed, never raw agent output."""
     if not isinstance(commit, str) or len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
         raise ValueError("Checkpoint requires a complete Git SHA")
@@ -26,6 +26,7 @@ def save_checkpoint(data, task_id, plan, worktree, commit, completed, attributio
         "version": 1, "task_id": task_id, "plan_digest": plan_digest(plan),
         "worktree": str(Path(worktree).resolve()), "commit": commit,
         "completed": completed, "attribution": attribution,
+        "pending": list(pending or []),
     }
     path = checkpoint_path(data, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,3 +59,71 @@ def load_checkpoint(data, task_id, plan, worktree, head):
             or value.get("commit") != head or type(value.get("completed")) is not int):
         return None
     return value
+
+
+def read_checkpoint(data, task_id):
+    """Read an untrusted prior record; caller must verify plan, worktree and HEAD."""
+    path = checkpoint_path(data, task_id)
+    if not path.is_file() or path.stat().st_size > 65536:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return None
+    return value
+
+
+def completed_node_ids(plan, completed):
+    """Map reviewed batch prefixes to exact DAG task IDs, without marking partial pairs done."""
+    from ats_modules import dag
+    if not isinstance(plan, dict) or plan.get("plan_version") != 2:
+        return []
+    batches = dag.execution_batches(plan)
+    result = []
+    for batch in batches:
+        if len(result) + len(batch) > completed:
+            break
+        result.extend(node["id"] for node in batch)
+    if len(result) != completed:
+        raise ValueError("Checkpoint splits a parallel DAG batch")
+    return result
+
+
+def verified_resume(data, source_id, plan, worktree, head):
+    """Resume only checkpointed reviewed work from the same immutable code snapshot."""
+    record = load_checkpoint(data, source_id, plan, worktree, head)
+    if not record:
+        return None
+    from ats_modules import dag
+    total = len(dag.validate_dag(plan)["tasks"]) if isinstance(plan, dict) else sum(
+        len(w) if isinstance(w, list) else 1 for w in plan)
+    count = record["completed"]
+    if not 0 <= count <= total:
+        return None
+    if count == 0 and not record.get("pending"):
+        return None
+    attribution = record.get("attribution")
+    if not isinstance(attribution, list) or len(attribution) != count:
+        return None
+    numbers = [a.get("subtask") for a in attribution if isinstance(a, dict)
+               and a.get("implementer") and a.get("reviewer")]
+    if numbers != list(range(1, count + 1)):
+        return None
+    if isinstance(plan, dict):
+        try:
+            record["completed_nodes"] = completed_node_ids(plan, count)
+        except ValueError:
+            return None
+    pending = record.get("pending", [])
+    if not isinstance(pending, list) or len(pending) > 2:
+        return None
+    for node in pending:
+        if (not isinstance(node, dict) or
+            type(node.get("subtask")) is not int or
+            node["subtask"] <= count or node["subtask"] > total or
+            not all(isinstance(node.get(k), str) and node[k] for k in
+                    ("commit", "worktree", "implementer", "reviewer", "wave_base"))):
+            return None
+    return record

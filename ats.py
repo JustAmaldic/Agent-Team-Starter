@@ -1485,6 +1485,11 @@ def plan_waves(plan):
     A string is a part on its own; a list of two strings is a pair the two agents build in
     parallel (parts that do not depend on each other). Waves run in order.
     """
+    if isinstance(plan, dict) and plan.get('plan_version') == 2:
+        try:
+            return [[part['title'] for part in batch] for batch in dag_planning.execution_batches(plan)]
+        except ValueError:
+            return None
     if not isinstance(plan, list):
         return None
     waves = []
@@ -1515,7 +1520,7 @@ def subtask_plan(output):
             raw = dag_lines[-1].split('ATS_DAG_JSON:', 1)[1].strip()
             if len(raw) > 28000:
                 raise ValueError('DAG marker is too large')
-            return dag_planning.as_waves(dag_planning.validate_dag(json.loads(raw)))
+            return dag_planning.validate_dag(json.loads(raw))
         except (ValueError, TypeError) as exc:
             raise RuntimeError('Invalid task DAG: ' + str(exc)) from exc
     lines = re.findall(r'^\s*ATS_SUBTASKS_JSON:[^\r\n]*$', output, re.MULTILINE)
@@ -1656,7 +1661,7 @@ def commit_all(folder, message):
 
 
 def run_part(task, plan, number, total, part, task_id, folder, branch, implementer, unavailable, conf,
-             base, quiet=False, alongside=None):
+             base, quiet=False, alongside=None, resume_work=False):
     """Implement one part and put it through the review loop. Returns (approved, reviewer, author, cycles)."""
     description = f'{task}\nSubtask {number}/{total}: {part}'
     # The reviewer sees only this part's diff; with the plan it does not flag work that belongs
@@ -1676,15 +1681,24 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
               + knowledge_context()
               + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
               + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
-    try:
-        author, output = invoke_with_fallback(implementer, prompt, folder, unavailable,
-                                              task_id, 'implementation', quiet=quiet, fallback=False)
-    except (AgentUsageExhausted, RuntimeError) as exc:
-        record('escalated', str(exc), task_id, subtask=number, implementer=implementer, branch=branch,
-               blocking_reasons=[f'subtask {number}: {exc}'])
-        return False, None, implementer, []
-    record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
-    capture_learning_proposals(output, task_id)
+    existing_changes = False
+    if resume_work:
+        base_tree = execute(['git', 'rev-parse', str(base) + '^{tree}'], folder).stdout.strip()
+        existing_changes = index_tree(folder) != base_tree
+    if existing_changes:
+        author = implementer
+        record('subtask_fix_only', 'Repairing unfinished changes in the resumed worktree',
+               task_id, subtask=number, implementer=author)
+    else:
+        try:
+            author, output = invoke_with_fallback(implementer, prompt, folder, unavailable,
+                                                  task_id, 'implementation', quiet=quiet, fallback=False)
+        except (AgentUsageExhausted, RuntimeError) as exc:
+            record('escalated', str(exc), task_id, subtask=number, implementer=implementer, branch=branch,
+                   blocking_reasons=[f'subtask {number}: {exc}'])
+            return False, None, implementer, []
+        record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
+        capture_learning_proposals(output, task_id)
     try:
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
@@ -1765,7 +1779,7 @@ def merge_parallel_part(task, plan, number, part, task_id, folder, branch, side_
 
 
 def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, conf,
-                 quiet=False):
+                 quiet=False, resumed=None):
     """Build a split task part by part; independent pairs are built and reviewed in parallel.
 
     A single part: one agent implements, the other reviews, and the reviewer builds the next part.
@@ -1776,9 +1790,23 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
     if waves is None:
         raise RuntimeError('Task plan must contain 2 to 20 non-empty parts (strings, or pairs of strings)')
     total = sum(len(w) for w in waves)
-    history, attribution = [], []
+    history = []
+    attribution = list((resumed or {}).get('attribution', []))
+    completed = int((resumed or {}).get('completed', 0))
     reviewer, author, number = None, implementer, 0
     for wave in waves:
+        if number + len(wave) <= completed:
+            for skipped in range(number + 1, number + len(wave) + 1):
+                record('subtask_resumed', 'Reusing independently reviewed code at a verified Git checkpoint',
+                       task_id, subtask=skipped, branch=branch)
+            number += len(wave)
+            old = next((a for a in reversed(attribution) if a.get('subtask') == number), None)
+            if old:
+                reviewer, author = old.get('reviewer'), old.get('implementer')
+                implementer = reviewer or implementer
+            continue
+        if number < completed:
+            raise RuntimeError('Checkpoint splits a parallel wave; refusing unsafe resume')
         other = alternate_agent(implementer, unavailable)
         if implementer in unavailable or other is None:
             record('escalated', 'Both agents are required for subtask handoffs', task_id,
@@ -1788,7 +1816,9 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             number += 1
             approved, reviewer, author, cycles = run_part(
                 task, plan, number, total, wave[0], task_id, folder, branch, implementer, unavailable, conf,
-                base=index_tree(folder), quiet=quiet)
+                base=(execute(['git', 'rev-parse', 'HEAD^{tree}'], folder).stdout.strip()
+                      if resumed else index_tree(folder)), quiet=quiet,
+                **({'resume_work': True} if resumed else {}))
             history.extend(cycles)
             if not approved:
                 return False, reviewer, author, history
@@ -1803,42 +1833,95 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
         # ---- a pair, in parallel: part `first` here, part `second` in a side worktree
         first, second = number + 1, number + 2
         number += 2
-        commit_all(folder, f'ATS: reviewed parts 1-{first - 1}' if first > 1 else 'ATS: start of parallel parts')
-        wave_base = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+        pending = {p['subtask']: p for p in (resumed or {}).get('pending', [])
+                   if p['subtask'] in (first, second)}
+        if not resumed:
+            commit_all(folder, f'ATS: reviewed parts 1-{first - 1}' if first > 1 else 'ATS: start of parallel parts')
+        wave_base = (next(iter(pending.values()))['wave_base'] if pending else
+                     execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip())
         side = folder.parent / f'{folder.name}-part{second}'
         side_branch = f'{branch}-part{second}'
-        execute(['git', 'worktree', 'add', '-b', side_branch, str(side), wave_base], folder)
+        if side.exists():
+            if not resumed:
+                raise RuntimeError('Parallel side worktree unexpectedly exists: ' + str(side))
+            actual_branch = execute(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], side).stdout.strip()
+            if actual_branch != side_branch:
+                raise RuntimeError('Parallel side branch differs from the checkpoint')
+        else:
+            if second in pending:
+                raise RuntimeError('Approved parallel node worktree disappeared; cannot reuse review')
+            execute(['git', 'worktree', 'add', '-b', side_branch, str(side), wave_base], folder)
         phase('parallel', task_id, subtasks=[first, second], implementers=[implementer, other])
         results = {}
 
+        def from_checkpoint(number, location):
+            saved = pending.get(number)
+            if not saved:
+                return None
+            if Path(saved['worktree']).resolve() != location.resolve():
+                raise RuntimeError('Approved DAG node worktree location changed')
+            head = execute(['git', 'rev-parse', 'HEAD'], location).stdout.strip()
+            dirty = execute(['git', 'status', '--porcelain'], location).stdout.strip()
+            if head != saved['commit'] or dirty:
+                raise RuntimeError('Approved DAG node snapshot changed: cannot skip review')
+            record('subtask_resumed', 'Reusing independently reviewed parallel node',
+                   task_id, subtask=number, implementer=saved['implementer'],
+                   reviewer=saved['reviewer'], branch=branch)
+            return True, saved['reviewer'], saved['implementer'], []
+
+        reuse_a = from_checkpoint(first, folder)
+        reuse_b = from_checkpoint(second, side)
+        if reuse_a:
+            results['a'] = reuse_a
+        if reuse_b:
+            results['b'] = reuse_b
+
         def build(key, *args):
             try:
-                results[key] = run_part(*args)
-            except Exception as exc:   # never leave the other thread waiting on a crash
+                results[key] = run_part(*args, **({'resume_work': True} if resumed else {}))
+            except Exception as exc:
                 record('escalated', str(exc), task_id, subtask=args[2], branch=branch,
                        blocking_reasons=[f'subtask {args[2]}: {exc}'])
                 results[key] = (False, None, args[8], [])
 
-        threads = [
-            threading.Thread(target=build, args=('a', task, plan, first, total, wave[0], task_id, folder, branch,
-                                                 implementer, unavailable, conf, wave_base, quiet,
-                                                 (second, wave[1]))),
-            threading.Thread(target=build, args=('b', task, plan, second, total, wave[1], task_id, side, branch,
-                                                 other, unavailable, conf, wave_base, quiet,
-                                                 (first, wave[0]))),
-        ]
+        threads = []
+        if not reuse_a:
+            threads.append(threading.Thread(
+                target=build, args=('a', task, plan, first, total, wave[0], task_id, folder, branch,
+                                    implementer, unavailable, conf, wave_base, quiet, (second, wave[1]))))
+        if not reuse_b:
+            threads.append(threading.Thread(
+                target=build, args=('b', task, plan, second, total, wave[1], task_id, side, branch,
+                                    other, unavailable, conf, wave_base, quiet, (first, wave[0]))))
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join()
         (ok_a, reviewer_a, author_a, cycles_a), (ok_b, reviewer_b, author_b, cycles_b) = results['a'], results['b']
         history.extend(cycles_a + cycles_b)
+        if ok_a:
+            commit_all(folder, f'ATS: part {first}')
+        if ok_b:
+            commit_all(side, f'ATS: part {second}')
         if not (ok_a and ok_b):
-            print(f'ATS: parallel parts {first}/{second} not both approved; side worktree kept: {side}',
+            approved_pending = []
+            for ok, number_in_pair, directory, writer, judge in (
+                    (ok_a, first, folder, author_a, reviewer_a),
+                    (ok_b, second, side, author_b, reviewer_b)):
+                if ok and judge:
+                    approved_pending.append({
+                        'subtask': number_in_pair, 'worktree': str(directory.resolve()),
+                        'commit': execute(['git', 'rev-parse', 'HEAD'], directory).stdout.strip(),
+                        'wave_base': wave_base, 'implementer': writer, 'reviewer': judge,
+                    })
+            if approved_pending:
+                checkpoints.save_checkpoint(
+                    DATA, task_id, plan, folder,
+                    execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip(),
+                    first - 1, attribution, pending=approved_pending)
+            print(f'ATS: part {first}/{second} pending; only unapproved DAG nodes require repair',
                   file=sys.stderr)
             return False, reviewer_a or reviewer_b, author_a, history
-        commit_all(folder, f'ATS: part {first}')
-        commit_all(side, f'ATS: part {second}')
         attribution.append(dict(subtask=first, implementer=author_a, reviewer=reviewer_a))
         attribution.append(dict(subtask=second, implementer=author_b, reviewer=reviewer_b))
         merged, merge_reviewer, merge_cycles = merge_parallel_part(
@@ -1964,7 +2047,7 @@ def provided_task_plan(path, task):
     if payload.get('plan_version') == 2:
         try:
             graph = dag_planning.validate_dag(payload)
-            return dag_planning.as_waves(graph)
+            return graph
         except ValueError as exc:
             raise RuntimeError('Invalid DAG task plan: ' + str(exc)) from exc
     plan = payload.get('waves')
@@ -2055,7 +2138,8 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
     return approved, cycles
 
 
-def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None):
+def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None,
+              resume_from=None):
     conf=project()
     risk = intelligence.risk_profile(task)
     if risk['require_human_approval'] and not approved_risk:
@@ -2073,13 +2157,47 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
+    resumed = None
+    if resume_from:
+        if local_mode or not plan_file:
+            raise RuntimeError('Checkpoint resume needs a Git project and original plan file')
+        try:
+            source_id = str(uuid.UUID(resume_from))
+        except ValueError as exc:
+            raise RuntimeError('Invalid resume source ID') from exc
+        plan_for_resume = provided_task_plan(plan_file, task)
+        source = checkpoints.read_checkpoint(DATA, source_id)
+        if not source:
+            raise RuntimeError('No reviewed checkpoint available for this source run')
+        folder = Path(source.get('worktree', '')).resolve()
+        if (folder.parent != APP.parent.resolve() or
+                not re.fullmatch(re.escape(APP.name) + r'-ats-[0-9a-f]{8}', folder.name) or
+                not folder.is_dir()):
+            raise RuntimeError('Checkpoint worktree does not match original project')
+        branch = execute(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], folder).stdout.strip()
+        if not branch.startswith('ats/'):
+            raise RuntimeError('Resumed branch is not managed by ATS')
+        if execute(['git', 'rev-parse', '--show-toplevel'], folder).stdout.strip() != str(folder):
+            raise RuntimeError('Resumed folder is not a Git worktree')
+        roots = execute(['git', 'worktree', 'list', '--porcelain'], APP).stdout.splitlines()
+        if 'worktree ' + str(folder) not in roots:
+            raise RuntimeError('Resumed worktree is not attached to the original Git repository')
+        head = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+        resumed = checkpoints.verified_resume(DATA, source_id, plan_for_resume, folder, head)
+        if not resumed:
+            raise RuntimeError('Source checkpoint is stale or invalid. Existing code was not modified')
     record('assigned',task,task_id,implementer=agent,branch=branch,task_categories=intelligence.categories(task))
     record('risk_profile', 'Risk-based execution profile', task_id, **risk)
     if not any(executable(name) for name in enabled_agents()):
         raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
     worktree_created=False
     try:
-        if local_mode:
+        if resumed:
+            record('resumed', 'Restored verified reviewed checkpoint', task_id,
+                   source_run=resume_from, completed=resumed['completed'],
+                   completed_nodes=resumed.get('completed_nodes', []), branch=branch)
+            print(f'ATS: resuming {resumed["completed"]} reviewed parts on {branch}.', flush=True)
+        elif local_mode:
             make_local_workspace(folder, branch)
             print('ATS: project has no Git repository; using an isolated local snapshot.', flush=True)
         else:
@@ -2135,15 +2253,17 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             if preflight_plan is None:
                 record('task_split', 'Task divided into reviewable parts', task_id, subtasks=plan)
             approved,reviewer,implementer,history=subtask_flow(
-                task,plan,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet)
+                task,plan,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,resumed=resumed)
         else:
             approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
                                                                base=base_commit)
         learning_agent = reviewer or alternate_agent(implementer) or implementer
         distill_learnings(task, task_id, folder, history,
                           learning_agent, unavailable, quiet=quiet)
-        execute(['git','add','-A'],folder)
-        staged = execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
+        # Never commit edits that have not passed independent review.
+        if approved:
+            execute(['git','add','-A'],folder)
+        staged = approved and execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
         if not staged:
             pass   # the agent already committed everything itself; nothing left to commit
         elif local_mode:
@@ -2223,7 +2343,7 @@ def child_run(argv):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file');p.add_argument('--resume-from')
     p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('performance')
@@ -2272,7 +2392,7 @@ def main():
             items = json.loads(Path(args.items_json).read_text(encoding='utf-8'))
             relations = json.loads(Path(args.relations_json).read_text(encoding='utf-8'))
             print(json.dumps(intelligence.relation_issues(items, relations),indent=2))
-        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file)
+        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file,args.resume_from)
         elif args.command=='plan':preview_task_plan(' '.join(args.description), args.agent)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()

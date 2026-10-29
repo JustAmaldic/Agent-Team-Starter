@@ -42,7 +42,7 @@ class DAGFoundationTests(unittest.TestCase):
 
     def test_auto_planner_accepts_graph_marker(self):
         output = "ATS_DAG_JSON: " + json.dumps(example())
-        self.assertEqual(ats.subtask_plan(output), as_waves(example()))
+        self.assertEqual(ats.subtask_plan(output), validate_dag(example()))
 
     def test_auto_planner_rejects_unsafe_graph(self):
         graph = example()
@@ -56,8 +56,8 @@ class DAGFoundationTests(unittest.TestCase):
             task = "Improve ARC safety"
             path.write_text(json.dumps({"task": task, **example()}))
             waves = ats.provided_task_plan(path, task)
-            self.assertEqual([len(w) if isinstance(w, list) else 1 for w in waves], [1, 2, 1, 1])
-            self.assertEqual(waves, as_waves(example()))
+            self.assertEqual(waves, validate_dag(example()))
+            self.assertEqual(ats.plan_waves(waves), [[p] if isinstance(p, str) else p for p in as_waves(example())])
             path.write_text(json.dumps({"task": task, "waves": ["Build contract", "Run tests"]}))
             self.assertEqual(ats.provided_task_plan(path, task), ["Build contract", "Run tests"])
 
