@@ -80,8 +80,7 @@ class SmartResumeTests(unittest.TestCase):
                     "Build ARC", plan, "new-run", root, "ats/test",
                     "codex", set(), {}, resumed=resumed)
             self.assertTrue(ok)
-            self.assertEqual(run_part.call_count, 1)
-            self.assertEqual(run_part.call_args.args[2], 2)
+            self.assertEqual([call.args[2] for call in run_part.call_args_list], [2, 3])
 
     def test_skip_checkpointed_sequential_node_without_agent_call(self):
         plan = ["Implement shared data contracts", "Repair remaining front-end tests"]
