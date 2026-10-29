@@ -1486,6 +1486,12 @@ def subtask_plan(output):
 
     A marker with an unusable plan is an error: the agent chose to split but gave no real parts.
     """
+    dag_lines = re.findall(r'^\\s*ATS_DAG_JSON:[^\\r\\n]*$', output, re.MULTILINE)
+    if dag_lines:
+        try:
+            return dag_planning.as_waves(parse_marked_json(dag_lines[-1], 'ATS_DAG_JSON'))
+        except ValueError as exc:
+            raise RuntimeError('Invalid task DAG: ' + str(exc)) from exc
     lines = re.findall(r'^\s*ATS_SUBTASKS_JSON:[^\r\n]*$', output, re.MULTILINE)
     if not lines:
         return None
@@ -1529,12 +1535,20 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         f'Project: {APP.name}. Task: {task}\n'
         'Inspect the code to divide this task into 2-20 concrete implementable parts '
         'with tests and independently reviewable outcomes. '
-        'Return exactly ONE LINE starting ATS_SUBTASKS_JSON: followed by valid JSON. '
-        'The JSON format is a list of task strings and independent pairs of task strings. '
-        'Example: ATS_SUBTASKS_JSON: ["Inspect shared interfaces and add tests", '
-        '["Implement independent inbox safety scorer in dedicated files", '
-        '"Implement weekly newsletter audit in separate files"], '
-        '"Integrate, run tests, and verify all parts together"]. '
+        'Return exactly ONE LINE starting ATS_DAG_JSON: followed by valid JSON. '
+        'The JSON object has plan_version=2 and tasks (2-20 objects). Each task contains '
+        'id, title, depends_on (list of prior task ids), and owned_paths (explicit source '
+        'files or directories). Example: ATS_DAG_JSON: '
+        '{"plan_version":2,"tasks":[{"id":"contract","title":"Define shared event contracts",'
+        '"depends_on":[],"owned_paths":["contracts/"]},'
+        '{"id":"scorer","title":"Implement sender safety scoring with regression tests",'
+        '"depends_on":["contract"],"owned_paths":["phish.py","tests/test_phish.py"]},'
+        '{"id":"audit","title":"Implement newsletter evidence inventory with tests",'
+        '"depends_on":["contract"],"owned_paths":["newsletter_audit.py"]},'
+        '{"id":"integration","title":"Integrate and test security and newsletter workflows",'
+        '"depends_on":["scorer","audit"],"owned_paths":["mail_assist.py"]}]}. '
+        'Declare ONLY true dependencies, not conceptual phases. '
+        'Use separate owned_paths for independently implementable work. '
         'Optimize for the shortest safe critical path, not for the most sequential phases. '
         'Before choosing waves, identify each part\'s prerequisites, files it will own, '
         'and which parts can start immediately after a shared contract is fixed. '
