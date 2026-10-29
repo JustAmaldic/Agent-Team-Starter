@@ -1678,8 +1678,10 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
               + knowledge_context()
               + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
               + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
-    base_tree = execute(['git', 'rev-parse', str(base) + '^{tree}'], folder).stdout.strip()
-    existing_changes = resume_work and index_tree(folder) != base_tree
+    existing_changes = False
+    if resume_work:
+        base_tree = execute(['git', 'rev-parse', str(base) + '^{tree}'], folder).stdout.strip()
+        existing_changes = index_tree(folder) != base_tree
     if existing_changes:
         author = implementer
         record('subtask_fix_only', 'Repairing unfinished changes in the resumed worktree',
@@ -1812,7 +1814,8 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             approved, reviewer, author, cycles = run_part(
                 task, plan, number, total, wave[0], task_id, folder, branch, implementer, unavailable, conf,
                 base=(execute(['git', 'rev-parse', 'HEAD^{tree}'], folder).stdout.strip()
-                      if resumed else index_tree(folder)), quiet=quiet, resume_work=bool(resumed))
+                      if resumed else index_tree(folder)), quiet=quiet,
+                **({'resume_work': True} if resumed else {}))
             history.extend(cycles)
             if not approved:
                 return False, reviewer, author, history
@@ -1872,7 +1875,7 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
 
         def build(key, *args):
             try:
-                results[key] = run_part(*args, resume_work=bool(resumed))
+                results[key] = run_part(*args, **({'resume_work': True} if resumed else {}))
             except Exception as exc:
                 record('escalated', str(exc), task_id, subtask=args[2], branch=branch,
                        blocking_reasons=[f'subtask {args[2]}: {exc}'])
