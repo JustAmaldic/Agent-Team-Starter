@@ -1485,6 +1485,11 @@ def plan_waves(plan):
     A string is a part on its own; a list of two strings is a pair the two agents build in
     parallel (parts that do not depend on each other). Waves run in order.
     """
+    if isinstance(plan, dict) and plan.get('plan_version') == 2:
+        try:
+            return [[part['title'] for part in batch] for batch in dag_planning.execution_batches(plan)]
+        except ValueError:
+            return None
     if not isinstance(plan, list):
         return None
     waves = []
@@ -1512,7 +1517,7 @@ def subtask_plan(output):
     dag_lines = re.findall(r'^\s*ATS_DAG_JSON:[^\r\n]*
     if dag_lines:
         try:
-            return dag_planning.as_waves(parse_marked_json(dag_lines[-1], 'ATS_DAG_JSON'))
+            return dag_planning.validate_dag(parse_marked_json(dag_lines[-1], 'ATS_DAG_JSON'))
         except ValueError as exc:
             raise RuntimeError('Invalid task DAG: ' + str(exc)) from exc
     lines = re.findall(r'^\s*ATS_SUBTASKS_JSON:[^\r\n]*$', output, re.MULTILINE)
@@ -1653,7 +1658,7 @@ def commit_all(folder, message):
 
 
 def run_part(task, plan, number, total, part, task_id, folder, branch, implementer, unavailable, conf,
-             base, quiet=False, alongside=None):
+             base, quiet=False, alongside=None, resume_work=False):
     """Implement one part and put it through the review loop. Returns (approved, reviewer, author, cycles)."""
     description = f'{task}\nSubtask {number}/{total}: {part}'
     # The reviewer sees only this part's diff; with the plan it does not flag work that belongs
@@ -1673,15 +1678,21 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
               + knowledge_context()
               + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
               + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
-    try:
-        author, output = invoke_with_fallback(implementer, prompt, folder, unavailable,
-                                              task_id, 'implementation', quiet=quiet, fallback=False)
-    except (AgentUsageExhausted, RuntimeError) as exc:
-        record('escalated', str(exc), task_id, subtask=number, implementer=implementer, branch=branch,
-               blocking_reasons=[f'subtask {number}: {exc}'])
-        return False, None, implementer, []
-    record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
-    capture_learning_proposals(output, task_id)
+    existing_changes = resume_work and index_tree(folder) != base
+    if existing_changes:
+        author = implementer
+        record('subtask_fix_only', 'Repairing unfinished changes in the resumed worktree',
+               task_id, subtask=number, implementer=author)
+    else:
+        try:
+            author, output = invoke_with_fallback(implementer, prompt, folder, unavailable,
+                                                  task_id, 'implementation', quiet=quiet, fallback=False)
+        except (AgentUsageExhausted, RuntimeError) as exc:
+            record('escalated', str(exc), task_id, subtask=number, implementer=implementer, branch=branch,
+                   blocking_reasons=[f'subtask {number}: {exc}'])
+            return False, None, implementer, []
+        record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
+        capture_learning_proposals(output, task_id)
     try:
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
@@ -1762,7 +1773,7 @@ def merge_parallel_part(task, plan, number, part, task_id, folder, branch, side_
 
 
 def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, conf,
-                 quiet=False):
+                 quiet=False, resumed=None):
     """Build a split task part by part; independent pairs are built and reviewed in parallel.
 
     A single part: one agent implements, the other reviews, and the reviewer builds the next part.
@@ -1773,9 +1784,23 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
     if waves is None:
         raise RuntimeError('Task plan must contain 2 to 20 non-empty parts (strings, or pairs of strings)')
     total = sum(len(w) for w in waves)
-    history, attribution = [], []
+    history = []
+    attribution = list((resumed or {}).get('attribution', []))
+    completed = int((resumed or {}).get('completed', 0))
     reviewer, author, number = None, implementer, 0
     for wave in waves:
+        if number + len(wave) <= completed:
+            for skipped in range(number + 1, number + len(wave) + 1):
+                record('subtask_resumed', 'Reusing independently reviewed code at a verified Git checkpoint',
+                       task_id, subtask=skipped, branch=branch)
+            number += len(wave)
+            old = next((a for a in reversed(attribution) if a.get('subtask') == number), None)
+            if old:
+                reviewer, author = old.get('reviewer'), old.get('implementer')
+                implementer = reviewer or implementer
+            continue
+        if number < completed:
+            raise RuntimeError('Checkpoint splits a parallel wave; refusing unsafe resume')
         other = alternate_agent(implementer, unavailable)
         if implementer in unavailable or other is None:
             record('escalated', 'Both agents are required for subtask handoffs', task_id,
@@ -1785,7 +1810,7 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             number += 1
             approved, reviewer, author, cycles = run_part(
                 task, plan, number, total, wave[0], task_id, folder, branch, implementer, unavailable, conf,
-                base=index_tree(folder), quiet=quiet)
+                base=index_tree(folder), quiet=quiet, resume_work=bool(resumed))
             history.extend(cycles)
             if not approved:
                 return False, reviewer, author, history
@@ -1804,6 +1829,8 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
         wave_base = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         side = folder.parent / f'{folder.name}-part{second}'
         side_branch = f'{branch}-part{second}'
+        if side.exists():
+            raise RuntimeError('Parallel side worktree already exists; inspect it before resuming: ' + str(side))
         execute(['git', 'worktree', 'add', '-b', side_branch, str(side), wave_base], folder)
         phase('parallel', task_id, subtasks=[first, second], implementers=[implementer, other])
         results = {}
@@ -1961,7 +1988,7 @@ def provided_task_plan(path, task):
     if payload.get('plan_version') == 2:
         try:
             graph = dag_planning.validate_dag(payload)
-            return dag_planning.as_waves(graph)
+            return graph
         except ValueError as exc:
             raise RuntimeError('Invalid DAG task plan: ' + str(exc)) from exc
     plan = payload.get('waves')
