@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 import ats_intelligence as intelligence
+from ats_modules import checkpoints
 from ats_modules import dag as dag_planning
 
 from ats_contract import accepted_event, valid_phase
@@ -1789,6 +1790,10 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             if not approved:
                 return False, reviewer, author, history
             attribution.append(dict(subtask=number, implementer=author, reviewer=reviewer))
+            commit_all(folder, f'ATS: reviewed part {number}')
+            checkpoints.save_checkpoint(DATA, task_id, plan, folder,
+                                        execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip(),
+                                        number, attribution)
             implementer = reviewer or other
             continue
 
@@ -1843,6 +1848,9 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             return False, merge_reviewer, author_b, history
         execute(['git', 'worktree', 'remove', '--force', str(side)], folder, check=False)
         execute(['git', 'branch', '-D', side_branch], folder, check=False)
+        checkpoints.save_checkpoint(DATA, task_id, plan, folder,
+                                    execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip(),
+                                    number, attribution)
         reviewer, author = reviewer_b, author_b
         implementer = other   # the next wave starts with the other agent
     record('subtasks_completed', 'All parts independently reviewed; combined diff has not been reviewed',
