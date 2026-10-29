@@ -16,7 +16,7 @@ def checkpoint_path(data, task_id):
     return Path(data) / "checkpoints" / (task_id + ".json")
 
 
-def save_checkpoint(data, task_id, plan, worktree, commit, completed, attribution):
+def save_checkpoint(data, task_id, plan, worktree, commit, completed, attribution, pending=None):
     """Save only after reviewed code has been committed, never raw agent output."""
     if not isinstance(commit, str) or len(commit) != 40 or any(c not in "0123456789abcdef" for c in commit):
         raise ValueError("Checkpoint requires a complete Git SHA")
@@ -26,6 +26,7 @@ def save_checkpoint(data, task_id, plan, worktree, commit, completed, attributio
         "version": 1, "task_id": task_id, "plan_digest": plan_digest(plan),
         "worktree": str(Path(worktree).resolve()), "commit": commit,
         "completed": completed, "attribution": attribution,
+        "pending": list(pending or []),
     }
     path = checkpoint_path(data, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,7 +100,9 @@ def verified_resume(data, source_id, plan, worktree, head):
     total = len(dag.validate_dag(plan)["tasks"]) if isinstance(plan, dict) else sum(
         len(w) if isinstance(w, list) else 1 for w in plan)
     count = record["completed"]
-    if not 0 < count <= total:
+    if not 0 <= count <= total:
+        return None
+    if count == 0 and not record.get("pending"):
         return None
     attribution = record.get("attribution")
     if not isinstance(attribution, list) or len(attribution) != count:
@@ -112,5 +115,15 @@ def verified_resume(data, source_id, plan, worktree, head):
         try:
             record["completed_nodes"] = completed_node_ids(plan, count)
         except ValueError:
+            return None
+    pending = record.get("pending", [])
+    if not isinstance(pending, list) or len(pending) > 2:
+        return None
+    for node in pending:
+        if (not isinstance(node, dict) or
+            type(node.get("subtask")) is not int or
+            node["subtask"] <= count or node["subtask"] > total or
+            not all(isinstance(node.get(k), str) and node[k] for k in
+                    ("commit", "worktree", "implementer", "reviewer", "wave_base"))):
             return None
     return record
