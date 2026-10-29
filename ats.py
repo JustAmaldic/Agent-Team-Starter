@@ -1678,7 +1678,8 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
               + knowledge_context()
               + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
               + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
-    existing_changes = resume_work and index_tree(folder) != base
+    base_tree = execute(['git', 'rev-parse', str(base) + '^{tree}'], folder).stdout.strip()
+    existing_changes = resume_work and index_tree(folder) != base_tree
     if existing_changes:
         author = implementer
         record('subtask_fix_only', 'Repairing unfinished changes in the resumed worktree',
