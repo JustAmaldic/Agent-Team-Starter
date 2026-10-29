@@ -124,6 +124,12 @@ Only approved tasks may become a draft PR. Never fake an approval, test result, 
 ## Git and source updates
 
 - Work happens on isolated branches/worktrees; never push or merge into an application's default branch.
+- **A task starts from the latest base branch.** ATS fetches and branches from `origin/<base_branch>` (default `main`), not from the local checkout, which may be behind GitHub.
+- **Before ATS publishes a branch, it updates it with the latest base branch.**
+  - Already up to date: nothing to do.
+  - A clean merge whose checks pass: done.
+  - A merge conflict, or checks that fail after the merge: the implementer resolves it, and the other agent reviews the whole change on top of the new base. The same approval gate applies.
+  - If that resolution is not approved, the branch is not published and the task escalates with the worktree kept.
 - On start, ATS updates its own source with a fast-forward-only merge, and only when the ATS checkout is clean. It never auto-commits, rebases or force-pushes the ATS source.
 - ATS updates are code: for production use, pin a reviewed release tag or commit instead of automatically running every update to the default branch.
 - Changes to ATS itself follow the same rule: a feature branch, a PR, a separate reviewer, passing CI, and a human merge.
