@@ -50,6 +50,39 @@ class SmartResumeTests(unittest.TestCase):
             self.assertEqual(state["completed_nodes"], ["contract"])
             self.assertEqual(state["pending"][0]["subtask"], 3)
 
+    def test_parallel_resume_only_runs_the_failed_sibling(self):
+        plan = [["Build reviewed security module", "Fix newsletter scanner tests"], "Integrate the modules"]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo-ats-12345678"
+            root.mkdir()
+            side = Path(temp) / "repo-ats-12345678-part2"
+            side.mkdir()
+            resumed = {"completed": 0, "attribution": [], "pending": [{
+                "subtask": 1, "worktree": str(root.resolve()),
+                "commit": "a" * 40, "wave_base": "b" * 40,
+                "implementer": "codex", "reviewer": "claude"
+            }]}
+
+            def git_result(args, *unused, **kwargs):
+                if args[:3] == ["git", "symbolic-ref", "--quiet"]:
+                    return SimpleNamespace(stdout="ats/test-part2")
+                if args[:3] == ["git", "status", "--porcelain"]:
+                    return SimpleNamespace(stdout="")
+                return SimpleNamespace(stdout="a" * 40)
+
+            with patch.object(ats, "execute", side_effect=git_result), \
+                 patch.object(ats, "run_part", return_value=(True, "codex", "claude", [])) as run_part, \
+                 patch.object(ats, "merge_parallel_part", return_value=(True, None, [])), \
+                 patch.object(ats, "commit_all"), \
+                 patch.object(ats.checkpoints, "save_checkpoint"), \
+                 patch.object(ats, "record"):
+                ok, _, _, _ = ats.subtask_flow(
+                    "Build ARC", plan, "new-run", root, "ats/test",
+                    "codex", set(), {}, resumed=resumed)
+            self.assertTrue(ok)
+            self.assertEqual(run_part.call_count, 1)
+            self.assertEqual(run_part.call_args.args[2], 2)
+
     def test_skip_checkpointed_sequential_node_without_agent_call(self):
         plan = ["Implement shared data contracts", "Repair remaining front-end tests"]
         prior = {"completed": 1,
