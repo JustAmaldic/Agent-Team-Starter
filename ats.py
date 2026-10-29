@@ -1367,6 +1367,28 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
     for cycle in range(max_revisions + 1):
         phase('checks', task_id, **context, cycle=cycle)
         checks = run_checks(conf, folder)
+        # Repair a narrowly failing test before spending tokens on a full diff review.
+        # A successful repair still goes through the independent review below.
+        failed = [c for c in checks if not c['passed']]
+        if failed and cycle < max_revisions and conf.get('targeted_test_fix', True):
+            phase('revision', task_id, **context, cycle=cycle, implementer=implementer)
+            problem = json.dumps([{'command': c['command'], 'output': c['output'][-1200:]}
+                                  for c in failed], ensure_ascii=False)
+            fix_prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. '
+                          f'Task: {task}\\nOnly repair these failing checks in the EXISTING worktree: '
+                          + problem + '\\nKeep already working functionality. Do not restart the task, '
+                          'rewrite unrelated files, commit, push or modify .ats. '
+                          'After editing, state what you changed.')
+            try:
+                implementer, response = invoke_with_fallback(
+                    implementer, fix_prompt, folder, unavailable, task_id, 'revision',
+                    quiet=quiet, fallback=False)
+                record('targeted_test_fix', response[-1200:], task_id, **context,
+                       implementer=implementer, failed_commands=[c['command'] for c in failed])
+                checks = run_checks(conf, folder)
+            except (AgentUsageExhausted, RuntimeError) as exc:
+                record('targeted_test_fix_skipped', str(exc)[:500], task_id, **context)
+                # Keep existing behavior: the full independent review still decides.
         execute(['git', 'add', '-A'], folder)
         # Against the commit (or, for a subtask, the tree) the work started from, not HEAD: an agent
         # that runs `git commit` itself would otherwise make its own work invisible.
