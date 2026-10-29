@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 import ats_intelligence as intelligence
+from ats_modules import dag as dag_planning
 
 from ats_contract import accepted_event, valid_phase
 
@@ -1913,6 +1914,12 @@ def provided_task_plan(path, task):
     payload = json.loads(source.read_text(encoding='utf-8'))
     if not isinstance(payload, dict) or payload.get('task') != task:
         raise RuntimeError('Plan is not bound to the requested task')
+    if payload.get('plan_version') == 2:
+        try:
+            graph = dag_planning.validate_dag(payload)
+            return dag_planning.as_waves(graph)
+        except ValueError as exc:
+            raise RuntimeError('Invalid DAG task plan: ' + str(exc)) from exc
     plan = payload.get('waves')
     if not valid_plan(plan):
         raise RuntimeError('Invalid custom task plan (2-20 parts, up to 2 per wave)')
