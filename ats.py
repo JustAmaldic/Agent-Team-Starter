@@ -2111,8 +2111,10 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
         source = checkpoints.read_checkpoint(DATA, source_id)
         if not source:
             raise RuntimeError('No reviewed checkpoint available for this source run')
-        folder = (APP.parent / f'{APP.name}-ats-{source_id[:8]}').resolve()
-        if str(folder) != source.get('worktree') or not folder.is_dir():
+        folder = Path(source.get('worktree', '')).resolve()
+        if (folder.parent != APP.parent.resolve() or
+                not re.fullmatch(re.escape(APP.name) + r'-ats-[0-9a-f]{8}', folder.name) or
+                not folder.is_dir()):
             raise RuntimeError('Checkpoint worktree does not match original project')
         branch = execute(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], folder).stdout.strip()
         if not branch.startswith('ats/'):
