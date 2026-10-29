@@ -40,6 +40,16 @@ class DAGFoundationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown"):
             validate_dag(graph)
 
+    def test_auto_planner_accepts_graph_marker(self):
+        output = "ATS_DAG_JSON: " + json.dumps(example())
+        self.assertEqual(ats.subtask_plan(output), as_waves(example()))
+
+    def test_auto_planner_rejects_unsafe_graph(self):
+        graph = example()
+        graph["tasks"][0]["depends_on"] = ["finish"]
+        with self.assertRaisesRegex(RuntimeError, "Invalid task DAG"):
+            ats.subtask_plan("ATS_DAG_JSON: " + json.dumps(graph))
+
     def test_legacy_plan_unchanged_and_versioned_plan_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "plan.json"
