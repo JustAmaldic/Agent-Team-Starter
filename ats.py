@@ -1512,8 +1512,11 @@ def subtask_plan(output):
     dag_lines = re.findall(r'^\s*ATS_DAG_JSON:[^\r\n]*$', output, re.MULTILINE)
     if dag_lines:
         try:
-            return dag_planning.as_waves(parse_marked_json(dag_lines[-1], 'ATS_DAG_JSON'))
-        except ValueError as exc:
+            raw = dag_lines[-1].split('ATS_DAG_JSON:', 1)[1].strip()
+            if len(raw) > 28000:
+                raise ValueError('DAG marker is too large')
+            return dag_planning.as_waves(dag_planning.validate_dag(json.loads(raw)))
+        except (ValueError, TypeError) as exc:
             raise RuntimeError('Invalid task DAG: ' + str(exc)) from exc
     lines = re.findall(r'^\s*ATS_SUBTASKS_JSON:[^\r\n]*$', output, re.MULTILINE)
     if not lines:
