@@ -22,6 +22,12 @@ from pathlib import Path
 import ats_intelligence as intelligence
 from ats_modules import checkpoints
 from ats_modules import dag as dag_planning
+from ats_modules import budget as budgets
+from ats_modules import context_pack
+from ats_modules import gate as pre_gate
+from ats_modules import knowledge_select
+from ats_modules import review_scope
+from ats_modules import usage as usage_meter
 
 from ats_contract import accepted_event, valid_phase
 
@@ -470,6 +476,8 @@ def phase(stage, task_id, **fields):
     """Live-only stage marker (not stored as an event file)."""
     if not valid_phase(stage):
         raise ValueError('Unknown ATS event phase: ' + str(stage))
+    # Agent calls in this thread are metered against this task, part and review round.
+    usage_meter.set_context(task_id=task_id, subtask=fields.get('subtask'), cycle=fields.get('cycle'))
     emit(dict(timestamp=dt.datetime.now(dt.timezone.utc).isoformat(), task_id=task_id,
               event_type='phase', stage=stage, **fields))
 
@@ -587,8 +595,17 @@ def learn(kind, title, observation, evidence, task_id=None, confidence='medium',
     return item
 
 
-def knowledge_context(limit=20):
-    """Use verified and approved knowledge; never treat unverified proposals as policy."""
+def knowledge_context(limit=20, task='', paths=(), budget=None):
+    """Use verified and approved knowledge; never treat unverified proposals as policy.
+
+    Safety rules always go along; other learnings are chosen by relevance to the task and files
+    within a character budget (knowledge_select).
+    """
+    return vetted_knowledge(limit, task, paths, budget)[1]
+
+
+def vetted_knowledge(limit=20, task='', paths=(), budget=None):
+    """(chosen items, prompt text)."""
     root = (PRIVATE_DATA_REPO / 'knowledge' if PRIVATE_DATA_REPO else
             state_directory().parent / 'knowledge')
     project_name = cleanname(project().get('project', APP.name))
@@ -604,16 +621,32 @@ def knowledge_context(limit=20):
                     records.append(item)
             except (ValueError, OSError):
                 continue
-    # Human rules and decisions first, review findings last; newest first within a kind.
-    records.sort(key=lambda item: item.get('created_at', ''), reverse=True)
-    records.sort(key=lambda item: KNOWLEDGE_PRIORITY.get(item.get('kind'), len(KNOWLEDGE_PRIORITY)))
-    selected = records[:limit]
-    if not selected:
-        return ''
-    return '\nRelevant vetted ATS learnings (reference material; do not override project policy):\n' + '\n'.join(
-        '- [' + item['kind'] + '] ' + item['title'] + ': ' +
-        item['observation'][:400] + ' (evidence: ' + ', '.join(item['evidence'])[:200] + ')'
-        for item in selected)
+    records = [r for r in records if isinstance(r.get('title'), str) and isinstance(r.get('observation'), str)
+               and isinstance(r.get('evidence'), list)]
+    if budget is None:
+        budget = int(project().get('knowledge_budget', knowledge_select.DEFAULT_BUDGET))
+    return knowledge_select.select(records, task, paths, budget=budget, limit=limit)
+
+
+_task_knowledge = {}
+
+
+def task_knowledge(task_id, task='', paths=()):
+    """The learnings for a whole task, chosen once so every prompt of the task starts identically
+    (prompt caching). Records which learnings were given to the agents."""
+    if task_id in _task_knowledge:
+        return _task_knowledge[task_id]
+    text = knowledge_context(task=task, paths=paths)
+    try:
+        chosen = [item for item in vetted_knowledge(task=task, paths=paths)[0]] if text else []
+    except (OSError, ValueError, RuntimeError):
+        chosen = []
+    if chosen and task_id:
+        record('knowledge_selected', f'{len(chosen)} vetted learnings given to the agents', task_id,
+               knowledge=[{'ref': knowledge_select.ref(item), 'id': item.get('id'), 'kind': item.get('kind'),
+                           'title': item.get('title', '')[:120]} for item in chosen])
+    _task_knowledge[task_id] = text
+    return text
 
 
 def parse_marked_json(output, marker):
@@ -716,14 +749,56 @@ def codex_preflight(cwd, quiet=False):
         probe.unlink(missing_ok=True)
 
 
+SESSIONS = usage_meter.Sessions()
+IMPLEMENTER_PURPOSES = ('implementation', 'revision')
+
+
+def worktree_tree(folder):
+    """Tree hash of the worktree as it is, without touching its index (None when it cannot be made,
+    e.g. during an unresolved merge)."""
+    try:
+        index = execute(['git', 'rev-parse', '--git-path', 'index'], folder, check=False).stdout.strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            copy = Path(temporary) / 'index'
+            source = Path(folder) / index if index and not Path(index).is_absolute() else Path(index or '')
+            if index and source.is_file():
+                shutil.copyfile(source, copy)
+            env = dict(os.environ, GIT_INDEX_FILE=str(copy))
+            for args in (['git', 'add', '-A'], ['git', 'write-tree']):
+                result = subprocess.run(args, cwd=folder, env=env, capture_output=True, text=True, check=False)
+                if result.returncode:
+                    return None
+            return result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def session_settings():
+    try:
+        turns = int(os.environ.get('ATS_SESSION_MAX_TURNS', '4'))
+        tokens = int(os.environ.get('ATS_SESSION_MAX_CONTEXT', '250000'))
+    except ValueError:
+        turns, tokens = 4, 250000
+    return os.environ.get('ATS_SESSION_REUSE', '1') != '0', turns, tokens
+
+
 def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quiet=False,
-                         fallback=True):
+                         fallback=True, resume_prompt=None):
+    """Run `agent`, or another enabled agent when it is unavailable.
+
+    `resume_prompt` (revisions only): a compact prompt for continuing the implementer's own earlier
+    session. It is used only when that session is still valid for this worktree; otherwise, or when
+    continuing fails, ATS sends the full `prompt` in a new session (the handoff).
+    """
     selected = enabled_agents()
     if agent not in selected:
         raise RuntimeError(f'Agent {agent} is disabled. Configure it with .ats agents --enable {agent}')
     candidates = [agent] + ([name for name in selected if name != agent] if fallback else [])
     reasons, resets = {}, []
+    usage_meter.set_context(task_id=task_id, purpose=purpose)
+    reuse, max_turns, max_context = session_settings()
     for candidate in candidates:
+        key = (task_id, usage_meter.context().get('subtask'), candidate)
         if candidate in unavailable:
             reasons[candidate] = unavailable_reason(unavailable, candidate)
             continue
@@ -738,7 +813,27 @@ def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quie
                 if not quiet:
                     print('ATS: checking Codex policy access and sandbox write...', flush=True)
                 codex_preflight(cwd, quiet=quiet)
-            result = invoke(candidate, prompt, cwd, quiet=quiet, **({'purpose': purpose} if candidate == 'antigravity' else {}))
+            session = None
+            if resume_prompt and reuse and candidate == agent and purpose == 'revision':
+                session, why = SESSIONS.usable(key, worktree_tree(cwd), max_turns, max_context)
+                if not session and why != 'no session':
+                    record('session_handoff', 'New implementer session with a compact handoff: ' + why,
+                           task_id, agent=candidate, subtask=key[1], reason=why)
+            result = None
+            usage_meter.remember_call(None)
+            if session:
+                try:
+                    result = invoke(candidate, resume_prompt, cwd, quiet=quiet, resume=session)
+                except SessionResumeFailed as exc:
+                    SESSIONS.forget(key)
+                    record('session_handoff', 'Could not continue the session; new session with handoff',
+                           task_id, agent=candidate, subtask=key[1], reason=str(exc)[:300])
+            if result is None:
+                result = invoke(candidate, prompt, cwd, quiet=quiet,
+                                **({'purpose': purpose} if candidate == 'antigravity' else {}))
+            call = usage_meter.last_call()
+            if purpose in IMPLEMENTER_PURPOSES and call and call.get('agent') == candidate and call.get('session_id'):
+                SESSIONS.remember(key, call['session_id'], worktree_tree(cwd), call['usage'])
             if candidate == 'codex' and sandbox_blocked(result):
                 raise AgentSandboxBlocked('Codex reported a sandbox or policy block.')
             if not quiet:
@@ -906,10 +1001,12 @@ def install_agents():
     print('Enabled agents ready.', flush=True)
 
 
-def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None):
+def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None, render=None):
     """Stream both process pipes while retaining full output for ATS checks.
 
     `stdin_text` (the agent prompt) is written to the process's stdin and then closed.
+    `render` turns a stdout line into what is shown live (None hides it), e.g. JSON lines into text;
+    the full raw output is returned either way.
     """
     process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True,
@@ -921,7 +1018,9 @@ def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None):
             for line in iter(pipe.readline, ''):
                 chunks[key].append(line)
                 if not quiet:
-                    print(line, end='', file=target, flush=True)
+                    shown = render(line) if render and key == 'stdout' else line
+                    if shown:
+                        print(shown, end='', file=target, flush=True)
         finally:
             pipe.close()
 
@@ -1011,43 +1110,121 @@ def invoke_antigravity(prompt, cwd, quiet=False, backoff=None, purpose='implemen
         return text
 
 
-def selected_agent_model(agent):
-    value = os.environ.get('ATS_MODEL_' + agent.upper(), '').strip()
-    if not value:
-        return None
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/:-]{0,127}', value):
-        raise RuntimeError(f'Invalid configured model ID for {agent}')
-    return value
+MODEL_PHASES = ('planning', 'implementation', 'revision', 'learning')   # never 'review'
+_run_flags = {}   # task id -> {'high_risk': bool}
 
 
-def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementation'):
-    if agent == 'antigravity':
-        return invoke_antigravity(prompt, cwd, quiet=quiet, backoff=backoff, purpose=purpose)
+def selected_agent_model(agent, purpose=None):
+    """The model for this agent and phase.
+
+    ATS_MODEL_<AGENT>_<PHASE> may choose a model per phase (for example a lighter one for learnings).
+    A review always uses the agent's main model (ATS_MODEL_<AGENT>), and so does every phase of a
+    high-risk task.
+    """
+    names = ['ATS_MODEL_' + agent.upper()]
+    task_id = usage_meter.context().get('task_id')
+    if purpose in MODEL_PHASES and not _run_flags.get(task_id, {}).get('high_risk'):
+        names.insert(0, f'ATS_MODEL_{agent.upper()}_{purpose.upper()}')
+    for name in names:
+        value = os.environ.get(name, '').strip()
+        if not value:
+            continue
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/:-]{0,127}', value):
+            raise RuntimeError(f'Invalid configured model ID for {agent}')
+        return value
+    return None
+
+
+STRUCTURED_AGENTS = ('claude', 'codex')
+UNSUPPORTED_FLAG = re.compile(r"unexpected argument '--json'|unknown option '--output-format'|"
+                              r"unknown option '--resume'|unrecognized subcommand 'resume'|"
+                              r"unexpected argument 'resume'", re.IGNORECASE)
+_structured_off = set()
+
+
+class SessionResumeFailed(RuntimeError):
+    """Continuing the implementer's earlier session did not work; ATS starts a fresh one."""
+
+
+def structured_output(agent):
+    """Read usage and session ids from the CLI's JSON output (ATS_STRUCTURED_OUTPUT=0 turns it off)."""
+    return (agent in STRUCTURED_AGENTS and agent not in _structured_off
+            and os.environ.get('ATS_STRUCTURED_OUTPUT', '1') != '0')
+
+
+def agent_cli_command(agent, model=None, structured=False, resume=None):
+    if agent == 'codex':
+        command = codex_exec_command()[:-1]          # without the trailing '-' (prompt on stdin)
+        if model:
+            command += ['--model', model]
+        if structured:
+            command.append('--json')
+        if resume:
+            command += ['resume', resume]
+        return command + ['-']
     commands = {
-        'codex': codex_exec_command,
         'claude': claude_print_command,
         'gemini': lambda: agent_command('gemini', '-p', ''),
         'opencode': lambda: agent_command('opencode', 'run'),
     }
-    if agent not in commands:
-        raise RuntimeError(f'Unsupported agent: {agent}')
     command = commands[agent]()
-    model = selected_agent_model(agent)
     if model:
-        if agent == 'codex':
-            command[-1:-1] = ['--model', model]
-        else:
-            command.extend(['--model', model])
+        command.extend(['--model', model])
+    if agent == 'claude' and structured:
+        command += ['--output-format', 'json']
+        if resume:
+            command += ['--resume', resume]
+    return command
+
+
+def note_usage(agent, purpose, info):
+    """Record the token usage of one call and count it against the part's budget."""
+    current = usage_meter.context()
+    budget = current.get('budget')
+    if budget is not None:
+        budget.add(info['usage'])
+    task_id = current.get('task_id')
+    if not task_id:
+        return
+    counts = info['usage']
+    record('agent_usage', f"{agent} {purpose}", task_id, agent=agent, model=info.get('model'),
+           purpose=purpose, subtask=current.get('subtask'), cycle=current.get('cycle'),
+           session_resumed=bool(info.get('resumed')), billable_tokens=usage_meter.billable(counts), **counts)
+
+
+def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementation', resume=None):
+    if agent == 'antigravity':
+        return invoke_antigravity(prompt, cwd, quiet=quiet, backoff=backoff, purpose=purpose)
+    if agent not in ('codex', 'claude', 'gemini', 'opencode'):
+        raise RuntimeError(f'Unsupported agent: {agent}')
+    purpose = usage_meter.context().get('purpose', purpose)
+    structured = structured_output(agent)
+    if resume and not structured:
+        raise SessionResumeFailed(f'{agent} session resume needs structured output')
+    model = selected_agent_model(agent, purpose)
+    command = agent_cli_command(agent, model, structured, resume)
     if agent == 'opencode':
         command.append(prompt)
     if not executable(agent):
         raise RuntimeError(f'{agent} executable missing; run .ats install')
     delays = RATE_LIMIT_BACKOFF if backoff is None else backoff
     attempt = 0
+    usage_meter.remember_call(None)
     while True:
         p = stream_command(command, cwd, timeout=1800, quiet=quiet,
-                           stdin_text=None if agent == 'opencode' else prompt)
-        out = (p.stdout or '')+'\n'+(p.stderr or '')
+                           stdin_text=None if agent == 'opencode' else prompt,
+                           **({'render': usage_meter.RENDERERS[agent]} if structured else {}))
+        parsed = usage_meter.PARSERS[agent](p.stdout) if structured else None
+        out = (parsed['text'] if parsed else (p.stdout or '')) + '\n' + (p.stderr or '')
+        if structured and p.returncode and UNSUPPORTED_FLAG.search((p.stdout or '') + (p.stderr or '')):
+            # An older CLI without JSON output or resume: fall back to plain text from now on.
+            _structured_off.add(agent)
+            print(f'ATS: {agent} has no JSON output; using plain text.', file=sys.stderr, flush=True)
+            if resume:
+                raise SessionResumeFailed(f'{agent} cannot resume sessions')
+            structured = False
+            command = agent_cli_command(agent, model)
+            continue
         if p.returncode and is_transient_rate_limit(out) and attempt < len(delays):
             print(f'ATS: {agent} is rate limited; retrying in {delays[attempt]}s '
                   f'({attempt + 1}/{len(delays)}).', file=sys.stderr, flush=True)
@@ -1055,11 +1232,18 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementatio
             attempt += 1
             continue
         break
+    if parsed:
+        info = {'agent': agent, 'model': model or parsed.get('model'), 'session_id': parsed.get('session_id'),
+                'usage': parsed['usage'], 'resumed': bool(resume)}
+        usage_meter.remember_call(info)
+        note_usage(agent, purpose, info)
     if p.returncode:
         if sandbox_blocked(out):
             raise AgentSandboxBlocked(f'{agent} sandbox blocked: {out[-1200:]}')
         if is_usage_exhausted(out):
             raise AgentUsageExhausted(agent, usage_reset_hint(out))
+        if resume:
+            raise SessionResumeFailed(f'{agent} could not continue session: {out[-600:]}')
         raise RuntimeError(f'{agent} error: {out[-1800:]}')
     if sandbox_blocked(out):
         raise AgentSandboxBlocked(f'{agent} sandbox blocked: {out[-1200:]}')
@@ -1161,11 +1345,15 @@ def normalize_findings(entries):
             continue
         raw = str(entry.get('severity', '')).strip().upper()
         severity = raw if raw in SEVERITIES else SEVERITY_ALIASES.get(raw, 'MAJOR')
-        findings.append({'id': str(entry.get('id') or f'F{number}').strip()[:20],
-                         'severity': severity,
-                         'file': str(entry.get('file', '')).strip()[:200],
-                         'line': str(entry.get('line', '')).strip()[:40],
-                         'summary': summary[:500]})
+        finding = {'id': str(entry.get('id') or f'F{number}').strip()[:20],
+                   'severity': severity,
+                   'file': str(entry.get('file', '')).strip()[:200],
+                   'line': str(entry.get('line', '')).strip()[:40],
+                   'summary': summary[:500]}
+        rule = str(entry.get('rule', '')).strip()
+        if re.fullmatch(r'K:[\w-]{1,40}', rule):
+            finding['rule'] = rule   # the vetted learning this finding is based on
+        findings.append(finding)
     return findings
 
 
@@ -1185,12 +1373,16 @@ def normalize_responses(entries):
 
 
 def evaluate_approval(verdict, checks, findings, history, reviewer, implementer, conf,
-                      tampered=False):
-    """Every reason in the returned list blocks approval (POLICY.md feedback loop)."""
+                      tampered=False, fresh_same_provider=False):
+    """Every reason in the returned list blocks approval (POLICY.md feedback loop).
+
+    `fresh_same_provider`: the project allows a new session of the same provider to review when the
+    other agent is unavailable (review_same_provider_fallback); the run records that it happened.
+    """
     reasons = []
     if tampered:
         reasons.append('reviewer modified the workspace (changes reverted)')
-    if not reviewer or reviewer == implementer:
+    if not reviewer or (reviewer == implementer and not fresh_same_provider):
         reasons.append('no independent reviewer')
     if verdict != 'APPROVE':
         reasons.append('verdict: ' + (verdict or 'missing VERDICT line'))
@@ -1312,50 +1504,236 @@ def style_context(folder, conf=None):
     return text
 
 
-def review_prompt(task, checks, diff, history, style=''):
-    previous = ''
-    if history:
-        last = history[-1]
-        answered = {r['id']: r for r in last.get('responses', [])}
-        items = [dict(f, response=answered.get(f['id'])) for f in last['findings']]
-        previous = (f"This is re-review cycle {len(history)}. Previous open findings with the "
-                    "author's responses (null = no answer):\n" + json.dumps(items, ensure_ascii=False) +
-                    "\nVerify every one against the diff. Keep a finding open (same id) unless it is "
-                    "really resolved; an unanswered BLOCKER/MAJOR or a deferred BLOCKER stays open.\n")
-    return (f"Review ONLY these application changes for task {task!r} using {ATS/'POLICY.md'}.\n"
-            "REVIEW-ONLY MODE: do not create, edit or delete any file. ATS checks the workspace "
-            "afterwards; any change is reverted and the review is rejected.\n"
-            "Inspect the diff and test results below yourself; do not rely on the implementer's summary.\n"
-            "Also check consistency with the existing project: code that departs from its conventions, or UI "
-            "that introduces new colours, fonts, spacing, components or libraries instead of the existing "
-            "ones, is a MINOR finding; visibly inconsistent UI or a new framework/dependency without need is MAJOR."
-            + style + "\n"
-            + previous +
-            "Write, in this order:\n"
-            "1. Findings in prose: severity (BLOCKER, MAJOR, MINOR, SUGGESTION), file:line, issue, why it matters, concrete fix.\n"
-            "2. ONE LINE listing only findings that are still open, or [] if none, in this shape: "
-            'ATS_FINDINGS_JSON: [{"id":"<id>","severity":"<severity>","file":"<path>","line":"<line>","summary":"<summary>"}]\n'
-            "3. Optionally ONE LINE ATS_LEARNINGS_JSON with evidence-backed reusable lessons (no secrets).\n"
-            "4. As the very last line, exactly one verdict line (APPROVE only when no BLOCKER/MAJOR is open), "
-            "either VERDICT: APPROVE or VERDICT: CHANGES_REQUESTED.\n"
-            'Checks: ' + json.dumps(checks, ensure_ascii=False) + '\nDiff:\n' + diff)
+_repo_context = {}
 
 
-def revision_prompt(task, review, findings, style=''):
-    return (f"Revise your implementation for task {task!r}. Never commit, push, merge, deploy or modify .ats.\n"
-            "Address the review below. Answer EVERY finding with status fixed (with test/file "
-            "evidence), not_applicable (with evidence why) or deferred (with an issue/reference). "
-            "Deferred BLOCKERs and unanswered BLOCKER/MAJOR findings prevent approval.\n"
-            "End with ONE LINE in this shape: "
-            'ATS_RESPONSES_JSON: [{"id":"<id>","status":"<status>","note":"<evidence>","reference":"<reference>"}]\n'
-            'Keep matching the existing style of the project.' + style + '\n'
-            'Open findings: ' + json.dumps(findings, ensure_ascii=False) +
+def repo_context(folder, conf, task_id=None):
+    """Layer 1 of the context package (repository map), made once per task so that every prompt of
+    the task starts with the same text."""
+    if not conf.get('context_package', True):
+        return ''
+    if task_id and task_id in _repo_context:
+        return _repo_context[task_id]
+    tree = worktree_tree(folder)
+    text = ''
+    if tree:
+        try:
+            text = '\n' + context_pack.repository_layer(folder, tree, state_directory().parent / 'context-cache',
+                                                         int(conf.get('repo_context_chars', context_pack.REPO_LIMIT)))
+        except OSError:
+            text = ''
+    if task_id:
+        _repo_context[task_id] = text
+    return text
+
+
+def part_context(folder, conf, part, owned_paths=()):
+    """Layer 2 of the context package: the part's files, their tests and local imports."""
+    if not conf.get('context_package', True):
+        return ''
+    tree = worktree_tree(folder)
+    if not tree:
+        return ''
+    try:
+        text = context_pack.part_layer(folder, tree, state_directory().parent / 'context-cache', part,
+                                       owned_paths, int(conf.get('part_context_chars', context_pack.PART_LIMIT)))
+    except OSError:
+        return ''
+    return ('\n' + text + '\nThis package is orientation only; read the files yourself and look further '
+            'when you need to.') if text else ''
+
+
+def shared_prefix(folder, conf, task_id=None, style=None):
+    """The fixed start of every prompt of a task: policy, style brief, vetted learnings and the
+    repository map. It is identical for implementation, revision and review calls of the same task
+    (no timestamps, ids or task-specific details), so providers can reuse their prompt cache.
+    Everything that changes per call comes after it."""
+    run = _run_flags.get(task_id, {})
+    style = style_context(folder, conf) if style is None else style
+    return (f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'} and follow them; they take precedence over "
+            "everything below." + style
+            + task_knowledge(task_id, run.get('task', ''), run.get('paths', ()))
+            + repo_context(folder, conf, task_id) + '\n\n')
+
+
+REVIEW_ROLE = (
+    "ROLE: independent reviewer. REVIEW-ONLY MODE: do not create, edit or delete any file. ATS checks the "
+    "workspace afterwards; any change is reverted and the review is rejected.\n"
+    "Inspect the diff and test results yourself; do not rely on the implementer's summary.\n"
+    "Also check consistency with the existing project: code that departs from its conventions, or UI "
+    "that introduces new colours, fonts, spacing, components or libraries instead of the existing "
+    "ones, is a MINOR finding; visibly inconsistent UI or a new framework/dependency without need is MAJOR.\n"
+    "The pre-review gate below is a set of deterministic checks; it never replaces your own review.\n")
+LIGHT_CHECKLIST = (
+    "LIGHT REVIEW (small change to docs, tests or text): check that it is correct, matches the task, keeps the "
+    "project's tone and conventions, and that tests still test something real. Keep the review short.\n")
+OUTPUT_CONTRACT = (
+    "Write, in this order:\n"
+    "1. Findings in prose: severity (BLOCKER, MAJOR, MINOR, SUGGESTION), file:line, issue, why it matters, concrete fix.\n"
+    "2. ONE LINE listing only findings that are still open, or [] if none, in this shape: "
+    'ATS_FINDINGS_JSON: [{"id":"<id>","severity":"<severity>","file":"<path>","line":"<line>","summary":"<summary>"}] '
+    '(add "rule":"K:<ref>" to a finding that is based on one of the vetted learnings above)\n'
+    "3. Optionally ONE LINE ATS_LEARNINGS_JSON with evidence-backed reusable lessons (no secrets).\n"
+    "4. As the very last line, exactly one verdict line (APPROVE only when no BLOCKER/MAJOR is open), "
+    "either VERDICT: APPROVE or VERDICT: CHANGES_REQUESTED.\n")
+SECURITY_FOCUS = (
+    "FOCUSED SECURITY AND DATA-SAFETY PASS for a high-risk change. Look only for: authentication and "
+    "authorization gaps, secrets or personal data in code, logs or output, injection, unsafe deserialisation, "
+    "data loss or irreversible operations without confirmation, unsafe defaults, missing input validation at "
+    "trust boundaries, and tests that would not catch these. Report only real problems in these areas.\n")
+
+
+def previous_findings(history):
+    if not history:
+        return ''
+    last = history[-1]
+    answered = {r['id']: r for r in last.get('responses', [])}
+    items = [dict(f, response=answered.get(f['id'])) for f in last['findings']]
+    decisions = [{'cycle': past['cycle'], 'id': r['id'], 'status': r['status'], 'note': r.get('note', '')[:200]}
+                 for past in history[:-1] for r in past.get('responses', [])]
+    return (f"This is re-review cycle {len(history)}. Previous open findings with the "
+            "author's responses (null = no answer):\n" + json.dumps(items, ensure_ascii=False) +
+            ("\nEarlier decisions: " + json.dumps(decisions, ensure_ascii=False) if decisions else '') +
+            "\nVerify every one against the code. Keep a finding open (same id) unless it is "
+            "really resolved; an unanswered BLOCKER/MAJOR or a deferred BLOCKER stays open.\n")
+
+
+def review_prompt(task, checks, diff, history, style='', *, prefix=None, gate=None, level='standard',
+                  delta=None, full_stats=None, base=None, notes='', focus=None):
+    """The reviewer's prompt: fixed prefix, role, then what changes per review.
+
+    `delta`: in a delta re-review the changes since the previous review; `diff` is then not sent,
+    only its file list, and the reviewer may read the complete change in the worktree itself.
+    """
+    if prefix is None:
+        prefix = f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'} and follow them." + style + '\n\n'
+    role = REVIEW_ROLE + (LIGHT_CHECKLIST if level == 'light' else '') + (SECURITY_FOCUS if focus == 'security' else '')
+    if delta is not None:
+        files = ', '.join((full_stats or {}).get('files', [])[:60])
+        changes = ("DELTA RE-REVIEW: below are only the changes since your previous review. The complete change "
+                   f"touches: {files}. You may and should read surrounding code and the complete change in the "
+                   "worktree yourself (read-only, e.g. `git diff" + (f" {base}" if base else '') + "`) when a fix "
+                   "could affect code outside these lines.\nChanges since the previous review:\n" + delta)
+    else:
+        changes = 'Diff:\n' + diff
+    gate_text = ('Pre-review gate: ' + json.dumps(gate, ensure_ascii=False) + '\n') if gate else ''
+    return (prefix + role + OUTPUT_CONTRACT
+            + f"\nReview ONLY these application changes for task {task!r} using {ATS/'POLICY.md'}.\n"
+            + (notes + '\n' if notes else '')
+            + previous_findings(history) + gate_text
+            + 'Checks: ' + json.dumps(checks, ensure_ascii=False) + '\n' + changes)
+
+
+RESPONSES_CONTRACT = (
+    "Answer EVERY finding with status fixed (with test/file evidence), not_applicable (with evidence why) "
+    "or deferred (with an issue/reference). Deferred BLOCKERs and unanswered BLOCKER/MAJOR findings "
+    "prevent approval.\nEnd with ONE LINE in this shape: "
+    'ATS_RESPONSES_JSON: [{"id":"<id>","status":"<status>","note":"<evidence>","reference":"<reference>"}]\n')
+
+
+def revision_prompt(task, review, findings, style='', *, prefix=None, handoff=''):
+    """The full revision prompt for a new implementer session (with a handoff of the work so far)."""
+    if prefix is None:
+        prefix = style
+    return (prefix + "ROLE: implementer, revising your work after an independent review. "
+            "Never commit, push, merge, deploy or modify .ats.\n"
+            + RESPONSES_CONTRACT + 'Keep matching the existing style of the project.' + '\n'
+            + f"Revise your implementation for task {task!r}. Address the review below.\n"
+            + (handoff + '\n' if handoff else '')
+            + 'Open findings: ' + json.dumps(findings, ensure_ascii=False) +
             '\nReview:\n' + review[-12000:])
 
 
+def revision_followup(review, findings):
+    """The compact prompt when the implementer continues its own session: only what is new."""
+    return ("The independent reviewer reviewed your changes and left the open findings below. Fix them in "
+            "the same worktree; keep everything that already works. Never commit, push, merge, deploy or "
+            "modify .ats.\n" + RESPONSES_CONTRACT
+            + 'Open findings: ' + json.dumps(findings, ensure_ascii=False) + '\nReview:\n' + review[-6000:])
+
+
+def handoff_summary(folder, base):
+    """What a new implementer session needs to know about the work so far."""
+    stat = execute(['git', 'diff', '--cached', '--stat', base], folder, check=False).stdout.strip()
+    return ('Work so far (this is a new session; the changes below are already in the worktree, '
+            'inspect them before editing):\n' + stat[-3000:]) if stat else ''
+
+
+def tracked_files(folder):
+    return execute(['git', 'ls-files', '-co', '--exclude-standard'], folder, check=False).stdout.splitlines()
+
+
+def gate_repair_prompt(prefix, task, problems):
+    return (prefix + "ROLE: implementer, repairing what the automatic pre-review checks found. Never commit, "
+            "push, merge, deploy or modify .ats.\n"
+            f"Task: {task}\nOnly repair these failing checks in the EXISTING worktree; keep what already works "
+            "and do not rewrite unrelated files. After editing, state what you changed.\nFailing checks: "
+            + json.dumps(problems, ensure_ascii=False))
+
+
+def gate_followup(problems):
+    return ("The automatic pre-review checks failed on your changes. Repair only these in the same worktree, "
+            "keep what already works, and state what you changed. Never commit, push, merge, deploy or modify "
+            ".ats.\nFailing checks: " + json.dumps(problems, ensure_ascii=False))
+
+
+def pre_review_gate(task, task_id, folder, base, implementer, unavailable, conf, budget, stuck, context,
+                    quiet=False, prefix=''):
+    """Run the gate and let the implementer repair what fails, within the shared repair budget.
+
+    Returns (results, implementer, reason); a reason means: stop and escalate.
+    """
+    while True:
+        execute(['git', 'add', '-A'], folder)
+        diff = execute(['git', 'diff', '--cached', base], folder).stdout
+        if not diff.strip():
+            return [], implementer, None   # the review loop reports "no changes"
+        phase('gate', task_id, **context)
+        results = pre_gate.run_gate(conf, folder, diff, tracked_files(folder), run_check)
+        failed = pre_gate.failed(results)
+        record('pre_review_gate', pre_gate.summary(results), task_id, **context, implementer=implementer,
+               results=results, passed=not failed)
+        if not failed:
+            return results, implementer, None
+        problems = [{'check': r['name'], 'output': r['detail'][-1200:]} for r in failed]
+        detail = '; '.join(f"{p['check']}: {p['output'][-300:]}" for p in problems)
+        repeated = stuck.same_failure(pre_gate.signature(results), 'gate')
+        if repeated:
+            return results, implementer, 'stuck: ' + repeated + ' (' + detail[:600] + ')'
+        spent = budget.exceeded()
+        if spent:
+            return results, implementer, 'budget: ' + spent
+        if not budget.take_repair():
+            return results, implementer, ('pre-review checks keep failing after automatic repairs: '
+                                          + detail[:800])
+        before = worktree_tree(folder)
+        try:
+            implementer, response = invoke_with_fallback(
+                implementer, gate_repair_prompt(prefix, task, problems), folder, unavailable, task_id,
+                'revision', quiet=quiet, fallback=False, resume_prompt=gate_followup(problems))
+        except (AgentUsageExhausted, RuntimeError) as exc:
+            return results, implementer, 'repair of the pre-review checks impossible: ' + str(exc)[:300]
+        record('gate_repair', response[-1200:], task_id, **context, implementer=implementer,
+               failed_checks=[p['check'] for p in problems])
+        if stuck.no_progress(before, worktree_tree(folder)):
+            return results, implementer, 'stuck: the repair of the pre-review checks changed no files'
+
+
+def outside_owned(paths, owned):
+    """Changed paths that are not part of the owned paths of a DAG node."""
+    if not owned:
+        return []
+    return [p for p in paths if not dag_planning.paths_conflict([p], owned)]
+
+
 def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
-                base='HEAD', subtask=None):
+                base='HEAD', subtask=None, owned_paths=None):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
+
+    Per round: pre-review gate (cheap deterministic checks, repaired by the implementer), the
+    project's test commands, then the review. Its depth follows risk and size; from the second
+    round on the reviewer gets the changes since its previous review when they are small and safe.
+    The part's budget and the stuck detector stop rounds that would only repeat themselves.
 
     Returns (approved, reviewer, implementer, history).
     """
@@ -1365,31 +1743,60 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
     history = []
     reviewer = None
     reasons = ['not reviewed']
+    budget = usage_meter.context().get('budget')
+    if budget is None:
+        budget = budgets.Budget.for_part(conf, owned_paths or ())
+        usage_meter.set_context(budget=budget)
+    stuck = budgets.StuckDetector()
+    reviewed_tree = None
+    drift_reported = False
     for cycle in range(max_revisions + 1):
+        spent = budget.exceeded()
+        if spent:
+            reasons = ['budget: ' + spent]
+            record('budget_exceeded', spent, task_id, **context, implementer=implementer, **budget.snapshot())
+            break
+        prefix = shared_prefix(folder, conf, task_id)
+        gate_results = []
+        if conf.get('pre_review_gate', True):
+            gate_results, implementer, stop = pre_review_gate(
+                task, task_id, folder, base, implementer, unavailable, conf, budget, stuck, context,
+                quiet=quiet, prefix=prefix)
+            if stop:
+                reasons = [stop]
+                break
         phase('checks', task_id, **context, cycle=cycle)
         checks = run_checks(conf, folder)
         # Repair a narrowly failing test before spending tokens on a full diff review.
         # A successful repair still goes through the independent review below.
         failed = [c for c in checks if not c['passed']]
-        if failed and cycle < max_revisions and conf.get('targeted_test_fix', True):
+        if (failed and cycle < max_revisions and conf.get('targeted_test_fix', True)
+                and budget.take_repair()):
             phase('revision', task_id, **context, cycle=cycle, implementer=implementer)
-            problem = json.dumps([{'command': c['command'], 'output': c['output'][-1200:]}
-                                  for c in failed], ensure_ascii=False)
-            fix_prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. '
-                          f'Task: {task}\\nOnly repair these failing checks in the EXISTING worktree: '
-                          + problem + '\\nKeep already working functionality. Do not restart the task, '
-                          'rewrite unrelated files, commit, push or modify .ats. '
-                          'After editing, state what you changed.')
+            problem = [{'command': c['command'], 'output': c['output'][-1200:]} for c in failed]
+            fix_prompt = (prefix + "ROLE: implementer, repairing failing tests. Never commit, push, merge, "
+                          "deploy or modify .ats.\n"
+                          f'Task: {task}\nOnly repair these failing checks in the EXISTING worktree: '
+                          + json.dumps(problem, ensure_ascii=False)
+                          + '\nKeep already working functionality. Do not restart the task or rewrite '
+                          'unrelated files. After editing, state what you changed.')
             try:
                 implementer, response = invoke_with_fallback(
                     implementer, fix_prompt, folder, unavailable, task_id, 'revision',
-                    quiet=quiet, fallback=False)
+                    quiet=quiet, fallback=False,
+                    resume_prompt=('These test commands fail on your changes; repair only them in the same '
+                                   'worktree and state what you changed: ' + json.dumps(problem, ensure_ascii=False)))
                 record('targeted_test_fix', response[-1200:], task_id, **context,
                        implementer=implementer, failed_commands=[c['command'] for c in failed])
                 checks = run_checks(conf, folder)
             except (AgentUsageExhausted, RuntimeError) as exc:
                 record('targeted_test_fix_skipped', str(exc)[:500], task_id, **context)
                 # Keep existing behavior: the full independent review still decides.
+            repeated = stuck.same_failure(tuple(sorted(
+                (str(c['command']), c['output'][-300:]) for c in checks if not c['passed'])), 'tests')
+            if repeated:
+                reasons = ['stuck: ' + repeated]
+                break
         execute(['git', 'add', '-A'], folder)
         # Against the commit (or, for a subtask, the tree) the work started from, not HEAD: an agent
         # that runs `git commit` itself would otherwise make its own work invisible.
@@ -1399,6 +1806,12 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                    implementer=implementer, branch=branch)
             raise RuntimeError('Agent made no changes; worktree preserved for diagnosis: ' + str(folder))
         preferred = alternate_agent(implementer, unavailable)
+        same_provider = False
+        if preferred is None and conf.get('review_same_provider_fallback', False) and implementer not in unavailable:
+            # Opt-in: the other provider is unavailable, so a NEW session of the same provider reviews.
+            preferred, same_provider = implementer, True
+            record('review_same_provider', 'Other agent unavailable: a new session of the same provider reviews',
+                   task_id, **context, implementer=implementer, reviewer=preferred)
         if preferred is None:
             message = 'Independent review unavailable: no other enabled agent is available'
             print(message, file=sys.stderr)
@@ -1413,10 +1826,33 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             reasons = ['diff too large to review completely']
             break
         tree = index_tree(folder)
+        full_stats = review_scope.diff_stats(diff)
+        risk = intelligence.risk_profile(task, full_stats['files'])
+        level, level_reason = review_scope.review_level(task, full_stats, risk, conf)
+        delta = None
+        mode, mode_reason = 'full', 'first review'
+        if reviewed_tree:
+            delta_diff = execute(['git', 'diff', reviewed_tree, tree], folder, check=False).stdout
+            delta_stats = review_scope.diff_stats(delta_diff)
+            added = ' '.join(' '.join(lines) for lines in pre_gate.added_lines(delta_diff).values())
+            delta_risk = intelligence.risk_profile(added[:20000], delta_stats['files'])
+            mode, mode_reason = review_scope.rereview_mode(len(history), delta_stats, full_stats, delta_risk, conf)
+            if mode == 'delta':
+                delta = delta_diff
+        notes = ''
+        drift = outside_owned(full_stats['files'], owned_paths)
+        if drift:
+            notes = ('Changes outside the files this part owns (' + ', '.join(owned_paths) + '): '
+                     + ', '.join(drift[:20]) + '. Check that they are necessary and safe next to parallel work.')
+            if not drift_reported:
+                record('ownership_drift', 'Changes outside the owned paths', task_id, **context,
+                       implementer=implementer, paths=drift[:50], owned_paths=list(owned_paths))
+                drift_reported = True
         phase('review', task_id, **context, cycle=cycle, reviewer=preferred, implementer=implementer)
+        prompt = review_prompt(task, checks, diff, history, prefix=prefix, gate=gate_results, level=level,
+                               delta=delta, full_stats=full_stats, base=base, notes=notes)
         try:
-            reviewer, review = invoke_with_fallback(preferred, review_prompt(task, checks, diff, history, style_context(folder, conf)),
-                                                    folder, unavailable, task_id, 'review',
+            reviewer, review = invoke_with_fallback(preferred, prompt, folder, unavailable, task_id, 'review',
                                                     quiet=quiet, fallback=False)
         except AgentUsageExhausted as exc:
             print(str(exc) + ': independent review skipped', file=sys.stderr)
@@ -1436,23 +1872,66 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                   + ', '.join(tampered[:10]), file=sys.stderr)
         verdict = parse_verdict(review)
         findings = normalize_findings(parse_marked_json(review, 'ATS_FINDINGS_JSON'))
-        reasons = evaluate_approval(verdict, checks, findings, history, reviewer, implementer,
-                                    conf, tampered=bool(tampered))
+        reasons = evaluate_approval(verdict, checks, findings, history, reviewer, implementer, conf,
+                                    tampered=bool(tampered), fresh_same_provider=same_provider)
+        security = None
+        if level == 'deep' and not reasons:
+            # High risk: a second, focused pass must approve too.
+            phase('review', task_id, **context, cycle=cycle, reviewer=preferred, implementer=implementer)
+            try:
+                _, second = invoke_with_fallback(
+                    preferred, review_prompt(task, checks, diff, history, prefix=prefix, gate=gate_results,
+                                             level=level, base=base, notes=notes, focus='security'),
+                    folder, unavailable, task_id, 'review', quiet=quiet, fallback=False)
+            except (AgentUsageExhausted, RuntimeError) as exc:
+                second = 'VERDICT: CHANGES_REQUESTED'
+                reasons = ['security review pass failed: ' + str(exc)[:300]]
+            touched = restore_if_changed(folder, tree)
+            sec_findings = [dict(f, id='S' + f['id'] if not f['id'].startswith('S') else f['id'])
+                            for f in normalize_findings(parse_marked_json(second, 'ATS_FINDINGS_JSON'))]
+            sec_verdict = parse_verdict(second)
+            if not reasons:
+                reasons = [('security pass: ' + r) for r in evaluate_approval(
+                    sec_verdict, checks, sec_findings, [], reviewer, implementer, conf,
+                    tampered=bool(touched), fresh_same_provider=same_provider)]
+            findings = findings + sec_findings
+            security = {'verdict': sec_verdict, 'findings': len(sec_findings)}
+            review = review + '\n\n--- Security and data-safety pass ---\n' + second
+            if reasons:
+                verdict = 'CHANGES_REQUESTED'
         approved = not reasons
         capture_learning_proposals(review, task_id)
         record('review_result', review[-8000:], task_id, **context, implementer=implementer, reviewer=reviewer,
                approved=approved, verdict=verdict, findings=findings, blocking_reasons=reasons,
-               tampered_paths=tampered, tests=checks, cycle=cycle, branch=branch)
+               tampered_paths=tampered, tests=checks, cycle=cycle, branch=branch, gate=gate_results,
+               review_level=level, review_level_reason=level_reason, review_mode=mode,
+               review_mode_reason=mode_reason, security_pass=security, same_provider_review=same_provider,
+               knowledge_cited=sorted({f['rule'] for f in findings if f.get('rule')}),
+               budget=budget.snapshot())
         history.append({'cycle': cycle, 'reviewer': reviewer, 'findings': findings, 'responses': []})
+        reviewed_tree = tree
         if approved:
             phase('approved', task_id, **context, cycle=cycle)
             return True, reviewer, implementer, history
+        repeated = stuck.reopened(findings)
+        if repeated:
+            reasons = reasons + ['stuck: ' + repeated]
+            break
         if cycle == max_revisions:
             break
+        spent = budget.exceeded()
+        if spent:
+            reasons = reasons + ['budget: ' + spent]
+            record('budget_exceeded', spent, task_id, **context, implementer=implementer, **budget.snapshot())
+            break
         phase('revision', task_id, **context, cycle=cycle, implementer=implementer)
+        before = worktree_tree(folder)
         try:
-            implementer, response = invoke_with_fallback(implementer, revision_prompt(task, review, findings, style_context(folder, conf)),
-                                                         folder, unavailable, task_id, 'revision', quiet=quiet)
+            implementer, response = invoke_with_fallback(
+                implementer, revision_prompt(task, review, findings, prefix=prefix,
+                                             handoff=handoff_summary(folder, base)),
+                folder, unavailable, task_id, 'revision', quiet=quiet,
+                resume_prompt=revision_followup(review, findings))
         except AgentUsageExhausted as exc:
             print(str(exc), file=sys.stderr)
             record('blocked', str(exc), task_id, **context, phase='revision', resets=exc.resets)
@@ -1465,6 +1944,12 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         record('feedback_response', response[-2000:], task_id, **context, implementer=implementer, cycle=cycle,
                responses=responses, unanswered=missing)
         capture_learning_proposals(response, task_id)
+        stuck.answered(findings, responses)
+        claims_fix = any(r['status'] == 'fixed' for r in responses)
+        idle = stuck.no_progress(before, worktree_tree(folder))
+        if idle and claims_fix:
+            reasons = reasons + ['stuck: ' + idle + ' although findings were answered as fixed']
+            break
     summary = 'Not approved; needs a human decision: ' + '; '.join(reasons)
     print('ATS: ' + summary, file=sys.stderr)
     record('escalated', summary, task_id, **context, implementer=implementer, reviewer=reviewer,
@@ -1562,7 +2047,8 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
     phase('planning', task_id, agent=agent)
     baseline = index_tree(folder)
     prompt = (
-        f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. Plan ONLY, do not edit any files. '
+        shared_prefix(folder, conf, task_id) +
+        'ROLE: planner. Plan ONLY, do not edit any files. '
         f'Project: {APP.name}. Task: {task}\n'
         'Inspect the code to divide this task into 2-20 concrete implementable parts '
         'with tests and independently reviewable outcomes. '
@@ -1644,6 +2130,13 @@ def other_agent(agent):
     return alternate_agent(agent)
 
 
+def dag_node(plan, title):
+    """The DAG v2 node (id, owned_paths, depends_on) of a part, or None for list plans."""
+    if isinstance(plan, dict) and plan.get('plan_version') == 2:
+        return next((n for n in plan.get('tasks', []) if n.get('title', '').strip() == title), None)
+    return None
+
+
 def git_identity(folder):
     """['-c', ...] for an ATS identity when git has none here (local snapshot projects), else []."""
     if execute(['git', 'config', 'user.email'], folder, check=False).stdout.strip():
@@ -1670,17 +2163,24 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
                    'separately): ' + json.dumps(plan, ensure_ascii=False))
     together = (f'Another agent builds part {alongside[0]} ({alongside[1]}) AT THE SAME TIME in a separate '
                 'copy; do not implement it and avoid changing the same code. ' if alongside else '')
+    node = dag_node(plan, part)
+    owned = list(node['owned_paths']) if node else []
+    ownership = ('Files this part owns: ' + ', '.join(owned) + '. Change other files only when unavoidable, '
+                 'and say which and why. ' if owned else '')
     phase('implementation', task_id, implementer=implementer, subtask=number)
-    prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. '
-              f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
-              f'Implement ONLY this part: {description}\n' + together +
+    budget = budgets.Budget.for_part(conf, owned)
+    usage_meter.set_context(budget=budget)
+    record('budget', f'Budget for part {number}', task_id, subtask=number, **budget.snapshot())
+    prompt = (shared_prefix(folder, conf, task_id)
+              + 'ROLE: implementer of one part of a planned task.\n'
               'Earlier parts have passed independent review. Preserve them. Add tests. '
               'Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; '
-              'ATS commits the work after the review.'
-              + style_context(folder, conf)
-              + knowledge_context()
-              + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
-              + 'items, or ATS_LEARNINGS_JSON: [] when there are none.')
+              'ATS commits the work after the review.\n'
+              'At the end include ONE LINE ATS_LEARNINGS_JSON: [...] with evidence-backed '
+              'items, or ATS_LEARNINGS_JSON: [] when there are none.\n\n'
+              f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
+              f'Implement ONLY this part: {description}\n' + together + ownership
+              + part_context(folder, conf, part, owned))
     existing_changes = False
     if resume_work:
         base_tree = execute(['git', 'rev-parse', str(base) + '^{tree}'], folder).stdout.strip()
@@ -1702,7 +2202,7 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
     try:
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
-            quiet=quiet, base=base, subtask=number)
+            quiet=quiet, base=base, subtask=number, owned_paths=owned)
     except RuntimeError as exc:   # e.g. the part produced no changes
         record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
                blocking_reasons=[f'subtask {number}: {exc}'])
@@ -1741,11 +2241,11 @@ def merge_parallel_part(task, plan, number, part, task_id, folder, branch, side_
         problem = ('Merging your part into the other part produced conflicts in: ' + ', '.join(conflicts[:30])
                    + '. Resolve every conflict marker so BOTH parts keep working.')
     record('merge_conflict', problem[:1200], task_id, subtask=number, implementer=author, branch=branch)
-    prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. Task: {task}\n'
+    prompt = (shared_prefix(folder, conf, task_id) + 'ROLE: implementer, integrating parallel work.\n'
+              f'Task: {task}\n'
               f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
               f'You built part {number} ({part}) in parallel with another part. {problem}\n'
-              'Change only what the integration needs. Do not commit, push or modify .ats.'
-              + style_context(folder, conf))
+              'Change only what the integration needs. Do not commit, push or modify .ats.')
     try:
         fixer, output = invoke_with_fallback(author, prompt, folder, unavailable, task_id, 'implementation',
                                              quiet=quiet, fallback=False)
@@ -1876,13 +2376,18 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
         if reuse_b:
             results['b'] = reuse_b
 
+        timing = {}
+
         def build(key, *args):
+            started = time.monotonic()
             try:
                 results[key] = run_part(*args, **({'resume_work': True} if resumed else {}))
             except Exception as exc:
                 record('escalated', str(exc), task_id, subtask=args[2], branch=branch,
                        blocking_reasons=[f'subtask {args[2]}: {exc}'])
                 results[key] = (False, None, args[8], [])
+            finally:
+                timing[key] = round(time.monotonic() - started, 1)
 
         threads = []
         if not reuse_a:
@@ -1897,6 +2402,11 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             thread.start()
         for thread in threads:
             thread.join()
+        if len(timing) == 2:
+            # How long the faster part waited for the slower one: the cost of the wave barrier.
+            record('wave_timing', f'Parts {first} and {second}: {timing["a"]}s and {timing["b"]}s', task_id,
+                   subtasks=[first, second], seconds=[timing['a'], timing['b']],
+                   idle_seconds=round(abs(timing['a'] - timing['b']), 1), branch=branch)
         (ok_a, reviewer_a, author_a, cycles_a), (ok_b, reviewer_b, author_b, cycles_b) = results['a'], results['b']
         history.extend(cycles_a + cycles_b)
         if ok_a:
@@ -2107,9 +2617,9 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
                    f'{base} and re-apply the intent of your change on top of it.')
     record('merge_conflict', problem[:1200], task_id, implementer=implementer, branch=branch, base=ref)
     fixer = implementer if implementer not in unavailable else ('claude' if implementer == 'codex' else 'codex')
-    prompt = (f'Read {ATS/"POLICY.md"} and {ATS/"AGENTS.md"}. Task: {task}\n{problem}\n'
-              'Change only what the update needs. Do not commit, push or modify .ats; ATS commits after the review.'
-              + style_context(folder, conf))
+    prompt = (shared_prefix(folder, conf, task_id) + 'ROLE: implementer, updating the branch.\n'
+              f'Task: {task}\n{problem}\n'
+              'Change only what the update needs. Do not commit, push or modify .ats; ATS commits after the review.')
     try:
         fixer, output = invoke_with_fallback(fixer, prompt, folder, unavailable, task_id, 'implementation',
                                              quiet=quiet)
@@ -2188,6 +2698,9 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             raise RuntimeError('Source checkpoint is stale or invalid. Existing code was not modified')
     record('assigned',task,task_id,implementer=agent,branch=branch,task_categories=intelligence.categories(task))
     record('risk_profile', 'Risk-based execution profile', task_id, **risk)
+    _run_flags[task_id] = {'task': task, 'high_risk': risk['level'] == 'high'}
+    usage_meter.reset_context()
+    usage_meter.set_context(task_id=task_id)
     if not any(executable(name) for name in enabled_agents()):
         raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
     worktree_created=False
@@ -2215,8 +2728,12 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
         else:
             preflight_plan = preplan_task(task, task_id, folder, agent, unavailable, conf,
                                          quiet=quiet, mode=parallel)
+        if isinstance(preflight_plan, dict):   # the files of every part help choose the learnings
+            _run_flags[task_id]['paths'] = [p for n in preflight_plan.get('tasks', []) for p in n.get('owned_paths', [])]
         phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
-        prompt = (f"Read {ATS/'POLICY.md'} and {ATS/'AGENTS.md'}. Task: {task}. "
+        prompt = (shared_prefix(folder, conf, task_id)
+                  + "ROLE: implementer.\n"
+                  f"Task: {task}. "
                   "Assess task size before editing. If it is too large for one complete review "
                   f"(maximum diff {conf.get('max_review_diff_chars', 150000)} characters), "
                   "make NO file changes and return ONE LINE ATS_SUBTASKS_JSON: "
@@ -2231,8 +2748,7 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
                   "Change only necessary application files and add tests. "
                   "Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; "
                   "ATS commits your work after the review."
-                  + style_context(folder, conf)
-                  + knowledge_context()
+                  + part_context(folder, conf, task)
                   + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: '
                   + '[{"kind":"finding","title":"<title>","observation":"<observation>",'
                   + '"evidence":"<evidence>"}] (replace the placeholders, or use []). '
@@ -2241,6 +2757,9 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             plan = preflight_plan
             implementer = agent
         else:
+            budget = budgets.Budget.for_part(conf)
+            usage_meter.set_context(budget=budget)
+            record('budget', 'Budget for the task', task_id, **budget.snapshot())
             initial_tree = index_tree(folder)
             implementer,result=invoke_with_fallback(
                 agent,prompt,folder,unavailable,task_id,'implementation',quiet=quiet)

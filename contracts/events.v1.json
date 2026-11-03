@@ -26,10 +26,21 @@
     "subtask_completed",
     "subtask_merged",
     "subtasks_completed",
-    "merge_conflict"
+    "merge_conflict",
+    "agent_usage",
+    "budget",
+    "budget_exceeded",
+    "pre_review_gate",
+    "gate_repair",
+    "session_handoff",
+    "ownership_drift",
+    "knowledge_selected",
+    "review_same_provider",
+    "wave_timing"
   ],
   "phase_stages": [
     "implementation",
+    "gate",
     "checks",
     "review",
     "revision",

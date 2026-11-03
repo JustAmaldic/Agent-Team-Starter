@@ -72,14 +72,39 @@ def ready_tasks(plan, completed, running=()):
             and set(n["depends_on"]) <= done]
 
 
+def critical_path(plan):
+    """{task id: number of tasks on the longest chain from it to the end, itself included}."""
+    graph = validate_dag(plan)
+    dependents = {n["id"]: [] for n in graph["tasks"]}
+    for node in graph["tasks"]:
+        for dep in node["depends_on"]:
+            dependents[dep].append(node["id"])
+    lengths = {}
+
+    def length(name):
+        if name not in lengths:
+            lengths[name] = 1 + max((length(child) for child in dependents[name]), default=0)
+        return lengths[name]
+
+    for node in graph["tasks"]:
+        length(node["id"])
+    return lengths
+
+
 def execution_batches(plan, max_parallel=2):
-    """Deterministic ready-queue batches. Every batch passes review/merge before dependents run."""
+    """Deterministic ready-queue batches. Every batch passes review/merge before dependents run.
+
+    Among the ready tasks the one with the longest remaining chain goes first, so the wait for a
+    batch to finish never holds back the critical path while a side task could have waited.
+    """
     if max_parallel != 2:
         raise ValueError("ATS currently supports exactly two concurrent worktrees")
     graph = validate_dag(plan)
+    chain = critical_path(graph)
+    order = {n["id"]: i for i, n in enumerate(graph["tasks"])}
     completed, batches = set(), []
     while len(completed) < len(graph["tasks"]):
-        ready = ready_tasks(graph, completed)
+        ready = sorted(ready_tasks(graph, completed), key=lambda n: (-chain[n["id"]], order[n["id"]]))
         if not ready:
             raise ValueError("DAG cannot progress")
         batch = [ready[0]]

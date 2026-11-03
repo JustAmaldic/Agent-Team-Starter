@@ -128,8 +128,9 @@ class TaskFlowStreamTests(unittest.TestCase):
 
         self.assertTrue(all(line['task_id'] == task_id for line in lines))
         sequence = [line['stage'] if line['event_type'] == 'phase' else line['event_type'] for line in lines]
-        self.assertEqual(sequence, ['assigned', 'implementation', 'implementation', 'checks', 'review',
-                                    'review_result', 'approved', 'finished'])
+        self.assertEqual(sequence, ['assigned', 'risk_profile', 'implementation', 'budget', 'implementation',
+                                    'gate', 'pre_review_gate', 'checks', 'review', 'review_result', 'approved',
+                                    'finished'])
         finished = lines[-1]
         self.assertTrue(finished['approved'])
         self.assertIn('app-ats-' + task_id[:8], finished['worktree'])

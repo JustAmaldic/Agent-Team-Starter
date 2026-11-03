@@ -5,6 +5,20 @@ from unittest.mock import patch
 import ats
 
 
+
+_plain = None
+
+
+def setUpModule():
+    """These tests cover the plain-text CLI contract; JSON output is covered in test_token_efficiency."""
+    global _plain
+    _plain = patch.dict(os.environ, {'ATS_STRUCTURED_OUTPUT': '0'})
+    _plain.start()
+
+
+def tearDownModule():
+    _plain.stop()
+
 class AgentModelOverridesTests(unittest.TestCase):
     def test_missing_model_uses_cli_default(self):
         with patch.dict(os.environ, {}, clear=True):
