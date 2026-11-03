@@ -166,6 +166,28 @@ ATS-app passes a comma-separated `ATS_BLOCKED_AGENTS` environment variable for q
 
 ATS-app can supply a model ID independently for each enabled CLI through `ATS_MODEL_CODEX`, `ATS_MODEL_CLAUDE`, `ATS_MODEL_GEMINI`, `ATS_MODEL_OPENCODE` and `ATS_MODEL_ANTIGRAVITY`. A blank setting preserves the provider's default. Nonempty values must be valid model IDs accepted by the selected CLI. The CLI invocation receives `--model <model-id>`; unsupported model IDs fail visibly instead of quietly choosing a different model. The selected model does not bypass review, sandboxing, agent enablement or quota limits.
 
+## Contract-first planning (t50)
+
+DAG v2 supports optional `contracts_provided` and `contracts_required` arrays on each task node.
+Use the same short identifier to connect a shared type or API contract to its consumers.
+ATS enforces exactly one provider and requires each consumer to depend on the provider,
+directly or transitively. Therefore the contract's implementation, tests and independent
+review must finish before dependent work starts. Independent components remain parallel.
+
+```json
+{"plan_version":2,"tasks":[
+  {"id":"contract","title":"Define shared public API contracts","depends_on":[],
+   "owned_paths":["contracts/"],"contracts_provided":["public_api"]},
+  {"id":"server","title":"Implement server against the stable API","depends_on":["contract"],
+   "owned_paths":["src/server.py"],"contracts_required":["public_api"]},
+  {"id":"client","title":"Implement client against the stable API","depends_on":["contract"],
+   "owned_paths":["src/client.js"],"contracts_required":["public_api"]}
+]}
+```
+
+This adds contract-level ordering to the existing batch planner; it does **not**
+yet remove the wave barrier (full dynamic t49 scheduler remains separate).
+
 ## Token-efficient runs
 
 ATS reads token usage and session ids from the CLIs' JSON output (`claude -p --output-format json`, `codex exec --json`) and records an `agent_usage` event per call: agent, model, phase, part, review round, and input, output, cache-read and cache-write tokens separately (no prompts or answers). `ATS_STRUCTURED_OUTPUT=0` switches back to plain text; an older CLI without JSON output falls back automatically.
