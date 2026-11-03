@@ -1862,7 +1862,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             raise RuntimeError('Agent made no changes; worktree preserved for diagnosis: ' + str(folder))
         preferred = alternate_agent(implementer, unavailable)
         same_provider = False
-        if preferred is None and conf.get('review_same_provider_fallback', False) and implementer not in unavailable:
+        if preferred is None and (conf.get('review_same_provider_fallback', False) or conf.get('solo_agent_mode', False)) and implementer not in unavailable:
             # Opt-in: the other provider is unavailable, so a NEW session of the same provider reviews.
             preferred, same_provider = implementer, True
             record('review_same_provider', 'Other agent unavailable: a new session of the same provider reviews',
