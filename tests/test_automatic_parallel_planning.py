@@ -69,6 +69,38 @@ class PreflightPlanningTests(unittest.TestCase):
                                      'codex', set(), {}, mode='auto')
                 self.assertEqual(invoke.call_count, 2)
 
+    def test_invalid_first_plan_records_reason_and_uses_compact_session_retry(self):
+        original = ('ATS_DAG_JSON: {"plan_version":2,"tasks":['
+                    '{"id":"first","title":"Implement reporting contract and regression tests",'
+                    '"depends_on":[],"owned_paths":["report.py"]},'
+                    '{"id":"second","title":"Build a separate storage module with tests",'
+                    '"depends_on":[],"owned_paths":["store.py"]},'
+                    '{"id":"third","title":"Integrate the two modules in the CLI",'
+                    '"depends_on":["first","second"],"owned_paths":["ats.py"]}]}')
+        corrected = ('ATS_DAG_JSON: {"plan_version":2,"tasks":['
+                     '{"id":"first","title":"Implement report module and tests",'
+                     '"depends_on":[],"owned_paths":["report.py"]},'
+                     '{"id":"second","title":"Integrate reporting into the CLI",'
+                     '"depends_on":["first"],"owned_paths":["ats.py"]}]}')
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(ats, 'should_preplan', return_value=True), \
+                 patch.object(ats, 'enabled_agents', return_value=['codex', 'claude']), \
+                 patch.object(ats, 'phase'), patch.object(ats, 'index_tree', return_value='tree0'), \
+                 patch.object(ats, 'restore_if_changed', return_value=[]), \
+                 patch.object(ats, 'record') as record, \
+                 patch.object(ats, 'invoke_with_fallback', side_effect=[('codex', original),
+                                                                        ('codex', corrected)]) as invoke:
+                plan = ats.preplan_task('Make CLI reporting and persistence with regression tests',
+                                        'task1', pathlib.Path(tmp), 'codex', set(),
+                                        {'max_plan_parts': 2}, mode='auto')
+        self.assertEqual(len(plan['tasks']), 2)
+        self.assertEqual(invoke.call_count, 2)
+        self.assertIn('resume_prompt', invoke.call_args.kwargs)
+        self.assertIn('at most 2 parts', invoke.call_args.kwargs['resume_prompt'])
+        self.assertTrue(any(c.args[0] == 'planning_retry' and
+                            'configured part limit' in c.args[1]
+                            for c in record.call_args_list))
+
     def test_always_mode_needs_parallel_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(ats, 'enabled_agents', return_value=['codex', 'claude']), \

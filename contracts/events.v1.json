@@ -36,7 +36,9 @@
     "ownership_drift",
     "knowledge_selected",
     "review_same_provider",
-    "wave_timing"
+    "wave_timing",
+    "planning_retry",
+    "review_handoff"
   ],
   "phase_stages": [
     "implementation",
