@@ -2064,6 +2064,13 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         '"depends_on":["contract"],"owned_paths":["newsletter_audit.py"]},'
         '{"id":"integration","title":"Integrate and test security and newsletter workflows",'
         '"depends_on":["scorer","audit"],"owned_paths":["mail_assist.py"]}]}. '
+        'When modules share newly introduced types or APIs, add a small contract-defining node first. '
+        'Declare contracts_provided on that node and contracts_required on each consumer, '
+        'using the same short identifier (example user_api). Every consumer must depend '
+        'directly or indirectly on the contract-defining node. ATS rejects missing or '
+        'parallel/unreviewed contract dependencies. Omit these optional fields when no '
+        'new shared interface is needed. Acceptance tests for the contract belong in '
+        'its owned_paths. Do not make unrelated parts depend on the contract. '
         'Declare ONLY true dependencies, not conceptual phases. '
         'Use separate owned_paths for independently implementable work. '
         'Optimize for the shortest safe critical path, not for the most sequential phases. '
@@ -2167,6 +2174,16 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
     owned = list(node['owned_paths']) if node else []
     ownership = ('Files this part owns: ' + ', '.join(owned) + '. Change other files only when unavoidable, '
                  'and say which and why. ' if owned else '')
+    contract_notes = ''
+    if node:
+        provided = node.get('contracts_provided', [])
+        required = node.get('contracts_required', [])
+        if provided:
+            contract_notes += ('This part defines shared contracts: ' + ', '.join(provided) +
+                               '. Document and test their final interfaces before downstream work. ')
+        if required:
+            contract_notes += ('Consume reviewed contract interfaces: ' + ', '.join(required) +
+                               '. Do not silently change the shared contract. ')
     phase('implementation', task_id, implementer=implementer, subtask=number)
     budget = budgets.Budget.for_part(conf, owned)
     usage_meter.set_context(budget=budget)
@@ -2180,7 +2197,7 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
               'items, or ATS_LEARNINGS_JSON: [] when there are none.\n\n'
               f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
               f'Implement ONLY this part: {description}\n' + together + ownership
-              + part_context(folder, conf, part, owned))
+              + contract_notes + part_context(folder, conf, part, owned))
     existing_changes = False
     if resume_work:
         base_tree = execute(['git', 'rev-parse', str(base) + '^{tree}'], folder).stdout.strip()
@@ -2212,7 +2229,8 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
         cycle['implementer'] = author
     if approved:
         record('subtask_completed', part, task_id, subtask=number, implementer=author,
-               reviewer=reviewer, branch=branch)
+               reviewer=reviewer, branch=branch,
+               contracts_provided=node.get('contracts_provided', []) if node else [])
     return approved, reviewer, author, cycles
 
 
