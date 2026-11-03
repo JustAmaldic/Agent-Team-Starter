@@ -726,6 +726,27 @@ def claude_print_command():
     return agent_command('claude', '-p', '--permission-mode', 'acceptEdits')
 
 
+_preflight_passed = set()   # (task, worktree) where Codex already proved it can read policy and write
+
+
+def preflight_key(cwd, task_id=None):
+    try:
+        folder = str(Path(cwd).resolve())
+    except OSError:
+        folder = str(cwd)
+    return (task_id, folder)
+
+
+def codex_preflight_once(cwd, quiet=False, task_id=None):
+    """The preflight runs once per worktree in a run; a sandbox block resets it (see invoke_with_fallback)."""
+    key = preflight_key(cwd, task_id)
+    if key in _preflight_passed:
+        return False
+    codex_preflight(cwd, quiet=quiet)
+    _preflight_passed.add(key)
+    return True
+
+
 def codex_preflight(cwd, quiet=False):
     """Ask Codex itself to read policy and write a disposable file."""
     marker = 'ATS_PREFLIGHT_OK'
@@ -758,7 +779,10 @@ def worktree_tree(folder):
     e.g. during an unresolved merge)."""
     try:
         index = execute(['git', 'rev-parse', '--git-path', 'index'], folder, check=False).stdout.strip()
-        with tempfile.TemporaryDirectory() as temporary:
+        tree = None
+        # Windows can hold the temporary index open for a moment (virus scanner); a failed cleanup
+        # must not turn a valid tree hash into None.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             copy = Path(temporary) / 'index'
             source = Path(folder) / index if index and not Path(index).is_absolute() else Path(index or '')
             if index and source.is_file():
@@ -768,7 +792,8 @@ def worktree_tree(folder):
                 result = subprocess.run(args, cwd=folder, env=env, capture_output=True, text=True, check=False)
                 if result.returncode:
                     return None
-            return result.stdout.strip() or None
+            tree = result.stdout.strip() or None
+        return tree
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -809,10 +834,10 @@ def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quie
         try:
             if not quiet:
                 print(f'ATS: {candidate} starting {purpose}...', flush=True)
-            if candidate == 'codex' and purpose == 'implementation':
+            if candidate == 'codex' and purpose == 'implementation' and preflight_key(cwd, task_id) not in _preflight_passed:
                 if not quiet:
                     print('ATS: checking Codex policy access and sandbox write...', flush=True)
-                codex_preflight(cwd, quiet=quiet)
+                codex_preflight_once(cwd, quiet=quiet, task_id=task_id)
             session = None
             if resume_prompt and reuse and candidate == agent and purpose == 'revision':
                 session, why = SESSIONS.usable(key, worktree_tree(cwd), max_turns, max_context)
@@ -840,6 +865,7 @@ def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quie
                 print(f'ATS: {candidate} finished {purpose}.', flush=True)
             return candidate, result
         except AgentSandboxBlocked as exc:
+            _preflight_passed.discard(preflight_key(cwd, task_id))   # check again before the next Codex call here
             mark_unavailable(unavailable, candidate, 'sandbox')
             reasons[candidate] = 'sandbox'
             print(f'ATS: {candidate} blocked: {exc}; trying alternate agent.', file=sys.stderr)
@@ -2017,6 +2043,18 @@ def subtask_plan(output):
     return plan
 
 
+DEFAULT_MAX_PLAN_PARTS = 5
+
+
+def max_plan_parts(conf):
+    """Preferred upper bound for a plan (`max_plan_parts`); a longer plan is asked once to merge parts."""
+    try:
+        value = int((conf or {}).get('max_plan_parts', DEFAULT_MAX_PLAN_PARTS))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_PLAN_PARTS
+    return min(MAX_PARTS, max(2, value))
+
+
 def should_preplan(task, mode='auto'):
     """Decide before implementation whether to request a structured multi-agent plan."""
     if mode == 'never':
@@ -2050,8 +2088,15 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         shared_prefix(folder, conf, task_id) +
         'ROLE: planner. Plan ONLY, do not edit any files. '
         f'Project: {APP.name}. Task: {task}\n'
-        'Inspect the code to divide this task into 2-20 concrete implementable parts '
-        'with tests and independently reviewable outcomes. '
+        'Inspect the code to divide this task into as FEW concrete implementable parts as possible '
+        f'(usually 2-{max_plan_parts(conf)}, never more than 20) with tests and independently reviewable '
+        'outcomes. Every part costs a full agent start, codebase exploration, tests and an independent '
+        'review (about five minutes), so merge small steps that belong together (a helper and its tests, '
+        'a setting and the code that uses it, a model and its migration) into one part. Split only at '
+        'real boundaries: work in separate owned files that can run in parallel, a true dependency, '
+        f'or a part whose diff would exceed {conf.get("max_review_diff_chars", 150000)} characters. '
+        'Never make a part only for tests, documentation or checking parts that are already reviewed; '
+        'each part delivers working code with its own tests. '
         'Return exactly ONE LINE starting ATS_DAG_JSON: followed by valid JSON. '
         'The JSON object has plan_version=2 and tasks (2-20 objects). Each task contains '
         'id, title, depends_on (list of prior task ids), and owned_paths (explicit source '
@@ -2087,7 +2132,8 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'interfaces or an agreed contract and independently pass tests. '
         'Never group parts that modify the same file, require each other\'s output, '
         'or depend on uncommitted code; if uncertain use consecutive strings. '
-        'Plan one final integration and cross-feature test pass after component work. '
+        'Plan one final integration and cross-feature test pass only when parts must be wired '
+        'together in code that none of them owns; otherwise the last component part integrates. '
         'Never have two agents modify the same file concurrently. '
         'Every part needs a testable acceptance criterion; include file boundaries '
         'where they are known. Do not include credentials, raw email data, '
@@ -2118,6 +2164,15 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
             if mode == 'always' and not any(len(wave) == 2 for wave in waves):
                 last_problem = 'No safe parallel pair was proposed'
                 continue
+            parts = sum(len(w) for w in waves)
+            limit = max_plan_parts(conf)
+            if parts > limit:
+                if attempt == 0:
+                    last_problem = (f'The plan has {parts} parts; merge related steps into at most {limit} '
+                                    'parts, keeping true dependencies and separate owned files')
+                    continue
+                record('planning_warning', f'Plan keeps {parts} parts (more than {limit}) after a merge request',
+                       task_id, planner=planner, parts=parts, max_plan_parts=limit)
             record('task_split', 'Validated preflight plan before implementation',
                    task_id, planner=planner, subtasks=plan,
                    parallel_pairs=sum(len(wave) == 2 for wave in waves))
@@ -2756,7 +2811,8 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
                   f"(maximum diff {conf.get('max_review_diff_chars', 150000)} characters), "
                   "make NO file changes and return ONE LINE ATS_SUBTASKS_JSON: "
                   '["first bounded implementation with tests", "next bounded implementation with tests"]. '
-                  "Use 2 to 20 concrete ordered parts that together complete the task; "
+                  f"Use as few concrete ordered parts as possible (usually 2 to {max_plan_parts(conf)}, "
+                  "at most 20) that together complete the task; merge small steps that belong together; "
                   "each part must be independently testable and reviewable. "
                   "Two parts that do not depend on each other and touch different code may be given as a "
                   'pair, e.g. ["shared model", ["API endpoint", "settings screen"], "end-to-end test"]: '
