@@ -779,7 +779,10 @@ def worktree_tree(folder):
     e.g. during an unresolved merge)."""
     try:
         index = execute(['git', 'rev-parse', '--git-path', 'index'], folder, check=False).stdout.strip()
-        with tempfile.TemporaryDirectory() as temporary:
+        tree = None
+        # Windows can hold the temporary index open for a moment (virus scanner); a failed cleanup
+        # must not turn a valid tree hash into None.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             copy = Path(temporary) / 'index'
             source = Path(folder) / index if index and not Path(index).is_absolute() else Path(index or '')
             if index and source.is_file():
@@ -789,7 +792,8 @@ def worktree_tree(folder):
                 result = subprocess.run(args, cwd=folder, env=env, capture_output=True, text=True, check=False)
                 if result.returncode:
                     return None
-            return result.stdout.strip() or None
+            tree = result.stdout.strip() or None
+        return tree
     except (OSError, subprocess.SubprocessError):
         return None
 
