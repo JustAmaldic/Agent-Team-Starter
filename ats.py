@@ -2126,6 +2126,9 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         f'or a part whose diff would exceed {conf.get("max_review_diff_chars", 150000)} characters. '
         'Never make a part only for tests, documentation or checking parts that are already reviewed; '
         'each part delivers working code with its own tests. '
+        'The configured maximum of ' + str(max_plan_parts(conf)) + ' parts is a HARD planning target: '
+        'before returning JSON count tasks, keep no more than this many, and verify every '
+        'dependency and owned file. A later correction needs another expensive agent call. '
         'Return exactly ONE LINE starting ATS_DAG_JSON: followed by valid JSON. '
         'The JSON object has plan_version=2 and tasks (2-20 objects). Each task contains '
         'id, title, depends_on (list of prior task ids), and owned_paths (explicit source '
@@ -2194,11 +2197,15 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
             plan = subtask_plan(output)
         except RuntimeError as exc:
             last_problem = str(exc)
+            record('planning_retry', 'Planner response could not be used', task_id,
+                   planner=planner, attempt=attempt + 1, reason=last_problem[:300])
             continue
         if plan is not None:
             waves = plan_waves(plan)
             if mode == 'always' and not any(len(wave) == 2 for wave in waves):
                 last_problem = 'No safe parallel pair was proposed'
+                record('planning_retry', 'Planner did not produce safe parallel work', task_id,
+                       planner=planner, attempt=attempt + 1, reason=last_problem)
                 continue
             parts = sum(len(w) for w in waves)
             limit = max_plan_parts(conf)
@@ -2206,6 +2213,9 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
                 if attempt == 0:
                     last_problem = (f'The plan has {parts} parts; merge related steps into at most {limit} '
                                     'parts, keeping true dependencies and separate owned files')
+                    record('planning_retry', 'Plan exceeds the configured part limit', task_id,
+                           planner=planner, attempt=attempt + 1, reason=last_problem,
+                           parts=parts, max_plan_parts=limit)
                     continue
                 record('planning_warning', f'Plan keeps {parts} parts (more than {limit}) after a merge request',
                        task_id, planner=planner, parts=parts, max_plan_parts=limit)
