@@ -816,9 +816,9 @@ def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quie
                          fallback=True, resume_prompt=None):
     """Run `agent`, or another enabled agent when it is unavailable.
 
-    `resume_prompt` (revisions only): a compact prompt for continuing the implementer's own earlier
-    session. It is used only when that session is still valid for this worktree; otherwise, or when
-    continuing fails, ATS sends the full `prompt` in a new session (the handoff).
+    `resume_prompt` is used only for implementation revisions and planning corrections.
+    Reviews always start fresh. A session is resumed only for the same agent and unchanged worktree;
+    on failure ATS retries with the complete `prompt` in a new session.
     """
     selected = enabled_agents()
     if agent not in selected:
@@ -844,7 +844,7 @@ def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quie
                     print('ATS: checking Codex policy access and sandbox write...', flush=True)
                 codex_preflight_once(cwd, quiet=quiet, task_id=task_id)
             session = None
-            if resume_prompt and reuse and candidate == agent and purpose == 'revision':
+            if resume_prompt and reuse and candidate == agent and purpose in ('revision', 'planning'):
                 session, why = SESSIONS.usable(key, worktree_tree(cwd), max_turns, max_context)
                 if not session and why != 'no session':
                     record('session_handoff', 'New implementer session with a compact handoff: ' + why,
@@ -862,7 +862,7 @@ def invoke_with_fallback(agent, prompt, cwd, unavailable, task_id, purpose, quie
                 result = invoke(candidate, prompt, cwd, quiet=quiet,
                                 **({'purpose': purpose} if candidate == 'antigravity' else {}))
             call = usage_meter.last_call()
-            if purpose in IMPLEMENTER_PURPOSES and call and call.get('agent') == candidate and call.get('session_id'):
+            if (purpose in IMPLEMENTER_PURPOSES or purpose == 'planning') and call and call.get('agent') == candidate and call.get('session_id'):
                 SESSIONS.remember(key, call['session_id'], worktree_tree(cwd), call['usage'])
             if candidate == 'codex' and sandbox_blocked(result):
                 raise AgentSandboxBlocked('Codex reported a sandbox or policy block.')
@@ -2186,7 +2186,11 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
                 agent, prompt + (f'\nYour prior plan was unusable: {last_problem}. '
                                  'Correct the JSON and return only the marker line.'
                                  if last_problem else ''),
-                folder, unavailable, task_id, 'planning', quiet=quiet)
+                folder, unavailable, task_id, 'planning', quiet=quiet,
+                resume_prompt=(f'Your previous ATS_DAG_JSON plan was rejected: {last_problem}. '
+                               f'Revise the existing plan to at most {max_plan_parts(conf)} parts, '
+                               'preserving independent work and owned paths. Return only the corrected '
+                               'ATS_DAG_JSON line. Do not edit any files.' if last_problem else None))
         finally:
             modified = restore_if_changed(folder, baseline)
             if modified:
