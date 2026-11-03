@@ -32,6 +32,35 @@ def validate_dag(plan):
             ".." not in p.split("/") and "\\\\" not in p for p in paths
         ):
             raise ValueError("DAG tasks need safe, explicit owned_paths")
+    # Explicit shared contracts are reviewed as their own DAG nodes before consumers run.
+    providers = {}
+    for node in nodes:
+        for field in ("contracts_provided", "contracts_required"):
+            values = node.get(field, [])
+            if (not isinstance(values, list) or len(values) > 20 or
+                    not all(isinstance(v, str) and ID.fullmatch(v) for v in values) or
+                    len(set(values)) != len(values)):
+                raise ValueError("Invalid contract references")
+        for name in node.get("contracts_provided", []):
+            if name in providers:
+                raise ValueError("Shared contract must have one owner: " + name)
+            providers[name] = node["id"]
+    depends = {node["id"]: set(node.get("depends_on", [])) for node in nodes}
+    def upstream(name):
+        result, pending = set(), list(depends[name])
+        while pending:
+            item = pending.pop()
+            if item not in result:
+                result.add(item)
+                pending.extend(depends.get(item, ()))
+        return result
+    for node in nodes:
+        for name in node.get("contracts_required", []):
+            provider = providers.get(name)
+            if provider is None:
+                raise ValueError("Missing contract provider: " + name)
+            if provider not in upstream(node["id"]):
+                raise ValueError("Contract must be reviewed before consumer: " + name)
     for node in nodes:
         if any(dep not in ids or dep == node["id"] for dep in node.get("depends_on", [])):
             raise ValueError("Unknown or self dependency")
@@ -46,7 +75,9 @@ def validate_dag(plan):
             del remaining[name]
     return {"plan_version": 2, "tasks": [
         {"id": n["id"], "title": n["title"].strip(), "depends_on": list(n.get("depends_on", [])),
-         "owned_paths": list(n["owned_paths"])} for n in nodes
+         "owned_paths": list(n["owned_paths"]),
+         **({key: list(n[key]) for key in ("contracts_provided", "contracts_required") if key in n})}
+        for n in nodes
     ]}
 
 
