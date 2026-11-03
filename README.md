@@ -165,3 +165,27 @@ ATS-app passes a comma-separated `ATS_BLOCKED_AGENTS` environment variable for q
 ## Per-agent model overrides
 
 ATS-app can supply a model ID independently for each enabled CLI through `ATS_MODEL_CODEX`, `ATS_MODEL_CLAUDE`, `ATS_MODEL_GEMINI`, `ATS_MODEL_OPENCODE` and `ATS_MODEL_ANTIGRAVITY`. A blank setting preserves the provider's default. Nonempty values must be valid model IDs accepted by the selected CLI. The CLI invocation receives `--model <model-id>`; unsupported model IDs fail visibly instead of quietly choosing a different model. The selected model does not bypass review, sandboxing, agent enablement or quota limits.
+
+## Token-efficient runs
+
+ATS reads token usage and session ids from the CLIs' JSON output (`claude -p --output-format json`, `codex exec --json`) and records an `agent_usage` event per call: agent, model, phase, part, review round, and input, output, cache-read and cache-write tokens separately (no prompts or answers). `ATS_STRUCTURED_OUTPUT=0` switches back to plain text; an older CLI without JSON output falls back automatically.
+
+Per phase a model can be chosen with `ATS_MODEL_<AGENT>_<PHASE>` (`PLANNING`, `IMPLEMENTATION`, `REVISION`, `LEARNING`), for example a lighter model for learnings. Reviews always use the agent's main model (`ATS_MODEL_<AGENT>`), and so does every phase of a high-risk task.
+
+Project settings in `.ats-project.json` (all optional):
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `pre_review_gate` | `true` | cheap checks before the review (see POLICY.md) |
+| `gate_commands` | `[]` | extra gate checks, e.g. `[{"name": "ruff", "command": "ruff check ."}]` |
+| `targeted_test_command` | from `test_commands` | command for related tests; `{files}` is replaced by the test files |
+| `max_repairs` | `3` | automatic repairs per part (gate and tests together) |
+| `subtask_token_budget` / `subtask_time_budget` | `2000000` / `3600` | budget per part |
+| `review_level_min` | `light` | minimum review depth: `light`, `standard` or `deep` |
+| `delta_review` | `true` | delta re-reviews from round two |
+| `review_same_provider_fallback` | `false` | allow a new session of the same provider to review when the other agent is unavailable |
+| `context_package` | `true` | repository map and part context in prompts |
+| `knowledge_budget` | `4000` | characters of vetted learnings per task |
+
+`ATS_SESSION_REUSE=0` turns session reuse off; `ATS_SESSION_MAX_TURNS` (4) and `ATS_SESSION_MAX_CONTEXT` (250000 tokens) bound it.
+

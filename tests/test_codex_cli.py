@@ -1,3 +1,4 @@
+import os
 import pathlib
 import subprocess
 import sys
@@ -7,6 +8,20 @@ from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import ats
 
+
+
+_plain = None
+
+
+def setUpModule():
+    """These tests cover the plain-text CLI contract; JSON output is covered in test_token_efficiency."""
+    global _plain
+    _plain = patch.dict(os.environ, {'ATS_STRUCTURED_OUTPUT': '0'})
+    _plain.start()
+
+
+def tearDownModule():
+    _plain.stop()
 
 class CodexCLITest(unittest.TestCase):
     def test_invoke_uses_approval_aware_command(self):

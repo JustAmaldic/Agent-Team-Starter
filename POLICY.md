@@ -4,12 +4,12 @@ This file is read by every agent before implementation and review. Rules marked 
 
 ## Task lifecycle
 
-`assigned → implementation → checks → independent review → revisions → approved, or escalated → draft PR (only when approved) → human merge`.
+`assigned → implementation → pre-review gate → checks → independent review → revisions → approved, or escalated → draft PR (only when approved) → human merge`.
 
 ## Roles
 
 - **Implementer:** changes application files in the ATS worktree, adds tests, never pushes or merges.
-- **Reviewer:** always the *other* agent. Never the implementer. **(enforced)** If the other agent is unavailable, the task is escalated instead of self-reviewed.
+- **Reviewer:** always the *other* agent, in a new session. Never the implementer. **(enforced)** If the other agent is unavailable, the task is escalated instead of self-reviewed. Only a project that sets `review_same_provider_fallback: true` may then let a **new** session of the same provider review; the run records `review_same_provider` so this is visible. The implementer's own session is never used for a review.
 - **Human:** the only party that merges. A reviewer's `APPROVE` is advisory, not a GitHub approval.
 
 ## Review-only mode
@@ -82,6 +82,19 @@ A task is approved only when **all** of these hold:
 - the diff was reviewed completely (diffs above `max_review_diff_chars` are not reviewed).
 
 Only approved tasks may become a draft PR. Never fake an approval, test result, push or merge.
+
+## Spending tokens well (enforced where noted)
+
+These rules save tokens without weakening the review:
+
+- **Pre-review gate.** Before a review ATS runs cheap deterministic checks: conflict markers, secrets in added lines, Python and JSON syntax, the project's linters (`gate_commands`, or ruff/eslint when configured) and the tests related to the changed files. A failure goes back to the implementer first. Every check is `passed`, `failed`, `skipped` or `unavailable`; a check that did not run is never `passed` **(enforced)**. A passing gate never replaces the independent review **(enforced)**.
+- **One repair budget.** Automatic repairs (gate and failing tests) share one counter (`max_repairs`, default 3). The same failure twice in a row, a finding that returns after being answered as fixed twice, or a revision that claims a fix but changes nothing stops the part with a reason **(enforced)**.
+- **Budgets.** Each (sub)task has a token and time budget (`subtask_token_budget`, `subtask_time_budget`; `ATS_BUDGET_MULTIPLIER` raises them for a retry). When spent, ATS escalates instead of continuing.
+- **Implementer sessions.** A revision may continue the implementer's own CLI session with only the new findings, but only when the worktree is exactly as that session left it and the session has not grown too large; otherwise ATS starts a new session with a handoff summary.
+- **Review depth.** Small changes to docs, tests or text get a light review with a checklist; high-risk changes always get the normal review plus a focused security and data-safety pass, which must approve as well **(enforced)**. `review_level_min` raises the minimum.
+- **Delta re-review.** From the second round on the reviewer gets the changes since its previous review and the open findings, and may read the complete change itself. A full re-review happens for large revisions, dependency changes, security-sensitive changes and refactors.
+- **Context and prompt order.** Every prompt starts with the same fixed part (policy, style brief, vetted learnings, repository map) so providers can reuse their prompt cache; part-specific context comes after it. The context package is orientation, not a substitute for reading the code.
+- **Owned paths.** A DAG part lists the files it owns. Changes outside them are reported to the reviewer (`ownership_drift`).
 
 ## Data and storage
 
