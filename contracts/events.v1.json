@@ -38,7 +38,8 @@
     "review_same_provider",
     "wave_timing",
     "planning_retry",
-    "review_handoff"
+    "review_handoff",
+    "solo_agent"
   ],
   "phase_stages": [
     "implementation",
