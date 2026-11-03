@@ -8,7 +8,7 @@ This file is read by every agent before implementation and review. Rules marked 
 
 ## Roles
 
-- **Implementer:** changes application files in the ATS worktree, adds tests, never pushes or merges.
+- **Implementer:** changes application files in the ATS worktree, adds tests, never pushes or merges. Agents never change the computer outside the worktree: no global installs, shell profiles, PATH shims or files in the home folder. A test command that cannot start is a configuration problem for the human; ATS stops the part instead of asking an agent to repair it **(enforced)**.
 - **Reviewer:** always the *other* agent, in a new session. Never the implementer. **(enforced)** If the other agent is unavailable, the task is escalated instead of self-reviewed. Only a project that sets `review_same_provider_fallback: true` may then let a **new** session of the same provider review; the run records `review_same_provider` so this is visible. The implementer's own session is never used for a review.
 - **Human:** the only party that merges. A reviewer's `APPROVE` is advisory, not a GitHub approval.
 

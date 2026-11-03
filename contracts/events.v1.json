@@ -45,6 +45,7 @@
     "review",
     "revision",
     "approved",
+    "update",
     "pr",
     "pr_created",
     "patch",

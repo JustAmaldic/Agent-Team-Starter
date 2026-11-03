@@ -722,8 +722,12 @@ def codex_exec_command():
 
 
 def claude_print_command():
-    """Claude Code in print mode; without a prompt argument it reads the prompt from stdin."""
-    return agent_command('claude', '-p', '--permission-mode', 'acceptEdits')
+    """Claude Code in print mode; without a prompt argument it reads the prompt from stdin.
+
+    --add-dir lets Claude read POLICY.md and AGENTS.md: ATS lives outside the task worktree, and
+    Claude Code otherwise denies reading files outside its working directory.
+    """
+    return agent_command('claude', '-p', '--permission-mode', 'acceptEdits', '--add-dir', str(ATS))
 
 
 _preflight_passed = set()   # (task, worktree) where Codex already proved it can read policy and write
@@ -1454,9 +1458,24 @@ def run_checks(conf, folder):
     checks = []
     for cmd in conf.get('test_commands', []):
         outcome = run_check(cmd, folder, timeout=int(conf.get('test_timeout', 900)))
-        checks.append({'command': cmd, 'passed': outcome.returncode == 0,
-                       'output': ((outcome.stdout or '') + (outcome.stderr or ''))[-1000:]})
+        output = (outcome.stdout or '') + (outcome.stderr or '')
+        check = {'command': cmd, 'passed': outcome.returncode == 0, 'output': output[-1000:]}
+        if outcome.returncode and cannot_start(outcome.returncode, output):
+            check['cannot_start'] = True
+        checks.append(check)
     return checks
+
+
+CANNOT_START = re.compile(r"cannot run test command|command not found|No such file or directory|"
+                          r"is not recognized as an internal or external command|No module named pytest\b",
+                          re.IGNORECASE)
+
+
+def cannot_start(returncode, output):
+    """The test command itself could not start (missing program or module): a configuration
+    problem on this computer, not something the implementer should "repair" in the code."""
+    return returncode in (127, 9009) or (returncode in (1, 2) and bool(CANNOT_START.search(output[:2000]))
+                                         and len(output.strip().splitlines()) <= 6)
 
 
 STYLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', 'STYLEGUIDE.md', 'STYLE.md', 'DESIGN.md',
@@ -1692,7 +1711,7 @@ def tracked_files(folder):
 def gate_repair_prompt(prefix, task, problems):
     return (prefix + "ROLE: implementer, repairing what the automatic pre-review checks found. Never commit, "
             "push, merge, deploy or modify .ats.\n"
-            f"Task: {task}\nOnly repair these failing checks in the EXISTING worktree; keep what already works "
+            f"Task: {task}\nOnly repair these failing checks in the EXISTING worktree; never change the computer outside it (no installs, PATH shims or files in the home folder); keep what already works "
             "and do not rewrite unrelated files. After editing, state what you changed.\nFailing checks: "
             + json.dumps(problems, ensure_ascii=False))
 
@@ -1796,13 +1815,22 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         # Repair a narrowly failing test before spending tokens on a full diff review.
         # A successful repair still goes through the independent review below.
         failed = [c for c in checks if not c['passed']]
+        broken = [c for c in failed if c.get('cannot_start')]
+        if broken:
+            # Never let an agent "fix" this by changing the computer (e.g. installing a python shim).
+            names = ', '.join(' '.join(c['command']) if isinstance(c['command'], list) else str(c['command'])
+                              for c in broken)
+            reasons = [f'test command cannot start on this computer: {names}. Fix test_commands in '
+                       f'.ats-project.json (for example python3 instead of python): {broken[0]["output"][-200:]}']
+            record('blocked', reasons[0], task_id, **context, implementer=implementer)
+            break
         if (failed and cycle < max_revisions and conf.get('targeted_test_fix', True)
                 and budget.take_repair()):
             phase('revision', task_id, **context, cycle=cycle, implementer=implementer)
             problem = [{'command': c['command'], 'output': c['output'][-1200:]} for c in failed]
             fix_prompt = (prefix + "ROLE: implementer, repairing failing tests. Never commit, push, merge, "
                           "deploy or modify .ats.\n"
-                          f'Task: {task}\nOnly repair these failing checks in the EXISTING worktree: '
+                          f'Task: {task}\nOnly repair these failing checks in the EXISTING worktree (never change the computer outside it: no installs, PATH shims or files in the home folder): '
                           + json.dumps(problem, ensure_ascii=False)
                           + '\nKeep already working functionality. Do not restart the task or rewrite '
                           'unrelated files. After editing, state what you changed.')
