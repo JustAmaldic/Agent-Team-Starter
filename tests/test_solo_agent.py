@@ -33,7 +33,7 @@ class SoloPlanningTests(unittest.TestCase):
             events = []
 
             def invoke_part(*args, **kwargs):
-                calls.append((args[2], args[7]))
+                calls.append((args[2], args[8]))
                 return True, "codex", "codex", []
 
             def fake_execute(command, cwd=None, check=True, **kwargs):
