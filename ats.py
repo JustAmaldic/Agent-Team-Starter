@@ -2158,7 +2158,7 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'requires the other\'s unfinished interfaces and their write sets are disjoint. '
         'Do not make a part wait for an unrelated part merely because the latter belongs '
         'to an earlier conceptual phase. Put true prerequisites BEFORE dependent work. '
-        'The execution engine has two agents and completes/reviews/merges an entire '
+        'The execution engine has up to two concurrent workers and completes/reviews/merges an entire '
         'wave before starting the next, so minimize avoidable single-part waves. '
         'Prefer pairs over serial work when both tasks can run against existing '
         'interfaces or an agreed contract and independently pass tests. '
