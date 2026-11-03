@@ -283,7 +283,7 @@ class ReviewLoopTests(unittest.TestCase):
         with patch.object(ats, 'enabled_agents', return_value=['codex']):
             approved, reviewer, *_ = self.run_loop(
                 [('codex', lambda folder, prompt:
-                  findings_line() + '\\nVERDICT: APPROVE')],
+                  findings_line() + '\nVERDICT: APPROVE')],
                 conf={'solo_agent_mode': True, 'max_revisions': 0},
                 unavailable=unavailable)
         self.assertTrue(approved)
