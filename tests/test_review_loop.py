@@ -277,6 +277,20 @@ class ReviewLoopTests(unittest.TestCase):
         self.assertIn('review_skipped', self.kinds())
         self.assertIn('escalated', self.kinds())
 
+    def test_solo_mode_uses_fresh_read_only_same_provider_review(self):
+        unavailable = ats.UnavailableAgents()
+        ats.mark_unavailable(unavailable, 'claude', 'usage')
+        with patch.object(ats, 'enabled_agents', return_value=['codex']):
+            approved, reviewer, *_ = self.run_loop(
+                [('codex', lambda folder, prompt:
+                  findings_line() + '\\nVERDICT: APPROVE')],
+                conf={'solo_agent_mode': True, 'max_revisions': 0},
+                unavailable=unavailable)
+        self.assertTrue(approved)
+        self.assertEqual(reviewer, 'codex')
+        self.assertIn('review_same_provider', self.kinds())
+        self.assertTrue(any('REVIEW-ONLY MODE' in prompt for _, prompt in self.calls))
+
     def test_unavailable_reviewer_is_skipped(self):
         unavailable = ats.UnavailableAgents()
         ats.mark_unavailable(unavailable, 'claude', 'usage')
