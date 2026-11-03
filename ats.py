@@ -453,6 +453,8 @@ def read_json(path):
 
 
 EMIT_LOCK = threading.Lock()
+RUN_PROGRESS_LOCK = threading.Lock()
+_run_progress = {}   # task id -> number of persisted review_result events, including parallel parts
 
 
 def emit(item):
@@ -495,6 +497,10 @@ def record(kind, summary, task=None, **fields):
         raise ValueError('Invalid ATS persistent event envelope')
     (target / f'{now.replace(":", "-")}-{uid}.json').write_text(
         json.dumps(item, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    if kind == 'review_result':
+        with RUN_PROGRESS_LOCK:
+            if task in _run_progress:
+                _run_progress[task] += 1
     emit(item)
     return item
 
@@ -2751,6 +2757,34 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
 
 def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None,
               resume_from=None):
+    """Persist run_finished_v1 once, after all work, including base updates and publishing."""
+    task_id = preset_task_id() or str(uuid.uuid4())
+    started = time.monotonic()
+    outcome = 'error'
+    with RUN_PROGRESS_LOCK:
+        _run_progress[task_id] = 0
+    try:
+        outcome = _task_flow(task, agent, push, task_id, quiet=quiet, parallel=parallel,
+                             approved_risk=approved_risk, plan_file=plan_file, resume_from=resume_from)
+    except (KeyboardInterrupt, SystemExit):
+        outcome = 'interrupted'
+        raise
+    finally:
+        with RUN_PROGRESS_LOCK:
+            review_rounds = _run_progress.pop(task_id)
+        propagating = sys.exc_info()[0] is not None
+        try:
+            record('run_finished', 'Task run completed', task_id, approved=outcome == 'approved',
+                   duration_seconds=round(max(0, time.monotonic() - started), 1),
+                   review_rounds=review_rounds, outcome=outcome)
+        except Exception:
+            if not propagating:
+                raise
+            print('ATS: could not persist run_finished; original error preserved', file=sys.stderr)
+
+
+def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approved_risk=False,
+               plan_file=None, resume_from=None):
     conf=project()
     risk = intelligence.risk_profile(task)
     if risk['require_human_approval'] and not approved_risk:
@@ -2764,7 +2798,6 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
     if agent != 'auto' and agent not in enabled_agents():
         raise RuntimeError(f'{agent} is disabled. Use .ats agents --enable {agent}')
     agent=select(task) if agent=='auto' else agent
-    task_id=preset_task_id() or str(uuid.uuid4())
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
@@ -2802,10 +2835,10 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
     _run_flags[task_id] = {'task': task, 'high_risk': risk['level'] == 'high'}
     usage_meter.reset_context()
     usage_meter.set_context(task_id=task_id)
-    if not any(executable(name) for name in enabled_agents()):
-        raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
     worktree_created=False
     try:
+        if not any(executable(name) for name in enabled_agents()):
+            raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
         if resumed:
             record('resumed', 'Restored verified reviewed checkpoint', task_id,
                    source_run=resume_from, completed=resumed['completed'],
@@ -2893,7 +2926,6 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
         else:
             execute(['git','commit','-m','ATS: '+task[:65]],folder)
         print(f'Branch: {branch} | approved: {approved} | workspace: {folder}')
-        phase('finished', task_id, approved=approved, branch=branch, worktree=str(folder))
         if local_mode:
             patch = export_local_patch(folder)
             if patch:
@@ -2904,10 +2936,12 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             else:
                 print('No local patch generated.')
             print('Original project unchanged. GitHub PR unavailable without a project remote.')
-            return
+            phase('finished', task_id, approved=approved, branch=branch, worktree=str(folder))
+            return 'approved' if approved else 'escalated'
         if not approved:
             print('Independent review/checks incomplete: PR publishing blocked; worktree preserved')
-            return
+            phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
+            return 'escalated'
         parts = {}
         for c in history:   # the approving (last) cycle of every part
             if 'subtask' in c:
@@ -2924,22 +2958,28 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
                            f"{conf.get('base_branch', 'main')} without a human decision; worktree preserved")
                 record('escalated', message, task_id, branch=branch, blocking_reasons=[message])
                 print('ATS: ' + message, file=sys.stderr)
-                return
+                phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
+                return 'escalated'
             phase('pr', task_id, branch=branch)
             execute(['git','push','-u','origin',branch],folder)
             if not shutil.which('gh'):
-                print('gh missing: branch pushed but draft PR must be created manually');return
+                print('gh missing: branch pushed but draft PR must be created manually')
+                phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
+                return 'approved'
             base=conf.get('base_branch','main')
             outcome=execute(['gh','pr','create','--draft','--base',base,'--head',branch,'--title','ATS: '+task[:65],
                              '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n{attribution}\nReview/check outcomes in ATS data. Human merge required.'],folder)
             print(outcome.stdout)
             phase('pr_created', task_id, url=outcome.stdout.strip()[-300:])
+        phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
+        return 'approved'
     except AgentUsageExhausted as exc:
         message = str(exc) if isinstance(exc, BothAgentsExhausted) else 'Usage voor beide agents is op'
         print(message, file=sys.stderr)
         record('blocked', message, task_id, branch=branch, resets=exc.resets)
         if worktree_created:
             print('Worktree retained: '+str(folder),file=sys.stderr)
+        return 'blocked'
     except Exception as e:
         record('error',str(e)[:2000],task_id,implementer=agent,branch=branch)
         if worktree_created:

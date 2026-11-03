@@ -8,6 +8,7 @@
   ],
   "event_types": [
     "assigned",
+    "run_finished",
     "phase",
     "implementation",
     "review_result",
@@ -38,6 +39,23 @@
     "review_same_provider",
     "wave_timing"
   ],
+  "run_finished_v1": {
+    "description": "One persisted run_finished event per task_flow invocation, after all work including base update and publishing. Live phase finished is not a completion record. Preflight failures may have no assigned event. A hard process termination cannot guarantee completion storage.",
+    "required": {
+      "approved": "boolean; true exactly when outcome is approved",
+      "duration_seconds": "non-negative number; monotonic wall time for the entire task_flow invocation, rounded to tenths of a second; parallel time is not summed",
+      "review_rounds": "non-negative integer; count of successfully persisted review_result events in this invocation, including parallel parts, integration and base-update reviews; security passes combined into one review_result count once",
+      "outcome": "approved, escalated, blocked, error or interrupted"
+    },
+    "outcomes": [
+      "approved",
+      "escalated",
+      "blocked",
+      "error",
+      "interrupted"
+    ],
+    "performance": "Only assigned plus run_finished events in the same project/task supply a sample. Revisions are max(0, review_rounds - 1); duration_seconds is the run total. Incomplete historical runs remain unsampled."
+  },
   "phase_stages": [
     "implementation",
     "gate",
