@@ -2439,6 +2439,8 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
         if number < completed:
             raise RuntimeError('Checkpoint splits a parallel wave; refusing unsafe resume')
         other = alternate_agent(implementer, unavailable)
+        if other is None and conf.get('solo_agent_mode', False) and implementer not in unavailable:
+            other = implementer
         if implementer in unavailable or other is None:
             record('escalated', 'Both agents are required for subtask handoffs', task_id,
                    subtask=number + 1, branch=branch)
