@@ -2108,8 +2108,8 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
     """
     if not should_preplan(task, mode):
         return None
-    if len(enabled_agents()) < 2:
-        raise RuntimeError('Automatic parallel planning requires two enabled agents.')
+    if len(enabled_agents()) < 2 and not conf.get('solo_agent_mode', False):
+        raise RuntimeError('Automatic parallel planning requires two enabled agents, or solo mode.')
     print('ATS: planning bounded work before implementation...', flush=True)
     phase('planning', task_id, agent=agent)
     baseline = index_tree(folder)
