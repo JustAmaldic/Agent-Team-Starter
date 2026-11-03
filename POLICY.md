@@ -94,6 +94,8 @@ These rules save tokens without weakening the review:
 - **Review depth.** Small changes to docs, tests or text get a light review with a checklist; high-risk changes always get the normal review plus a focused security and data-safety pass, which must approve as well **(enforced)**. `review_level_min` raises the minimum.
 - **Delta re-review.** From the second round on the reviewer gets the changes since its previous review and the open findings, and may read the complete change itself. A full re-review happens for large revisions, dependency changes, security-sensitive changes and refactors.
 - **Context and prompt order.** Every prompt starts with the same fixed part (policy, style brief, vetted learnings, repository map) so providers can reuse their prompt cache; part-specific context comes after it. The context package is orientation, not a substitute for reading the code.
+- **Few, larger parts.** Every part costs an agent start, exploration, tests and a review. The planner merges steps that belong together and splits only at real boundaries (separate owned files that can run in parallel, a true dependency, the review size limit); a plan longer than `max_plan_parts` (default 5) is asked once to merge. Every part is still reviewed on its own.
+- **One Codex preflight per worktree.** The Codex policy and sandbox check runs once per worktree in a run, and again after a sandbox block.
 - **Owned paths.** A DAG part lists the files it owns. Changes outside them are reported to the reviewer (`ownership_drift`).
 
 ## Data and storage
