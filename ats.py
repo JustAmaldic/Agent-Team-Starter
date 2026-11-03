@@ -27,6 +27,7 @@ from ats_modules import context_pack
 from ats_modules import gate as pre_gate
 from ats_modules import knowledge_select
 from ats_modules import review_scope
+from ats_modules import review_handoff
 from ats_modules import usage as usage_meter
 
 from ats_contract import accepted_event, valid_phase
@@ -1772,7 +1773,7 @@ def outside_owned(paths, owned):
 
 
 def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
-                base='HEAD', subtask=None, owned_paths=None):
+                base='HEAD', subtask=None, owned_paths=None, earlier_review_notes=''):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
 
     Per round: pre-review gate (cheap deterministic checks, repaired by the implementer), the
@@ -1904,7 +1905,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                 drift_reported = True
         phase('review', task_id, **context, cycle=cycle, reviewer=preferred, implementer=implementer)
         prompt = review_prompt(task, checks, diff, history, prefix=prefix, gate=gate_results, level=level,
-                               delta=delta, full_stats=full_stats, base=base, notes=notes)
+                               delta=delta, full_stats=full_stats, base=base, notes=(earlier_review_notes + '\n' + notes).strip())
         try:
             reviewer, review = invoke_with_fallback(preferred, prompt, folder, unavailable, task_id, 'review',
                                                     quiet=quiet, fallback=False)
@@ -2162,6 +2163,13 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'or depend on uncommitted code; if uncertain use consecutive strings. '
         'Plan one final integration and cross-feature test pass only when parts must be wired '
         'together in code that none of them owns; otherwise the last component part integrates. '
+        'Avoid false dependencies from shared orchestration files. When a new standalone module '
+        'can be built against an existing interface, give that module and its tests to an '
+        'independent node and reserve minimal wiring in shared files (such as ats.py) '
+        'for a final integration node. The standalone module can run in parallel with '
+        'another independent implementation. Do not reserve a shared entrypoint in both '
+        'owned_paths unless both edits are unavoidable. Do not invent parallel tasks '
+        'merely to increase concurrency; contract consumers must wait until reviewed. '
         'Never have two agents modify the same file concurrently. '
         'Every part needs a testable acceptance criterion; include file boundaries '
         'where they are known. Do not include credentials, raw email data, '
@@ -2244,7 +2252,7 @@ def commit_all(folder, message):
 
 
 def run_part(task, plan, number, total, part, task_id, folder, branch, implementer, unavailable, conf,
-             base, quiet=False, alongside=None, resume_work=False):
+             base, quiet=False, alongside=None, resume_work=False, prior_cycles=()):
     """Implement one part and put it through the review loop. Returns (approved, reviewer, author, cycles)."""
     description = f'{task}\nSubtask {number}/{total}: {part}'
     # The reviewer sees only this part's diff; with the plan it does not flag work that belongs
@@ -2255,6 +2263,13 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
                 'copy; do not implement it and avoid changing the same code. ' if alongside else '')
     node = dag_node(plan, part)
     owned = list(node['owned_paths']) if node else []
+    carried = review_handoff.relevant_findings(prior_cycles, part, owned)
+    previous_note = review_handoff.handoff_note(carried)
+    if carried:
+        record('review_handoff', 'Relevant earlier review findings passed to next part',
+               task_id, subtask=number, count=len(carried),
+               from_subtasks=sorted({v['from_part'] for v in carried if isinstance(v.get('from_part'), int)}))
+
     ownership = ('Files this part owns: ' + ', '.join(owned) + '. Change other files only when unavoidable, '
                  'and say which and why. ' if owned else '')
     contract_notes = ''
@@ -2280,7 +2295,7 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
               'items, or ATS_LEARNINGS_JSON: [] when there are none.\n\n'
               f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
               f'Implement ONLY this part: {description}\n' + together + ownership
-              + contract_notes + part_context(folder, conf, part, owned))
+              + contract_notes + previous_note + part_context(folder, conf, part, owned))
     existing_changes = False
     if resume_work:
         base_tree = execute(['git', 'rev-parse', str(base) + '^{tree}'], folder).stdout.strip()
@@ -2302,7 +2317,8 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
     try:
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
-            quiet=quiet, base=base, subtask=number, owned_paths=owned)
+            quiet=quiet, base=base, subtask=number, owned_paths=owned,
+            earlier_review_notes=previous_note)
     except RuntimeError as exc:   # e.g. the part produced no changes
         record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
                blocking_reasons=[f'subtask {number}: {exc}'])
@@ -2419,6 +2435,7 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
                 task, plan, number, total, wave[0], task_id, folder, branch, implementer, unavailable, conf,
                 base=(execute(['git', 'rev-parse', 'HEAD^{tree}'], folder).stdout.strip()
                       if resumed else index_tree(folder)), quiet=quiet,
+                prior_cycles=history,
                 **({'resume_work': True} if resumed else {}))
             history.extend(cycles)
             if not approved:
@@ -2494,11 +2511,11 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
         if not reuse_a:
             threads.append(threading.Thread(
                 target=build, args=('a', task, plan, first, total, wave[0], task_id, folder, branch,
-                                    implementer, unavailable, conf, wave_base, quiet, (second, wave[1]))))
+                                    implementer, unavailable, conf, wave_base, quiet, (second, wave[1]), False, tuple(history))))
         if not reuse_b:
             threads.append(threading.Thread(
                 target=build, args=('b', task, plan, second, total, wave[1], task_id, side, branch,
-                                    other, unavailable, conf, wave_base, quiet, (first, wave[0]))))
+                                    other, unavailable, conf, wave_base, quiet, (first, wave[0]), False, tuple(history))))
         for thread in threads:
             thread.start()
         for thread in threads:
