@@ -2443,6 +2443,7 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
         other = alternate_agent(implementer, unavailable)
         if other is None and conf.get('solo_agent_mode', False) and implementer not in unavailable:
             other = implementer
+            record('solo_agent', 'Solo worker active', task_id, agent=implementer, subtask=number + 1, parallel=len(wave) == 2)
         if implementer in unavailable or other is None:
             record('escalated', 'Both agents are required for subtask handoffs', task_id,
                    subtask=number + 1, branch=branch)
