@@ -83,7 +83,8 @@ class PreflightPlanningTests(unittest.TestCase):
                      '{"id":"second","title":"Integrate reporting into the CLI",'
                      '"depends_on":["first"],"owned_paths":["ats.py"]}]}')
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(ats, 'enabled_agents', return_value=['codex', 'claude']), \
+            with patch.object(ats, 'should_preplan', return_value=True), \
+                 patch.object(ats, 'enabled_agents', return_value=['codex', 'claude']), \
                  patch.object(ats, 'phase'), patch.object(ats, 'index_tree', return_value='tree0'), \
                  patch.object(ats, 'restore_if_changed', return_value=[]), \
                  patch.object(ats, 'record') as record, \
