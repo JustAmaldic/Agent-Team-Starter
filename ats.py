@@ -2438,6 +2438,8 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
             continue
         if number < completed:
             raise RuntimeError('Checkpoint splits a parallel wave; refusing unsafe resume')
+        if conf.get('solo_agent_mode', False) and implementer in unavailable:
+            implementer = alternate_agent(implementer, unavailable) or implementer
         other = alternate_agent(implementer, unavailable)
         if other is None and conf.get('solo_agent_mode', False) and implementer not in unavailable:
             other = implementer
