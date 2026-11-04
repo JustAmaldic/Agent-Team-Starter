@@ -193,7 +193,9 @@ def absolute(command, env: Path | None):
     argv = _argv(command)
     if not argv or not python_of(command) or Path(argv[0]).is_absolute():
         return command
-    return ' '.join(shlex.quote(part) for part in [str(python_in(env)), *argv[1:]])
+    parts = [str(python_in(env)), *argv[1:]]
+    # Windows runs test strings through cmd: quote the Windows way, not the POSIX way.
+    return subprocess.list2cmdline(parts) if os.name == 'nt' else ' '.join(shlex.quote(p) for p in parts)
 
 
 def agent_instructions(conf: dict, env: Path | None) -> str:
