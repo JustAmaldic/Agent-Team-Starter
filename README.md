@@ -210,5 +210,5 @@ Project settings in `.ats-project.json` (all optional):
 | `context_package` | `true` | repository map and part context in prompts |
 | `knowledge_budget` | `4000` | characters of vetted learnings per task |
 
-`ATS_SESSION_REUSE=0` turns session reuse off; `ATS_SESSION_MAX_TURNS` (4) and `ATS_SESSION_MAX_CONTEXT` (250000 tokens) bound it.
+`ATS_SESSION_REUSE=0` turns session reuse off; `ATS_SESSION_MAX_TURNS` (4) and `ATS_SESSION_MAX_CONTEXT` (400000 new tokens; cache reads do not count) bound it.
 

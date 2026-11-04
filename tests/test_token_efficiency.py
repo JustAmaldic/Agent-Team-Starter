@@ -243,7 +243,9 @@ class SessionReuseTests(unittest.TestCase):
         sessions.remember('k', 'S', 'tree', {'input_tokens': 10})
         self.assertEqual(sessions.usable('k', 'tree'), ('S', None))
         self.assertIsNone(sessions.usable('k', 'other')[0])
-        sessions.remember('k', 'S', 'tree', {'cache_read_tokens': 300000})
+        sessions.remember('k', 'S', 'tree', {'cache_read_tokens': 3000000})   # cache reads do not count
+        self.assertEqual(sessions.usable('k', 'tree'), ('S', None))
+        sessions.remember('k', 'S', 'tree', {'input_tokens': 300000, 'output_tokens': 150000})
         self.assertIn('context', sessions.usable('k', 'tree')[1])
         for _ in range(4):
             sessions.remember('j', 'T', 'tree', {})
