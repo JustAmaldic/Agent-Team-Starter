@@ -206,6 +206,8 @@ Project settings in `.ats-project.json` (all optional):
 | --- | --- | --- |
 | `max_plan_parts` | `5` | preferred maximum of parts in a plan; a longer plan is asked once to merge related steps |
 | `integration_review` | `true` | one review of the combined change after parallel or more than two parts |
+| `integration_fixup` | `true` | before the integration review, one agent call fixes findings still open from the part reviews and updates the release notes |
+| `release_files` | detected | version and changelog files; only the first part of a plan edits them |
 | `python_env` | `.venv` or `venv` when present | the project's virtualenv for test commands and agents (relative to the project folder, or absolute) |
 | `environment_check` | `true` | before any agent starts, check that the requirement files are installed in the Python the test commands use |
 | `pre_review_gate` | `true` | cheap checks before the review (see POLICY.md) |
