@@ -17,6 +17,8 @@ import shlex
 import shutil
 from pathlib import Path, PurePosixPath
 
+from . import test_env
+
 PASSED, FAILED, SKIPPED, UNAVAILABLE = 'passed', 'failed', 'skipped', 'unavailable'
 FAST, TARGETED = 'fast', 'targeted'
 CONFLICT = re.compile(r'^(<{7}|>{7})( |$)', re.MULTILINE)
@@ -128,6 +130,11 @@ def _run(name, level, command, folder, run, timeout, no_tests_ok=False):
         return result(name, level, UNAVAILABLE, output)
     if outcome.returncode == 124 and 'timed out' in output:
         return result(name, level, UNAVAILABLE, output)
+    module = test_env.missing_module(output, folder) if outcome.returncode else None
+    if module:   # the test environment lacks a package: no code change can fix that
+        found = result(name, level, UNAVAILABLE, output)
+        found['environment'] = module
+        return found
     if no_tests_ok and outcome.returncode == 5:   # pytest: no tests collected
         return result(name, level, SKIPPED, 'no tests collected')
     return result(name, level, PASSED if outcome.returncode == 0 else FAILED, output)
@@ -255,6 +262,11 @@ def targeted_tests(folder: Path, paths, conf, tracked, run, timeout):
         return result('targeted tests', TARGETED, SKIPPED,
                       'no pytest or unittest test command, or targeted_test_command, configured')
     outcomes = [_run('targeted tests', TARGETED, c, folder, run, timeout, no_tests_ok=True) for c in commands]
+    environment = [o for o in outcomes if o.get('environment')]
+    if environment:   # a missing package explains the other failures too
+        found = result('targeted tests', TARGETED, UNAVAILABLE, '\n'.join(o['detail'] for o in environment))
+        found['environment'] = environment[0]['environment']
+        return found
     for status in (FAILED, UNAVAILABLE):
         bad = [o for o in outcomes if o['status'] == status]
         if bad:

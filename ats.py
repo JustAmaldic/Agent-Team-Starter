@@ -30,6 +30,7 @@ from ats_modules import plan_learning
 from ats_modules import review_scope
 from ats_modules import review_handoff
 from ats_modules import run_report
+from ats_modules import test_env
 from ats_modules import usage as usage_meter
 
 from ats_contract import accepted_event, valid_phase
@@ -985,7 +986,33 @@ def isolated_env(cwd=None):
     os.makedirs(state, exist_ok=True)
     env = {key: value for key, value in os.environ.items() if not key.startswith('ATS_')}
     env.update(ATS_DATA_REPO='none', ATS_STATE_DIR=str(state))
-    return env
+    return test_env.environ(env, _test_env)
+
+
+_test_env = None   # the project's virtualenv for test commands and agent CLIs (configure_test_env)
+
+
+def configure_test_env(conf):
+    """Use the project's virtualenv (python_env, .venv or venv) for every test command of this run."""
+    global _test_env
+    resolved = test_env.resolve(conf, APP)
+    _test_env = resolved['env']
+    return resolved
+
+
+def environment_problem(conf, task_id):
+    """Before any agent starts: can the test commands run with the project's requirements?
+    Returns a blocking reason, or None."""
+    if not conf.get('environment_check', True):
+        return None
+    base = {key: value for key, value in os.environ.items() if not key.startswith('ATS_')}
+    report = test_env.check(conf, APP, base)
+    if report['python'] is None and report['ok']:
+        return None   # nothing to check: no Python test command or no requirement files
+    record('test_environment', report['message'] or 'Test environment ready', task_id,
+           ok=report['ok'], python=report['python'], env=report['env'], source=report['source'],
+           missing=report['missing'])
+    return None if report['ok'] else report['message']
 
 
 def run_check(command, cwd, timeout=900):
@@ -1521,8 +1548,9 @@ def run_checks(conf, folder):
         outcome = run_check(cmd, folder, timeout=int(conf.get('test_timeout', 900)))
         output = (outcome.stdout or '') + (outcome.stderr or '')
         check = {'command': cmd, 'passed': outcome.returncode == 0, 'output': output[-1000:]}
-        if outcome.returncode and cannot_start(outcome.returncode, output):
+        if outcome.returncode and cannot_start(outcome.returncode, output, folder):
             check['cannot_start'] = True
+            check['missing_module'] = test_env.missing_module(output, folder)
         checks.append(check)
     return checks
 
@@ -1532,11 +1560,14 @@ CANNOT_START = re.compile(r"cannot run test command|command not found|No such fi
                           re.IGNORECASE)
 
 
-def cannot_start(returncode, output):
+def cannot_start(returncode, output, folder=None):
     """The test command itself could not start (missing program or module): a configuration
-    problem on this computer, not something the implementer should "repair" in the code."""
-    return returncode in (127, 9009) or (returncode in (1, 2) and bool(CANNOT_START.search(output[:2000]))
-                                         and len(output.strip().splitlines()) <= 6)
+    problem on this computer, not something the implementer should "repair" in the code.
+    A third-party module the test environment lacks counts too, however long the traceback."""
+    return (returncode in (127, 9009)
+            or (returncode in (1, 2) and bool(CANNOT_START.search(output[:2000]))
+                and len(output.strip().splitlines()) <= 6)
+            or (folder is not None and test_env.missing_module(output, folder) is not None))
 
 
 STYLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', 'STYLEGUIDE.md', 'STYLE.md', 'DESIGN.md',
@@ -1815,6 +1846,12 @@ def pre_review_gate(task, task_id, folder, base, implementer, unavailable, conf,
         failed = pre_gate.failed(results)
         record('pre_review_gate', pre_gate.summary(results), task_id, **context, implementer=implementer,
                results=results, passed=not failed)
+        environment = [r for r in results if r.get('environment')]
+        if environment:
+            return results, implementer, ('test environment incomplete: ' + environment[0]['environment']
+                                          + ' is not installed in the Python that runs the tests. Install the '
+                                          'project requirements in .venv (or set python_env in .ats-project.json); '
+                                          'agents never install packages')
         if not failed:
             return results, implementer, None
         problems = [{'check': r['name'], 'output': r['detail'][-1200:]} for r in failed]
@@ -1838,7 +1875,9 @@ def pre_review_gate(task, task_id, folder, base, implementer, unavailable, conf,
         record('gate_repair', response[-1200:], task_id, **context, implementer=implementer,
                failed_checks=[p['check'] for p in problems])
         if stuck.no_progress(before, worktree_tree(folder)):
-            return results, implementer, 'stuck: the repair of the pre-review checks changed no files'
+            said = ' '.join(response.strip().split())[-300:]
+            return results, implementer, ('stuck: the repair of the pre-review checks changed no files. Still failing: '
+                                          + detail[:500] + (f'. {implementer} said: {said}' if said else ''))
 
 
 def outside_owned(paths, owned):
@@ -1906,8 +1945,14 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             # Never let an agent "fix" this by changing the computer (e.g. installing a python shim).
             names = ', '.join(' '.join(c['command']) if isinstance(c['command'], list) else str(c['command'])
                               for c in broken)
-            reasons = [f'test command cannot start on this computer: {names}. Fix test_commands in '
-                       f'.ats-project.json (for example python3 instead of python): {broken[0]["output"][-200:]}']
+            module = next((c['missing_module'] for c in broken if c.get('missing_module')), None)
+            if module:
+                reasons = [f'test environment incomplete: {module} is not installed in the Python that runs '
+                           f'{names}. Install the project requirements in .venv (or set python_env in '
+                           f'.ats-project.json); agents never install packages: {broken[0]["output"][-200:]}']
+            else:
+                reasons = [f'test command cannot start on this computer: {names}. Fix test_commands in '
+                           f'.ats-project.json (for example python3 instead of python): {broken[0]["output"][-200:]}']
             record('blocked', reasons[0], task_id, **context, implementer=implementer)
             break
         if (failed and cycle < max_revisions and conf.get('targeted_test_fix', True)
@@ -2970,8 +3015,37 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
     return approved, cycles
 
 
+def recheck_source(source_id, agent):
+    """The kept worktree of an earlier run that was not approved, to test and review it again.
+
+    Returns (folder, branch, implementer). The implementer is the agent that built it, so the
+    other agent reviews; nothing is rebuilt.
+    """
+    try:
+        source_id = str(uuid.UUID(source_id))
+    except ValueError as exc:
+        raise RuntimeError('Invalid recheck source ID') from exc
+    folder = (APP.parent / f'{APP.name}-ats-{source_id[:8]}').resolve()
+    if not folder.is_dir():
+        raise RuntimeError('The kept worktree of that run no longer exists')
+    if execute(['git', 'rev-parse', '--show-toplevel'], folder, check=False).stdout.strip() != str(folder):
+        raise RuntimeError('The kept folder is not a Git worktree')
+    roots = execute(['git', 'worktree', 'list', '--porcelain'], APP).stdout.splitlines()
+    if 'worktree ' + str(folder) not in roots:
+        raise RuntimeError('The kept worktree is not attached to this project')
+    branch = execute(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], folder, check=False).stdout.strip()
+    if not branch.startswith('ats/'):
+        raise RuntimeError('The kept branch is not managed by ATS')
+    built = [e.get('implementer') for e in intelligence.read_events(DATA / cleanname(project().get('project', APP.name)) / 'events')
+             if e.get('task_id') == source_id and e.get('event_type') == 'implementation' and e.get('implementer')]
+    implementer = built[-1] if built else agent
+    if implementer == 'auto' or implementer not in enabled_agents():
+        raise RuntimeError('Cannot tell which agent built the kept work; start the recheck with --agent')
+    return folder, branch, implementer
+
+
 def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None,
-              resume_from=None):
+              resume_from=None, recheck_from=None):
     """Persist run_finished_v1 once, after all work, including base updates and publishing."""
     task_id = preset_task_id() or str(uuid.uuid4())
     started = time.monotonic()
@@ -2980,7 +3054,8 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
         _run_progress[task_id] = 0
     try:
         outcome = _task_flow(task, agent, push, task_id, quiet=quiet, parallel=parallel,
-                             approved_risk=approved_risk, plan_file=plan_file, resume_from=resume_from)
+                             approved_risk=approved_risk, plan_file=plan_file, resume_from=resume_from,
+                             recheck_from=recheck_from)
     except (KeyboardInterrupt, SystemExit):
         outcome = 'interrupted'
         raise
@@ -3010,7 +3085,7 @@ def save_run_report(task_id):
 
 
 def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approved_risk=False,
-               plan_file=None, resume_from=None):
+               plan_file=None, resume_from=None, recheck_from=None):
     conf=project()
     risk = intelligence.risk_profile(task)
     if risk['require_human_approval'] and not approved_risk:
@@ -3028,6 +3103,12 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
     resumed = None
+    rechecked = None
+    if recheck_from:
+        if local_mode or resume_from or plan_file:
+            raise RuntimeError('Recheck needs a Git project and cannot be combined with a resume or plan file')
+        folder, branch, rechecked = recheck_source(recheck_from, agent)
+        agent = rechecked
     if resume_from:
         if local_mode or not plan_file:
             raise RuntimeError('Checkpoint resume needs a Git project and original plan file')
@@ -3058,6 +3139,16 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
             raise RuntimeError('Source checkpoint is stale or invalid. Existing code was not modified')
     record('assigned',task,task_id,implementer=agent,branch=branch,task_categories=intelligence.categories(task))
     record('risk_profile', 'Risk-based execution profile', task_id, **risk)
+    resolved_env = configure_test_env(conf)
+    if resolved_env['env'] is not None:
+        print(f"ATS: tests use the virtualenv {resolved_env['env']}.", flush=True)
+    problem = environment_problem(conf, task_id)
+    if problem:
+        # Before any agent starts: no implementation is spent on work that cannot be tested here.
+        record('blocked', problem, task_id, branch=branch, blocking_reasons=[problem])
+        print('ATS: ' + problem, file=sys.stderr)
+        phase('finished', task_id, approved=False, branch=branch)
+        return 'blocked'
     _run_flags[task_id] = {'task': task, 'high_risk': risk['level'] == 'high'}
     usage_meter.reset_context()
     usage_meter.set_context(task_id=task_id)
@@ -3065,7 +3156,11 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
     try:
         if not any(executable(name) for name in enabled_agents()):
             raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
-        if resumed:
+        if rechecked:
+            record('rechecked', 'Testing and reviewing the kept worktree again, without rebuilding', task_id,
+                   source_run=recheck_from, branch=branch, implementer=agent, worktree=str(folder))
+            print(f'ATS: testing and reviewing the kept work on {branch} again.', flush=True)
+        elif resumed:
             record('resumed', 'Restored verified reviewed checkpoint', task_id,
                    source_run=resume_from, completed=resumed['completed'],
                    completed_nodes=resumed.get('completed_nodes', []), branch=branch)
@@ -3079,6 +3174,12 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
             print(f'ATS: task branch starts from {start}.', flush=True)
         worktree_created=True
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+        if rechecked:
+            approved, reviewer, implementer, history = review_loop(
+                task, task_id, folder, branch, agent, unavailable, conf, quiet=quiet,
+                base=integration_base(folder, conf))
+            return finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer, approved,
+                               history, unavailable, quiet, local_mode)
         if plan_file:
             preflight_plan = provided_task_plan(plan_file, task)
             record('task_split', 'Human-approved editable plan', task_id, subtasks=preflight_plan,
@@ -3137,68 +3238,8 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
         else:
             approved,reviewer,implementer,history=review_loop(task,task_id,folder,branch,implementer,unavailable,conf,quiet=quiet,
                                                                base=base_commit)
-        learning_agent = reviewer or alternate_agent(implementer) or implementer
-        distill_learnings(task, task_id, folder, history,
-                          learning_agent, unavailable, quiet=quiet)
-        # Never commit edits that have not passed independent review.
-        if approved:
-            execute(['git','add','-A'],folder)
-        staged = approved and execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
-        if not staged:
-            pass   # the agent already committed everything itself; nothing left to commit
-        elif local_mode:
-            execute(['git', '-c', 'user.name=ATS', '-c', 'user.email=ats@localhost',
-                     'commit', '-m', 'ATS: '+task[:65]], folder)
-        else:
-            execute(['git','commit','-m','ATS: '+task[:65]],folder)
-        print(f'Branch: {branch} | approved: {approved} | workspace: {folder}')
-        if local_mode:
-            patch = export_local_patch(folder)
-            if patch:
-                phase('patch', task_id, patch=str(patch))
-                print(f'Local patch: {patch}')
-                print('Review and apply from your application directory: git apply --check "' + str(patch) + '"')
-                print('Then: git apply "' + str(patch) + '"')
-            else:
-                print('No local patch generated.')
-            print('Original project unchanged. GitHub PR unavailable without a project remote.')
-            phase('finished', task_id, approved=approved, branch=branch, worktree=str(folder))
-            return 'approved' if approved else 'escalated'
-        if not approved:
-            print('Independent review/checks incomplete: PR publishing blocked; worktree preserved')
-            phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
-            return 'escalated'
-        parts = {}
-        for c in history:   # the approving (last) cycle of every part
-            if 'subtask' in c:
-                parts[c['subtask']] = f"Part {c['subtask']}: implementer {c['implementer']}, reviewer {c['reviewer']}"
-        attribution = ('\n'.join(parts[n] for n in sorted(parts))
-                       + '\nEvery part was reviewed on its own diff; the combined change was not reviewed as a whole.'
-                       if parts else '')
-        if push:
-            updated, update_cycles = update_from_base(task, task_id, folder, branch, conf, implementer,
-                                                      unavailable, quiet=quiet)
-            history.extend(update_cycles)
-            if not updated:
-                message = (f"Not published: the branch could not be updated with the latest "
-                           f"{conf.get('base_branch', 'main')} without a human decision; worktree preserved")
-                record('escalated', message, task_id, branch=branch, blocking_reasons=[message])
-                print('ATS: ' + message, file=sys.stderr)
-                phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
-                return 'escalated'
-            phase('pr', task_id, branch=branch)
-            execute(['git','push','-u','origin',branch],folder)
-            if not shutil.which('gh'):
-                print('gh missing: branch pushed but draft PR must be created manually')
-                phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
-                return 'approved'
-            base=conf.get('base_branch','main')
-            outcome=execute(['gh','pr','create','--draft','--base',base,'--head',branch,'--title','ATS: '+task[:65],
-                             '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n{attribution}\nReview/check outcomes in ATS data. Human merge required.'],folder)
-            print(outcome.stdout)
-            phase('pr_created', task_id, url=outcome.stdout.strip()[-300:])
-        phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
-        return 'approved'
+        return finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer, approved,
+                           history, unavailable, quiet, local_mode)
     except AgentUsageExhausted as exc:
         message = str(exc) if isinstance(exc, BothAgentsExhausted) else 'Usage voor beide agents is op'
         print(message, file=sys.stderr)
@@ -3211,6 +3252,73 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
         if worktree_created:
             print('Worktree retained: '+str(folder),file=sys.stderr)
         raise
+
+def finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer, approved, history,
+                unavailable, quiet, local_mode):
+    """After the review: learnings, the commit, and (when approved) the base update and draft PR."""
+    learning_agent = reviewer or alternate_agent(implementer) or implementer
+    distill_learnings(task, task_id, folder, history,
+                      learning_agent, unavailable, quiet=quiet)
+    # Never commit edits that have not passed independent review.
+    if approved:
+        execute(['git','add','-A'],folder)
+    staged = approved and execute(['git', 'diff', '--cached', '--quiet'], folder, check=False).returncode != 0
+    if not staged:
+        pass   # the agent already committed everything itself; nothing left to commit
+    elif local_mode:
+        execute(['git', '-c', 'user.name=ATS', '-c', 'user.email=ats@localhost',
+                 'commit', '-m', 'ATS: '+task[:65]], folder)
+    else:
+        execute(['git','commit','-m','ATS: '+task[:65]],folder)
+    print(f'Branch: {branch} | approved: {approved} | workspace: {folder}')
+    if local_mode:
+        patch = export_local_patch(folder)
+        if patch:
+            phase('patch', task_id, patch=str(patch))
+            print(f'Local patch: {patch}')
+            print('Review and apply from your application directory: git apply --check "' + str(patch) + '"')
+            print('Then: git apply "' + str(patch) + '"')
+        else:
+            print('No local patch generated.')
+        print('Original project unchanged. GitHub PR unavailable without a project remote.')
+        phase('finished', task_id, approved=approved, branch=branch, worktree=str(folder))
+        return 'approved' if approved else 'escalated'
+    if not approved:
+        print('Independent review/checks incomplete: PR publishing blocked; worktree preserved')
+        phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
+        return 'escalated'
+    parts = {}
+    for c in history:   # the approving (last) cycle of every part
+        if 'subtask' in c:
+            parts[c['subtask']] = f"Part {c['subtask']}: implementer {c['implementer']}, reviewer {c['reviewer']}"
+    attribution = ('\n'.join(parts[n] for n in sorted(parts))
+                   + '\nEvery part was reviewed on its own diff; the combined change was not reviewed as a whole.'
+                   if parts else '')
+    if push:
+        updated, update_cycles = update_from_base(task, task_id, folder, branch, conf, implementer,
+                                                  unavailable, quiet=quiet)
+        history.extend(update_cycles)
+        if not updated:
+            message = (f"Not published: the branch could not be updated with the latest "
+                       f"{conf.get('base_branch', 'main')} without a human decision; worktree preserved")
+            record('escalated', message, task_id, branch=branch, blocking_reasons=[message])
+            print('ATS: ' + message, file=sys.stderr)
+            phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
+            return 'escalated'
+        phase('pr', task_id, branch=branch)
+        execute(['git','push','-u','origin',branch],folder)
+        if not shutil.which('gh'):
+            print('gh missing: branch pushed but draft PR must be created manually')
+            phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
+            return 'approved'
+        base=conf.get('base_branch','main')
+        outcome=execute(['gh','pr','create','--draft','--base',base,'--head',branch,'--title','ATS: '+task[:65],
+                         '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n{attribution}\nReview/check outcomes in ATS data. Human merge required.'],folder)
+        print(outcome.stdout)
+        phase('pr_created', task_id, url=outcome.stdout.strip()[-300:])
+    phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
+    return 'approved'
+
 
 def child_run(argv):
     if not argv: raise RuntimeError('Usage: ats run -- command [args]')
@@ -3239,9 +3347,10 @@ def positive_days(value):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file');p.add_argument('--resume-from')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file');p.add_argument('--resume-from');p.add_argument('--recheck-from',help='Test and review the kept worktree of an earlier run again, without rebuilding')
     p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
+    sub.add_parser('env-check', help='Check that the test commands find the project requirements (JSON)')
     sub.add_parser('performance')
     p=sub.add_parser('report', help='Summarize the run reports of the last days');p.add_argument('--days',type=positive_days,default=7)
     p=sub.add_parser('feedback');p.add_argument('comments_json');p.add_argument('--existing-ids')
@@ -3278,6 +3387,10 @@ def main():
                              indent=2))
         elif args.command=='risk':
             print(json.dumps(intelligence.risk_profile(' '.join(args.description)),indent=2))
+        elif args.command=='env-check':
+            conf = project()
+            base = {key: value for key, value in os.environ.items() if not key.startswith('ATS_')}
+            print(json.dumps(test_env.check(conf, APP, base), ensure_ascii=False))
         elif args.command=='performance':
             directory = DATA / cleanname(project().get('project', APP.name)) / 'events'
             print(json.dumps(intelligence.performance(intelligence.read_events(directory)),indent=2))
@@ -3292,7 +3405,7 @@ def main():
             items = json.loads(Path(args.items_json).read_text(encoding='utf-8'))
             relations = json.loads(Path(args.relations_json).read_text(encoding='utf-8'))
             print(json.dumps(intelligence.relation_issues(items, relations),indent=2))
-        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file,args.resume_from)
+        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file,args.resume_from,args.recheck_from)
         elif args.command=='plan':preview_task_plan(' '.join(args.description), args.agent)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()

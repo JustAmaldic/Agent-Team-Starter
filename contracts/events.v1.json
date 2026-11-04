@@ -41,7 +41,9 @@
     "planning_retry",
     "review_handoff",
     "ownership_blocked",
-    "integration_review"
+    "integration_review",
+    "test_environment",
+    "rechecked"
   ],
   "run_finished_v1": {
     "description": "One persisted run_finished event per task_flow invocation, after all work including base update and publishing. Live phase finished is not a completion record. Preflight failures may have no assigned event. A hard process termination cannot guarantee completion storage.",
