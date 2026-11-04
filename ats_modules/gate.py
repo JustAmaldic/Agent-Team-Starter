@@ -11,6 +11,7 @@ replaces the independent review: it only decides whether the review is worth sta
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -111,7 +112,13 @@ def json_syntax(folder: Path, paths):
 
 
 def _argv(command):
-    return shlex.split(command) if isinstance(command, str) else [str(part) for part in command]
+    """A command string as arguments. On Windows backslashes are path separators, not escapes."""
+    if not isinstance(command, str):
+        return [str(part) for part in command]
+    if os.name == 'nt':
+        return [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"' else part
+                for part in shlex.split(command, posix=False)]
+    return shlex.split(command)
 
 
 def _run(name, level, command, folder, run, timeout, no_tests_ok=False):

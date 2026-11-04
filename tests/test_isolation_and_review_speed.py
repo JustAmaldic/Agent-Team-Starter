@@ -85,6 +85,11 @@ class UnittestTargetedTests(unittest.TestCase):
                                     ['python3', '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_b.py', '-v']])
         self.assertEqual(gate.unittest_commands({'test_commands': ['make test']}, ['tests/test_a.py']), [])
 
+    def test_windows_paths_keep_their_backslashes(self):
+        with patch.object(gate.os, 'name', 'nt'):
+            argv = gate._argv(r'C:\Python312\python.exe -m unittest discover -s "my tests"')
+        self.assertEqual(argv, [r'C:\Python312\python.exe', '-m', 'unittest', 'discover', '-s', 'my tests'])
+
     def test_gate_runs_them(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = pathlib.Path(temp)
