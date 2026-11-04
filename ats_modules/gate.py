@@ -11,10 +11,11 @@ replaces the independent review: it only decides whether the review is worth sta
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PASSED, FAILED, SKIPPED, UNAVAILABLE = 'passed', 'failed', 'skipped', 'unavailable'
 FAST, TARGETED = 'fast', 'targeted'
@@ -111,7 +112,13 @@ def json_syntax(folder: Path, paths):
 
 
 def _argv(command):
-    return shlex.split(command) if isinstance(command, str) else [str(part) for part in command]
+    """A command string as arguments. On Windows backslashes are path separators, not escapes."""
+    if not isinstance(command, str):
+        return [str(part) for part in command]
+    if os.name == 'nt':
+        return [part[1:-1] if len(part) > 1 and part[0] == part[-1] == '"' else part
+                for part in shlex.split(command, posix=False)]
+    return shlex.split(command)
 
 
 def _run(name, level, command, folder, run, timeout, no_tests_ok=False):
@@ -196,15 +203,66 @@ def targeted_command(conf, tests):
     return None
 
 
+MAX_UNITTEST_FILES = 5
+
+
+def unittest_commands(conf, tests):
+    """`python -m unittest discover -s <dir>` test commands, narrowed to one test file each (-p).
+
+    unittest has no way to select several files of a discover run at once, so this is one command
+    per file, for the files inside the start directory, at most MAX_UNITTEST_FILES.
+    """
+    for command in conf.get('test_commands', []) or []:
+        argv = _argv(command)
+        if 'unittest' not in argv or 'discover' not in argv:
+            continue
+        head = argv[:argv.index('discover') + 1]
+        rest = argv[len(head):]
+        options, start, top = [], '.', None
+        index = 0
+        while index < len(rest):
+            flag = rest[index]
+            value = rest[index + 1] if index + 1 < len(rest) else None
+            if flag in ('-s', '--start-directory') and value is not None:
+                start, index = value, index + 2
+            elif flag in ('-t', '--top-level-directory') and value is not None:
+                top, index = value, index + 2
+            elif flag in ('-p', '--pattern') and value is not None:
+                index += 2   # replaced by the file below
+            else:
+                options.append(flag)
+                index += 1
+        base = PurePosixPath(start.replace('\\', '/').rstrip('/') or '.')
+        commands = []
+        for test in tests:
+            test_path = PurePosixPath(test)
+            inside = str(base) == '.' or str(test_path).startswith(str(base) + '/')
+            if inside and test_path.suffix == '.py':
+                commands.append(head + ['-s', start, *(['-t', top] if top else []), '-p', test_path.name, *options])
+        return commands[:MAX_UNITTEST_FILES]
+    return []
+
+
 def targeted_tests(folder: Path, paths, conf, tracked, run, timeout):
     tests = related_tests(folder, paths, tracked)
     if not tests:
         return result('targeted tests', TARGETED, SKIPPED, 'no tests related to the changed files')
     command = targeted_command(conf, tests)
-    if command is None:
+    if command is not None:
+        return _run('targeted tests', TARGETED, command, folder, run, timeout, no_tests_ok=True)
+    commands = unittest_commands(conf, tests)
+    if not commands:
         return result('targeted tests', TARGETED, SKIPPED,
-                      'no pytest test command or targeted_test_command configured')
-    return _run('targeted tests', TARGETED, command, folder, run, timeout, no_tests_ok=True)
+                      'no pytest or unittest test command, or targeted_test_command, configured')
+    outcomes = [_run('targeted tests', TARGETED, c, folder, run, timeout, no_tests_ok=True) for c in commands]
+    for status in (FAILED, UNAVAILABLE):
+        bad = [o for o in outcomes if o['status'] == status]
+        if bad:
+            return result('targeted tests', TARGETED, status, '\n'.join(o['detail'] for o in bad))
+    ran = [o for o in outcomes if o['status'] == PASSED]
+    if ran:
+        return result('targeted tests', TARGETED, PASSED, f'{len(ran)} test files')
+    return result('targeted tests', TARGETED, SKIPPED, 'no tests ran')
 
 
 def run_gate(conf, folder, diff, tracked, run):

@@ -67,10 +67,15 @@ def billable(counts: dict) -> int:
 
 
 def context_size(counts: dict) -> int:
-    """How much context the agent read in its latest call (new + cached input)."""
+    """How much new context a call added to the session: new input, cache writes and output.
+
+    Cache reads are left out on purpose. The CLIs report them summed over every turn of the call,
+    so a single long call shows millions of cache-read tokens while the session itself is much
+    smaller; counting them made every session look too large to continue.
+    """
     counts = counts or {}
-    return ((counts.get('input_tokens') or 0) + (counts.get('cache_read_tokens') or 0)
-            + (counts.get('cache_write_tokens') or 0))
+    return ((counts.get('input_tokens') or 0) + (counts.get('cache_write_tokens') or 0)
+            + (counts.get('output_tokens') or 0))
 
 
 def _json_objects(stdout: str):
@@ -233,15 +238,16 @@ class Sessions:
         with self._lock:
             old = self._sessions.get(key)
             turns = (old['turns'] + 1) if old and old['session_id'] == session_id else 1
+            grown = (old['context_tokens'] if old and old['session_id'] == session_id else 0) + context_size(counts)
             self._sessions[key] = {'session_id': session_id, 'tree': tree, 'turns': turns,
-                                   'context_tokens': context_size(counts)}
+                                   'context_tokens': grown}
 
     def update_tree(self, key, tree):
         with self._lock:
             if key in self._sessions:
                 self._sessions[key]['tree'] = tree
 
-    def usable(self, key, tree, max_turns=4, max_context_tokens=250000):
+    def usable(self, key, tree, max_turns=4, max_context_tokens=400000):
         """(session id, None) when it may be continued, else (None, reason)."""
         with self._lock:
             saved = self._sessions.get(key)
