@@ -188,6 +188,12 @@ review must finish before dependent work starts. Independent components remain p
 This adds contract-level ordering to the existing batch planner; it does **not**
 yet remove the wave barrier (full dynamic t49 scheduler remains separate).
 
+## Test environment
+
+Test commands such as `python -m unittest` use the project's virtualenv: `python_env` from `.ats-project.json`, otherwise `.venv` or `venv` in the project folder. ATS puts its scripts folder first in `PATH` for the test commands and the agent CLIs. Before any agent starts, ATS checks that the packages in `requirements.txt`, `requirements-dev.txt` and `requirements-test.txt` are installed there; `ats env-check` prints the same check as JSON.
+
+A missing package stops the run as a configuration problem with the exact package and Python, before implementation, or, if it only shows in a test, without asking an agent to repair it. Agents never install packages. After installing, `ats task "<same task>" --recheck-from <run id>` tests and reviews the kept worktree again without rebuilding it.
+
 ## Token-efficient runs
 
 ATS reads token usage and session ids from the CLIs' JSON output (`claude -p --output-format json`, `codex exec --json`) and records an `agent_usage` event per call: agent, model, phase, part, review round, and input, output, cache-read and cache-write tokens separately (no prompts or answers). `ATS_STRUCTURED_OUTPUT=0` switches back to plain text; an older CLI without JSON output falls back automatically.
@@ -200,6 +206,8 @@ Project settings in `.ats-project.json` (all optional):
 | --- | --- | --- |
 | `max_plan_parts` | `5` | preferred maximum of parts in a plan; a longer plan is asked once to merge related steps |
 | `integration_review` | `true` | one review of the combined change after parallel or more than two parts |
+| `python_env` | `.venv` or `venv` when present | the project's virtualenv for test commands and agents (relative to the project folder, or absolute) |
+| `environment_check` | `true` | before any agent starts, check that the requirement files are installed in the Python the test commands use |
 | `pre_review_gate` | `true` | cheap checks before the review (see POLICY.md) |
 | `gate_commands` | `[]` | extra gate checks, e.g. `[{"name": "ruff", "command": "ruff check ."}]` |
 | `targeted_test_command` | from `test_commands` | command for related tests; `{files}` is replaced by the test files |
