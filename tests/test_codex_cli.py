@@ -58,7 +58,8 @@ class CodexCLITest(unittest.TestCase):
                  patch.object(ats, 'stream_command', side_effect=fake_stream):
                 ats.invoke(agent, prompt, pathlib.Path('.'))
             self.assertEqual(seen['stdin'], prompt)
-            self.assertLess(len(' '.join(seen['command'])), 200, agent)
+            self.assertNotIn('quoted', ' '.join(seen['command']), agent)
+            self.assertLess(len(' '.join(seen['command'])), 1000, agent)   # fixed flags only, never the prompt
 
     def test_stream_command_feeds_stdin(self):
         prompt = 'regel 1\nregel 2 met é\n' + 'y' * 100_000
