@@ -315,6 +315,48 @@ class BuildTests(unittest.TestCase):
                 row = next(line for line in run_report.render(report).splitlines() if line.startswith('| 1 |'))
                 self.assertEqual(row.split(' | ')[4], run_report._show(seconds, ' s'))
 
+    def test_sequential_resume_reports_reused_parts_as_approved_with_their_agents(self):
+        # subtask_flow skips a checkpointed wave: subtask_resumed has no agents, the summary has them.
+        parts = [{'subtask': 1, 'implementer': 'codex', 'reviewer': 'claude'},
+                 {'subtask': 2, 'implementer': 'claude', 'reviewer': 'codex'}]
+        events = [event('assigned', 0, implementer='codex'),
+                  event('subtask_resumed', 1, subtask=1),
+                  event('budget', 2, subtask=2),
+                  event('implementation', 5, subtask=2, implementer='claude'),
+                  event('review_result', 9, subtask=2, cycle=0, approved=True, implementer='claude',
+                        reviewer='codex', findings=[]),
+                  event('subtask_completed', 10, subtask=2, implementer='claude', reviewer='codex'),
+                  event('subtasks_completed', 11, parts=parts),
+                  event('run_finished', 12, approved=True, duration_seconds=12.0, review_rounds=1,
+                        outcome='approved')]
+        report = run_report.build(events, 'demo', 't1')
+        self.assertEqual(report['parts'][0], {'part': 1, 'implementer': 'codex', 'reviewers': ['claude'],
+                                              'review_rounds': 0, 'seconds': None, 'parallel': False,
+                                              'approved': True})
+        self.assertEqual(report['parts'][1]['approved'], True)
+        self.assertIn('| 1 | codex | claude | 0 | unknown | yes |', run_report.render(report))
+        # Escalated later, so no summary: the reused part is still approved, its agents unknown.
+        events = [e for e in events if e['event_type'] not in ('subtasks_completed', 'run_finished')]
+        report = run_report.build(events, 'demo', 't1')
+        self.assertEqual(report['parts'][0]['approved'], True)
+        self.assertIsNone(report['parts'][0]['implementer'])
+        self.assertIn('| 1 | unknown | unknown | 0 | unknown | yes |', run_report.render(report))
+
+    def test_reused_parallel_node_reports_approval_and_agents(self):
+        # The DAG path records who built and reviewed the reused node on subtask_resumed itself.
+        events = [event('subtask_resumed', 1, subtask=2, implementer='claude', reviewer='codex'),
+                  event('budget', 1, subtask=3),
+                  event('implementation', 4, subtask=3, implementer='codex'),
+                  event('review_result', 8, subtask=3, cycle=0, approved=True, implementer='codex',
+                        reviewer='claude', findings=[]),
+                  event('subtask_completed', 9, subtask=3, implementer='codex', reviewer='claude'),
+                  event('escalated', 20, blocking_reasons=['merge of part 3: conflict'])]
+        report = run_report.build(events, 'demo', 't1')
+        self.assertEqual(report['parts'][0], {'part': 2, 'implementer': 'claude', 'reviewers': ['codex'],
+                                              'review_rounds': 0, 'seconds': None, 'parallel': False,
+                                              'approved': True})
+        self.assertIn('| 2 | claude | codex | 0 | unknown | yes |', run_report.render(report))
+
     def test_finding_ids_are_scoped_to_integration_and_base_update_reviews(self):
         # Both producers start a fresh review_loop at cycle 0, reusing F1 after initial approval.
         for number, terminal in ((2, 'subtask_merged'), (None, 'base_merged')):

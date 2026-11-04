@@ -9,7 +9,9 @@ only for some events, is shown as unknown, never guessed or counted as zero.
 Durations: the total is the wall time of run_finished_v1, so parallel parts are not added twice.
 A part's own duration comes from wave_timing when it ran in a parallel wave, otherwise from its
 budget event (written when the part starts) to the event that ends it (subtask_completed, or the
-escalation, block or error of that part); without both the duration is unknown. Repairing the
+escalation, block or error of that part); without both the duration is unknown. A part reused from
+a checkpoint (subtask_resumed) was approved in an earlier run: it counts as approved, its agents
+come from that event or from subtasks_completed, and its duration here is unknown. Repairing the
 merge of a parallel part happens after the wave and is shown separately, from merge_conflict to
 subtask_merged or the stored failure event.
 """
@@ -161,6 +163,12 @@ def build(events, project, task_id):
 
     finished = next(iter(kind('run_finished')[-1:]), {})
     assigned = next(iter(kind('assigned')), {})
+    # Who built and reviewed each part, including parts reused from a checkpoint of an earlier run.
+    attribution = {}
+    for summary in kind('subtasks_completed'):
+        for item in summary.get('parts') if isinstance(summary.get('parts'), list) else []:
+            if isinstance(item, dict) and _part(item) is not None:
+                attribution[_part(item)] = item
     reviews = kind('review_result')
     outcome = finished.get('outcome') or UNKNOWN
 
@@ -180,12 +188,19 @@ def build(events, project, task_id):
             if not mine:
                 break
         completed = next((e for e in mine if e.get('event_type') == 'subtask_completed'), {})
+        # A part reused from a verified checkpoint was approved by an independent review earlier.
+        resumed = next((e for e in mine if e.get('event_type') == 'subtask_resumed'), {})
+        attributed = attribution.get(number, {})
         built = next((e for e in mine if e.get('event_type') == 'implementation'), {})
         own_reviews = [e for e in mine if e.get('event_type') == 'review_result']
-        builder = completed.get('implementer') or built.get('implementer') or next(
-            (e.get('implementer') for e in own_reviews if e.get('implementer')), None) or (
-            assigned.get('implementer') if number is None else None)
+        builder = (completed.get('implementer') or resumed.get('implementer') or attributed.get('implementer')
+                   or built.get('implementer') or next(
+                       (e.get('implementer') for e in own_reviews if e.get('implementer')), None) or (
+                       assigned.get('implementer') if number is None else None))
         reviewers = list(dict.fromkeys(e['reviewer'] for e in own_reviews if e.get('reviewer')))
+        if not reviewers:
+            reviewers = [r for r in (completed.get('reviewer') or resumed.get('reviewer')
+                                     or attributed.get('reviewer'),) if r]
         if number in wave_seconds:
             seconds, parallel = wave_seconds[number], True
         elif number is None:
@@ -194,7 +209,7 @@ def build(events, project, task_id):
             seconds, parallel = _part_seconds(mine), False
         parts.append({'part': number, 'implementer': builder, 'reviewers': reviewers,
                       'review_rounds': len(own_reviews), 'seconds': seconds, 'parallel': parallel,
-                      'approved': bool(completed) or (number is None and outcome == 'approved')})
+                      'approved': bool(completed or resumed) or (number is None and outcome == 'approved')})
 
     rounds = _number(finished.get('review_rounds'))
     complete = rounds is None or rounds == len(reviews)
