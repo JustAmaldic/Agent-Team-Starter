@@ -208,6 +208,8 @@ Project settings in `.ats-project.json` (all optional):
 | `integration_review` | `true` | one review of the combined change after parallel or more than two parts |
 | `integration_fixup` | `true` | before the integration review, one agent call fixes findings still open from the part reviews and updates the release notes |
 | `release_files` | detected | version and changelog files; only the first part of a plan edits them |
+| `style_gate` | `true` | gate check on literal colours and fonts in added UI lines (projects with design tokens) |
+| `required_tools` | detected | programs the tests need, checked before agents start (`node` for JavaScript tests) |
 | `python_env` | `.venv` or `venv` when present | the project's virtualenv for test commands and agents (relative to the project folder, or absolute) |
 | `environment_check` | `true` | before any agent starts, check that the requirement files are installed in the Python the test commands use |
 | `pre_review_gate` | `true` | cheap checks before the review (see POLICY.md) |

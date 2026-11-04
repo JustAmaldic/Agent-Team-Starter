@@ -33,6 +33,7 @@ from ats_modules import review_handoff
 from ats_modules import run_report
 from ats_modules import severity as severity_floor
 from ats_modules import findings_ledger
+from ats_modules import style_check
 from ats_modules import test_env
 from ats_modules import usage as usage_meter
 
@@ -1017,11 +1018,19 @@ def environment_problem(conf, task_id):
         return None
     base = {key: value for key, value in os.environ.items() if not key.startswith('ATS_')}
     report = test_env.check(conf, APP, base)
-    if report['python'] is None and report['ok']:
+    tools = test_env.required_tools(conf, APP)
+    missing_tools = test_env.missing_tools(tools, base, _test_env)
+    if missing_tools:
+        message = (f"Test environment incomplete: {', '.join(missing_tools)} not found on this computer, and the "
+                   "project's tests need it (required_tools, or JavaScript tests found). Tests that skip themselves "
+                   'without it would pass unnoticed. Install it, or set required_tools in .ats-project.json. Agents '
+                   'never install programs; no agent was started for this.')
+        report = dict(report, ok=False, message=(report['message'] + ' ' if report['message'] else '') + message)
+    if report['python'] is None and report['ok'] and not tools:
         return None   # nothing to check: no Python test command or no requirement files
     record('test_environment', report['message'] or 'Test environment ready', task_id,
            ok=report['ok'], python=report['python'], env=report['env'], source=report['source'],
-           missing=report['missing'])
+           missing=report['missing'], tools=tools, missing_tools=missing_tools)
     return None if report['ok'] else report['message']
 
 
@@ -1562,12 +1571,26 @@ def restore_if_changed(folder, tree):
             if not any(marker in path for marker in GENERATED_PATH_PATTERNS)]
 
 
+SKIPPED_COUNT = re.compile(r'skipped=(\d+)|(\d+) skipped')
+
+
+def skipped_tests(output):
+    """How many tests the run skipped (unittest `skipped=N`, pytest `N skipped`)."""
+    total = 0
+    for a, b in SKIPPED_COUNT.findall(output[-3000:] or ''):
+        total = max(total, int(a or b))
+    return total
+
+
 def run_checks(conf, folder):
     checks = []
     for cmd in conf.get('test_commands', []):
         outcome = run_check(cmd, folder, timeout=int(conf.get('test_timeout', 900)))
         output = (outcome.stdout or '') + (outcome.stderr or '')
         check = {'command': cmd, 'passed': outcome.returncode == 0, 'output': output[-1000:]}
+        skipped = skipped_tests(output)
+        if skipped:
+            check['skipped'] = skipped   # shown to the reviewer: a passing suite can hide skipped tests
         if outcome.returncode and cannot_start(outcome.returncode, output, folder):
             check['cannot_start'] = True
             check['missing_module'] = test_env.missing_module(output, folder)
@@ -1598,7 +1621,7 @@ STYLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', 'STYLEGUIDE.md', 'ST
                'tailwind.config.ts', 'tsconfig.json')
 STYLE_SKIP = {'node_modules', '.git', 'dist', 'build', '.venv', 'venv', '.venv-bouw', 'vendor', '__pycache__',
               '.next', 'coverage', 'site-packages'}
-STYLE_LIMIT = 2500
+STYLE_LIMIT = 3500
 _style_cache = {}
 
 
@@ -1647,6 +1670,12 @@ def style_context(folder, conf=None):
     if tokens:
         lines.append(f'Design tokens in {token_file} (use these instead of literal values): '
                      + '; '.join(f'{n}: {v.strip()}' for n, v in tokens[:40]) + '.')
+    classes, helpers = style_check.vocabulary(folder)
+    if classes:
+        lines.append('CSS classes the screens use most (build with these before adding new ones): '
+                     + ', '.join(classes) + '.')
+    if helpers:
+        lines.append('UI helper functions the project uses (reuse them): ' + ', '.join(helpers) + '.')
     if fonts:
         lines.append('Fonts in use: ' + ' | '.join(f for f, _ in sorted(fonts.items(), key=lambda x: -x[1])[:3]) + '.')
     notes = (conf or {}).get('style_guide')
@@ -1918,7 +1947,8 @@ def reserved_changes(paths, reserved, owned=()):
 
 
 def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
-                base='HEAD', subtask=None, owned_paths=None, earlier_review_notes='', reserved_paths=None):
+                base='HEAD', subtask=None, owned_paths=None, earlier_review_notes='', reserved_paths=None,
+                style_reference=None, kind=None):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
 
     Per round: pre-review gate (cheap deterministic checks, repaired by the implementer), the
@@ -2046,6 +2076,13 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             if mode == 'delta':
                 delta = delta_diff
         notes = ''
+        unknown = style_check.unknown_classes(folder, pre_gate.added_lines(diff))
+        if unknown:
+            notes = ('CSS classes used in this change that no stylesheet of the project defines: '
+                     + ', '.join(unknown) + '. Check whether an existing class was meant. ')
+        if style_reference:
+            notes += (f'UI reference for this part: {style_reference}. Compare layout, components and texts with it; '
+                      'a visible difference without reason is a finding. ')
         drift = outside_owned(full_stats['files'], owned_paths)
         if drift:
             notes = ('Changes outside the files this part owns (' + ', '.join(owned_paths) + '): '
@@ -2123,6 +2160,8 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                tampered_paths=tampered, tests=checks, cycle=cycle, branch=branch, gate=gate_results,
                review_level=level, review_level_reason=level_reason, review_mode=mode,
                review_mode_reason=mode_reason, security_pass=security, same_provider_review=same_provider,
+               review_kind=kind or ('part' if subtask is not None else 'task'),
+               passes=['functional', 'security'] if security else ['functional'],
                knowledge_cited=sorted({f['rule'] for f in findings if f.get('rule')}),
                budget=budget.snapshot())
         history.append({'cycle': cycle, 'reviewer': reviewer, 'findings': findings, 'responses': []})
@@ -2339,6 +2378,8 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'owned_paths unless both edits are unavoidable. Do not invent parallel tasks '
         'merely to increase concurrency; contract consumers must wait until reviewed. '
         'Never have two agents modify the same file concurrently. '
+        'For a part that adds or changes a screen, add "style_reference": an existing file and screen '
+        'whose layout and components it should follow (for example "ats_host/web/app.js: project settings"). '
         'Every part needs a testable acceptance criterion; include file boundaries '
         'where they are known. Do not include credentials, raw email data, '
         'deployment, live trading, or deletion without explicit approval. '
@@ -2494,6 +2535,9 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
             ownership += ('Do NOT edit these files (the parallel part owns them, or earlier runs showed they cause '
                           'conflicts): ' + ', '.join(off_limits[:20]) + '; ATS blocks the part if you do. ')
     contract_notes = ''
+    if node and node.get('style_reference'):
+        contract_notes += (f"UI REFERENCE: read {node['style_reference']} first and build this part's screens the same "
+                           'way: the same components, classes, spacing and tone of text. ')
     if node:
         provided = node.get('contracts_provided', [])
         required = node.get('contracts_required', [])
@@ -2547,7 +2591,8 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
             quiet=quiet, base=base, subtask=number, owned_paths=owned,
-            earlier_review_notes=previous_note, reserved_paths=reserved)
+            earlier_review_notes=previous_note, reserved_paths=reserved,
+            style_reference=node.get('style_reference') if node else None)
     except RuntimeError as exc:   # e.g. the part produced no changes
         record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
                blocking_reasons=[f'subtask {number}: {exc}'])
@@ -2605,7 +2650,8 @@ def merge_parallel_part(task, plan, number, part, task_id, folder, branch, side_
                    'is that part plus the merge resolution; check that both parts keep working.')
     try:
         approved, reviewer, fixer, cycles = review_loop(review_task, task_id, folder, branch, fixer, unavailable,
-                                                        conf, quiet=quiet, base=pre_merge, subtask=number)
+                                                        conf, quiet=quiet, base=pre_merge, subtask=number,
+                                                        kind='merge')
     except RuntimeError as exc:
         record('escalated', str(exc), task_id, subtask=number, branch=branch,
                blocking_reasons=[f'merge of part {number}: {exc}'])
@@ -2960,7 +3006,7 @@ def integration_review(task, plan, total, task_id, folder, branch, implementer, 
     try:
         approved, reviewer, implementer, cycles = review_loop(review_task, task_id, folder, branch, implementer,
                                                               unavailable, settings, quiet=quiet, base=base,
-                                                              earlier_review_notes=notes)
+                                                              earlier_review_notes=notes, kind='integration')
     except RuntimeError as exc:
         record('integration_review', 'Integration review could not run: ' + str(exc)[:300], task_id,
                branch=branch, approved=False, files=[])
@@ -2999,6 +3045,8 @@ def distill_learnings(task, task_id, folder, history, preferred, unavailable, qu
               + json.dumps(findings[:40], ensure_ascii=False) +
               '\nAlready known (do not repeat): ' + json.dumps(known, ensure_ascii=False) +
               '\nWrite at most 5 learnings that help FUTURE tasks avoid these problems: general and actionable, '
+              'Write a style or UI-consistency finding as a project rule that names the component, class or '
+              'token to use instead (for example: inside .composer use the .input class on textareas). '
               'not a description of this change; skip one-off typos. kind: "lesson" (insight), "rule" (always/never '
               'do X) or "pattern". scope: "shared" when it applies to any project, else "project". risk: "high" only '
               'if following it could delete or overwrite data, rewrite git history, weaken review/tests/security, '
@@ -3153,7 +3201,7 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
                    f'on top of the new {base}; check it is still correct, including the conflict resolution.)')
     try:
         approved, reviewer, fixer, cycles = review_loop(review_task, task_id, folder, branch, fixer, unavailable,
-                                                        conf, quiet=quiet, base=ref)
+                                                        conf, quiet=quiet, base=ref, kind='update')
     except RuntimeError as exc:
         record('escalated', str(exc), task_id, branch=branch, blocking_reasons=[f'update with {ref}: {exc}'])
         return False, []
