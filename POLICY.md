@@ -98,6 +98,9 @@ These rules save tokens without weakening the review:
 - **Isolated tests.** Test commands, and the agent CLIs, run without ATS's own control variables (`ATS_EVENTS_FILE`, `ATS_TASK_ID`, ...) and with a temporary ATS state and no private data (`ATS_DATA_REPO=none`), so tests never write into the live run or the real ATS-data **(enforced)**. Claude may run the project's test commands and read-only git without a prompt.
 - **Reviews reuse ATS's checks.** The reviewer gets the results of the test commands ATS just ran and runs targeted tests for specific concerns instead of the whole suite again.
 - **One Codex preflight per worktree.** The Codex policy and sandbox check runs once per worktree in a run, and again after a sandbox block.
+- **Parallel parts stay in their own files (enforced).** A part that runs in parallel may not change files its sibling owns, nor files that earlier runs of this project showed to cause conflicts (learned shared files), unless it owns them. ATS blocks such a part with finding `OWN1` until the change is undone, instead of letting it reach the merge.
+- **Integration review.** After a plan with parallel parts or more than two parts, the other agent reviews the combined change once, only for how the parts work together (`integration_review`, on by default). A combined diff above `max_review_diff_chars` is skipped and recorded.
+- **Plans learn from earlier runs.** The planner gets a factual summary of this project's earlier merge conflicts, edits outside ownership, integration findings and waiting time between parallel parts, computed from the project's events.
 - **Owned paths.** A DAG part lists the files it owns. Changes outside them are reported to the reviewer (`ownership_drift`).
 
 ## Data and storage

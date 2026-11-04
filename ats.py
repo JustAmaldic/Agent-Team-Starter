@@ -26,6 +26,7 @@ from ats_modules import budget as budgets
 from ats_modules import context_pack
 from ats_modules import gate as pre_gate
 from ats_modules import knowledge_select
+from ats_modules import plan_learning
 from ats_modules import review_scope
 from ats_modules import review_handoff
 from ats_modules import run_report
@@ -1847,8 +1848,17 @@ def outside_owned(paths, owned):
     return [p for p in paths if not dag_planning.paths_conflict([p], owned)]
 
 
+def reserved_changes(paths, reserved, owned=()):
+    """Changed paths that fall in `reserved` (files of the parallel part, or learned shared files)
+    and are not this part's own."""
+    if not reserved:
+        return []
+    return [p for p in paths if dag_planning.paths_conflict([p], reserved)
+            and not (owned and dag_planning.paths_conflict([p], owned))]
+
+
 def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
-                base='HEAD', subtask=None, owned_paths=None, earlier_review_notes=''):
+                base='HEAD', subtask=None, owned_paths=None, earlier_review_notes='', reserved_paths=None):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
 
     Per round: pre-review gate (cheap deterministic checks, repaired by the implementer), the
@@ -2002,6 +2012,16 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                   + ', '.join(tampered[:10]), file=sys.stderr)
         verdict = parse_verdict(review)
         findings = normalize_findings(parse_marked_json(review, 'ATS_FINDINGS_JSON'))
+        trespass = reserved_changes(full_stats['files'], reserved_paths, owned_paths)
+        if trespass:
+            # Enforced before the merge: a parallel part that edits its sibling's (or a learned shared)
+            # file would otherwise cause a merge conflict, a resolution and an extra review.
+            findings.append({'id': 'OWN1', 'severity': 'MAJOR', 'file': trespass[0], 'line': '',
+                             'summary': ('This part runs in parallel and changed files it does not own: '
+                                         + ', '.join(trespass[:10]) + '. Undo those changes; the part that owns '
+                                         'them, or the final integration part, makes them.')})
+            record('ownership_blocked', 'Parallel part changed files it does not own', task_id, **context,
+                   implementer=implementer, paths=trespass[:50])
         reasons = evaluate_approval(verdict, checks, findings, history, reviewer, implementer, conf,
                                     tampered=bool(tampered), fresh_same_provider=same_provider)
         security = None
@@ -2253,6 +2273,7 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'where they are known. Do not include credentials, raw email data, '
         'deployment, live trading, or deletion without explicit approval. '
         'Do not implement any changes. Do not add explanations outside the JSON line.'
+        + plan_learning.planner_note(plan_history())
     )
     last_problem = None
     for attempt in range(2):
@@ -2313,6 +2334,24 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
     )
 
 
+_plan_history = {}
+
+
+def plan_history():
+    """What this project's earlier runs say about dividing work (plan_learning), read once per run."""
+    try:
+        name = cleanname(project().get('project', APP.name))
+    except RuntimeError:
+        return plan_learning.history([])
+    if name not in _plan_history:
+        try:
+            events = intelligence.read_events(DATA / name / 'events')
+        except OSError:
+            events = []
+        _plan_history[name] = plan_learning.history(events)
+    return _plan_history[name]
+
+
 def other_agent(agent):
     return alternate_agent(agent)
 
@@ -2361,6 +2400,14 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
 
     ownership = ('Files this part owns: ' + ', '.join(owned) + '. Change other files only when unavoidable, '
                  'and say which and why. ' if owned else '')
+    if alongside:
+        sibling = dag_node(plan, alongside[1])
+        shared = [f for f in plan_learning.shared_files(plan_history()) if not dag_planning.paths_conflict([f], owned)] \
+            if owned else plan_learning.shared_files(plan_history())
+        off_limits = (list(sibling['owned_paths']) if sibling else []) + shared
+        if off_limits:
+            ownership += ('Do NOT edit these files (the parallel part owns them, or earlier runs showed they cause '
+                          'conflicts): ' + ', '.join(off_limits[:20]) + '; ATS blocks the part if you do. ')
     contract_notes = ''
     if node:
         provided = node.get('contracts_provided', [])
@@ -2403,11 +2450,16 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
             return False, None, implementer, []
         record('implementation', output[-1600:], task_id, implementer=author, subtask=number)
         capture_learning_proposals(output, task_id)
+    reserved = []
+    if alongside:
+        sibling = dag_node(plan, alongside[1])
+        reserved = list(sibling['owned_paths']) if sibling else []
+        reserved += [f for f in plan_learning.shared_files(plan_history()) if f not in reserved]
     try:
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
             quiet=quiet, base=base, subtask=number, owned_paths=owned,
-            earlier_review_notes=previous_note)
+            earlier_review_notes=previous_note, reserved_paths=reserved)
     except RuntimeError as exc:   # e.g. the part produced no changes
         record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
                blocking_reasons=[f'subtask {number}: {exc}'])
@@ -2446,7 +2498,8 @@ def merge_parallel_part(task, plan, number, part, task_id, folder, branch, side_
         conflicts = execute(['git', 'diff', '--name-only', '--diff-filter=U'], folder, check=False).stdout.split()
         problem = ('Merging your part into the other part produced conflicts in: ' + ', '.join(conflicts[:30])
                    + '. Resolve every conflict marker so BOTH parts keep working.')
-    record('merge_conflict', problem[:1200], task_id, subtask=number, implementer=author, branch=branch)
+    record('merge_conflict', problem[:1200], task_id, subtask=number, implementer=author, branch=branch,
+           files=conflicts[:50] if merged.returncode else [])
     prompt = (shared_prefix(folder, conf, task_id) + 'ROLE: implementer, integrating parallel work.\n'
               f'Task: {task}\n'
               f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
@@ -2656,9 +2709,70 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
                                     number, attribution)
         reviewer, author = reviewer_b, author_b
         implementer = other   # the next wave starts with the other agent
-    record('subtasks_completed', 'All parts independently reviewed; combined diff has not been reviewed',
-           task_id, parts=attribution, branch=branch, combined_review=False)
+    pairs = sum(len(w) == 2 for w in waves)
+    combined = False
+    if conf.get('integration_review', True) and (pairs or total > 2):
+        ok, judge, author, cycles = integration_review(task, plan, total, task_id, folder, branch, author,
+                                                       unavailable, conf, quiet=quiet)
+        history.extend(cycles)
+        if not ok:
+            return False, judge, author, history
+        combined = judge is not None
+        reviewer = judge or reviewer
+    record('subtasks_completed', 'All parts independently reviewed' + (
+               '; the combined change passed an integration review' if combined else
+               '; combined diff has not been reviewed'),
+           task_id, parts=attribution, branch=branch, combined_review=combined)
     return True, reviewer, author, history
+
+
+def integration_base(folder, conf):
+    """Where the task branch left the base branch: the combined change of all parts starts there."""
+    ref = 'origin/' + conf.get('base_branch', 'main')
+    found = execute(['git', 'merge-base', 'HEAD', ref], folder, check=False).stdout.strip()
+    if found:
+        return found
+    roots = execute(['git', 'rev-list', '--max-parents=0', 'HEAD'], folder, check=False).stdout.split()
+    return roots[0] if roots else 'HEAD'
+
+
+def integration_review(task, plan, total, task_id, folder, branch, implementer, unavailable, conf, quiet=False):
+    """One review of the combined change after all parts: only how the parts work together.
+
+    Parts are reviewed one by one, so problems between them (interfaces, duplicated logic, wiring)
+    can slip through. Returns (approved, reviewer, implementer, cycles); a combined diff too large to
+    review completely is skipped (recorded), not escalated.
+    """
+    base = integration_base(folder, conf)
+    diff = execute(['git', 'diff', base, 'HEAD'], folder, check=False).stdout
+    if not diff.strip():
+        return True, None, implementer, []
+    if len(diff) > int(conf.get('max_review_diff_chars', 150000)):
+        record('integration_review', 'Skipped: the combined change is too large to review completely',
+               task_id, branch=branch, skipped=True, approved=None, files=[])
+        return True, None, implementer, []
+    usage_meter.set_context(budget=budgets.Budget.for_part(conf))
+    review_task = (f'{task}\nINTEGRATION REVIEW of the combined change of all {total} parts. Every part already '
+                   'passed its own independent review: do not repeat per-part findings. Look only at how the parts '
+                   'work together: interfaces and data passed between parts, duplicated or conflicting logic, '
+                   'wiring and configuration, end-to-end behaviour, and whether tests cover the combination. '
+                   'Plan: ' + json.dumps(plan, ensure_ascii=False))
+    settings = dict(conf, max_revisions=min(1, int(conf.get('max_revisions', 2))))
+    try:
+        approved, reviewer, implementer, cycles = review_loop(review_task, task_id, folder, branch, implementer,
+                                                              unavailable, settings, quiet=quiet, base=base)
+    except RuntimeError as exc:
+        record('integration_review', 'Integration review could not run: ' + str(exc)[:300], task_id,
+               branch=branch, approved=False, files=[])
+        return False, None, implementer, []
+    for cycle in cycles:
+        cycle['integration'] = True
+    files = sorted({f['file'] for c in cycles for f in c['findings'] if f.get('file')})
+    record('integration_review', 'Combined change ' + ('approved' if approved else 'not approved'), task_id,
+           branch=branch, approved=approved, reviewer=reviewer, cycles=len(cycles), files=files[:50])
+    if approved:
+        commit_all(folder, 'ATS: integration review')
+    return approved, reviewer, implementer, cycles
 
 
 def distill_learnings(task, task_id, folder, history, preferred, unavailable, quiet=False):
@@ -2822,7 +2936,8 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
         problem = (f'While you worked, {base} changed. Merging it into your branch produced conflicts in: '
                    + ', '.join(conflicts[:30]) + f'. Resolve every conflict marker: keep everything that is new on '
                    f'{base} and re-apply the intent of your change on top of it.')
-    record('merge_conflict', problem[:1200], task_id, implementer=implementer, branch=branch, base=ref)
+    record('merge_conflict', problem[:1200], task_id, implementer=implementer, branch=branch, base=ref,
+           files=conflicts[:50] if merged.returncode else [])
     fixer = implementer if implementer not in unavailable else ('claude' if implementer == 'codex' else 'codex')
     prompt = (shared_prefix(folder, conf, task_id) + 'ROLE: implementer, updating the branch.\n'
               f'Task: {task}\n{problem}\n'

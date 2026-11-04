@@ -199,6 +199,7 @@ Project settings in `.ats-project.json` (all optional):
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `max_plan_parts` | `5` | preferred maximum of parts in a plan; a longer plan is asked once to merge related steps |
+| `integration_review` | `true` | one review of the combined change after parallel or more than two parts |
 | `pre_review_gate` | `true` | cheap checks before the review (see POLICY.md) |
 | `gate_commands` | `[]` | extra gate checks, e.g. `[{"name": "ruff", "command": "ruff check ."}]` |
 | `targeted_test_command` | from `test_commands` | command for related tests; `{files}` is replaced by the test files |
