@@ -221,3 +221,38 @@ Project settings in `.ats-project.json` (all optional):
 
 `ATS_SESSION_REUSE=0` turns session reuse off; `ATS_SESSION_MAX_TURNS` (4) and `ATS_SESSION_MAX_CONTEXT` (400000 new tokens; cache reads do not count) bound it.
 
+
+### Consistent UI changes
+
+Put the project's visual contract in `DESIGN.md`: existing controls, CSS tokens,
+reference screens and UI language. ATS includes a bounded excerpt and an inventory
+of CSS classes/UI functions in both agents' style brief. The inventory is cached per
+worktree snapshot and refreshes when relevant files change.
+
+The pre-review gate checks only new UI declarations against the existing project.
+It flags hex/function colour literals, font families, px/em/rem sizes and inline style attributes/objects;
+named colours and other units are left to review. Comments are masked before checking;
+it does not require rewriting legacy CSS. Define new shared tokens centrally when
+necessary. This is a conservative static heuristic, not complete CSS parsing or a
+replacement for browser/visual testing. Projects without existing style declarations
+still receive the inventory and inline-style check, but no invented palette/scale.
+
+Intentional departures can be recorded in `.ats-project.json`:
+
+```json
+{
+  "style_check": true,
+  "style_check_exceptions": [
+    {"path": "web/chart.js", "rule": "inline", "reason": "Positions are calculated from chart data"}
+  ]
+}
+```
+
+Exceptions match the exact path and rule, require a reason, and appear in review
+evidence. Use `style_check: false` only as an explicit project decision. An exception
+never bypasses independent review. For DAG UI tasks, include e.g.
+`"reference_screen": "web/settings.js"`; it must be an existing file inside the
+worktree. The planner is instructed to choose it from the inventory. Legacy list
+plans remain valid; put the reference file directly in their part description.
+Style findings use the existing learning call to produce project-scoped rules;
+there is no extra learning-agent invocation or screenshot step.

@@ -23,6 +23,7 @@ import ats_intelligence as intelligence
 from ats_modules import checkpoints
 from ats_modules import dag as dag_planning
 from ats_modules import budget as budgets
+from ats_modules import style_guard
 from ats_modules import context_pack
 from ats_modules import gate as pre_gate
 from ats_modules import knowledge_select
@@ -1579,7 +1580,7 @@ STYLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', 'STYLEGUIDE.md', 'ST
                'tailwind.config.ts', 'tsconfig.json')
 STYLE_SKIP = {'node_modules', '.git', 'dist', 'build', '.venv', 'venv', '.venv-bouw', 'vendor', '__pycache__',
               '.next', 'coverage', 'site-packages'}
-STYLE_LIMIT = 2500
+STYLE_LIMIT = 5000
 _style_cache = {}
 
 
@@ -1603,7 +1604,10 @@ def style_context(folder, conf=None):
     style_guide notes from .ats-project.json. Cached per worktree.
     """
     folder = Path(folder)
-    key = str(folder.resolve())
+    evidence = style_guard.brief(folder)
+    key = (str(folder.resolve()), evidence,
+           tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in _style_sheets(folder)),
+           json.dumps((conf or {}).get('style_guide'), sort_keys=True))
     if key in _style_cache:
         return _style_cache[key]
     sources = [name for name in STYLE_FILES if (folder / name).is_file()]
@@ -1623,11 +1627,13 @@ def style_context(folder, conf=None):
              'test style and the language and tone of user-facing text. Reuse existing components, helpers, '
              'CSS classes and design tokens. Do not introduce new colours, fonts, spacing or radius values, UI '
              'libraries, frameworks or code styles unless the task asks for it; extend what is there instead.']
+    if evidence:
+        lines.append(evidence)
     if sources:
         lines.append('Style sources in this project (read the relevant ones): ' + ', '.join(sources) + '.')
     if tokens:
         lines.append(f'Design tokens in {token_file} (use these instead of literal values): '
-                     + '; '.join(f'{n}: {v.strip()}' for n, v in tokens[:40]) + '.')
+                     + '; '.join(f'{n}: {v.strip()}' for n, v in tokens[:20]) + '.')
     if fonts:
         lines.append('Fonts in use: ' + ' | '.join(f for f, _ in sorted(fonts.items(), key=lambda x: -x[1])[:3]) + '.')
     notes = (conf or {}).get('style_guide')
@@ -1638,6 +1644,9 @@ def style_context(folder, conf=None):
     text = '\n' + '\n'.join(lines)
     if len(text) > STYLE_LIMIT:
         text = text[:STYLE_LIMIT].rsplit(';', 1)[0] + ' …'
+    for old in list(_style_cache):
+        if isinstance(old, tuple) and old[0] == key[0]:
+            del _style_cache[old]
     _style_cache[key] = text
     return text
 
@@ -2276,7 +2285,9 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'write a bare double quote: copy quoted words from the task with single quotes (\'Nieuwe run\'). '
         'The JSON object has plan_version=2 and tasks (2-20 objects). Each task contains '
         'id, title, depends_on (list of prior task ids), and owned_paths (explicit source '
-        'files or directories). Example: ATS_DAG_JSON: '
+        'files or directories). For UI parts add reference_screen: the repository-relative path of an existing '
+        'similar screen or component from the style inventory. Do not invent a path. '
+        'For non-UI parts omit it. Example: ATS_DAG_JSON: '
         '{"plan_version":2,"tasks":[{"id":"contract","title":"Define shared event contracts",'
         '"depends_on":[],"owned_paths":["contracts/"]},'
         '{"id":"scorer","title":"Implement sender safety scoring with regression tests",'
@@ -2439,6 +2450,9 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
     together = (f'Another agent builds part {alongside[0]} ({alongside[1]}) AT THE SAME TIME in a separate '
                 'copy; do not implement it and avoid changing the same code. ' if alongside else '')
     node = dag_node(plan, part)
+    reference = style_guard.reference_context(folder, node)
+    description += reference
+    review_task += reference
     owned = list(node['owned_paths']) if node else []
     carried = review_handoff.relevant_findings(prior_cycles, part, owned)
     previous_note = review_handoff.handoff_note(carried)
@@ -2852,7 +2866,11 @@ def distill_learnings(task, task_id, folder, history, preferred, unavailable, qu
               'do X) or "pattern". scope: "shared" when it applies to any project, else "project". risk: "high" only '
               'if following it could delete or overwrite data, rewrite git history, weaken review/tests/security, '
               'touch credentials or money, or do something irreversible; otherwise "low". evidence: file:line or '
-              'finding id.\nEnd with ONE LINE: ATS_LEARNINGS_JSON: [{"kind":"lesson","title":"<title>",'
+              'finding id. For style/visual consistency findings, propose an actionable project-scoped rule '
+              'that names the existing component, design token or reference screen to reuse. Do not generalize '
+              'one project palette into a shared rule. Only describe a fix as established when a later '
+              'independent review confirms it; unresolved findings are evidence for investigation, not proven fixes. '
+              'Keep the existing risk checks and never weaken validation.\nEnd with ONE LINE: ATS_LEARNINGS_JSON: [{"kind":"lesson","title":"<title>",'
               '"observation":"<observation>","evidence":"<evidence>","scope":"project","risk":"low"}] '
               '(replace the placeholders, or use []).')
     tree = index_tree(folder)
