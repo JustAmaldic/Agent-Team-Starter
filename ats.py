@@ -28,6 +28,7 @@ from ats_modules import gate as pre_gate
 from ats_modules import knowledge_select
 from ats_modules import review_scope
 from ats_modules import review_handoff
+from ats_modules import run_report
 from ats_modules import usage as usage_meter
 
 from ats_contract import accepted_event, valid_phase
@@ -456,6 +457,8 @@ def read_json(path):
 
 
 EMIT_LOCK = threading.Lock()
+RUN_PROGRESS_LOCK = threading.Lock()
+_run_progress = {}   # task id -> number of persisted review_result events, including parallel parts
 
 
 def emit(item):
@@ -498,6 +501,10 @@ def record(kind, summary, task=None, **fields):
         raise ValueError('Invalid ATS persistent event envelope')
     (target / f'{now.replace(":", "-")}-{uid}.json').write_text(
         json.dumps(item, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    if kind == 'review_result':
+        with RUN_PROGRESS_LOCK:
+            if task in _run_progress:
+                _run_progress[task] += 1
     emit(item)
     return item
 
@@ -817,6 +824,8 @@ def worktree_tree(folder):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             copy = Path(temporary) / 'index'
             source = Path(folder) / index if index and not Path(index).is_absolute() else Path(index or '')
+            # copy2 keeps the index mtime, so git still rehashes files changed in the same second
+            # (racy entries); a fresh mtime would make the tree hash depend on timing.
             if index and source.is_file():
                 shutil.copy2(source, copy)   # keep the index mtime, or git's racy-file check can miss a same-second edit
             env = dict(os.environ, GIT_INDEX_FILE=str(copy))
@@ -2848,6 +2857,45 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
 
 def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None,
               resume_from=None):
+    """Persist run_finished_v1 once, after all work, including base updates and publishing."""
+    task_id = preset_task_id() or str(uuid.uuid4())
+    started = time.monotonic()
+    outcome = 'error'
+    with RUN_PROGRESS_LOCK:
+        _run_progress[task_id] = 0
+    try:
+        outcome = _task_flow(task, agent, push, task_id, quiet=quiet, parallel=parallel,
+                             approved_risk=approved_risk, plan_file=plan_file, resume_from=resume_from)
+    except (KeyboardInterrupt, SystemExit):
+        outcome = 'interrupted'
+        raise
+    finally:
+        with RUN_PROGRESS_LOCK:
+            review_rounds = _run_progress.pop(task_id)
+        propagating = sys.exc_info()[0] is not None
+        try:
+            record('run_finished', 'Task run completed', task_id, approved=outcome == 'approved',
+                   duration_seconds=round(max(0, time.monotonic() - started), 1),
+                   review_rounds=review_rounds, outcome=outcome)
+        except Exception:
+            if not propagating:
+                raise
+            print('ATS: could not persist run_finished; original error preserved', file=sys.stderr)
+        save_run_report(task_id)
+
+
+def save_run_report(task_id):
+    """Best effort: a report that cannot be written never changes the outcome of the run."""
+    try:
+        name = cleanname(project().get('project', APP.name))
+        path = run_report.write(DATA, name, task_id, intelligence.read_events(DATA / name / 'events'))
+        print('Run report: ' + str(path))
+    except Exception as exc:
+        print('ATS: could not write the run report: ' + str(exc)[:300], file=sys.stderr)
+
+
+def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approved_risk=False,
+               plan_file=None, resume_from=None):
     conf=project()
     risk = intelligence.risk_profile(task)
     if risk['require_human_approval'] and not approved_risk:
@@ -2861,7 +2909,6 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
     if agent != 'auto' and agent not in enabled_agents():
         raise RuntimeError(f'{agent} is disabled. Use .ats agents --enable {agent}')
     agent=select(task) if agent=='auto' else agent
-    task_id=preset_task_id() or str(uuid.uuid4())
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
@@ -2899,10 +2946,10 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
     _run_flags[task_id] = {'task': task, 'high_risk': risk['level'] == 'high'}
     usage_meter.reset_context()
     usage_meter.set_context(task_id=task_id)
-    if not any(executable(name) for name in enabled_agents()):
-        raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
     worktree_created=False
     try:
+        if not any(executable(name) for name in enabled_agents()):
+            raise RuntimeError('No enabled agent CLI found; run .ats agents and install an enabled CLI')
         if resumed:
             record('resumed', 'Restored verified reviewed checkpoint', task_id,
                    source_run=resume_from, completed=resumed['completed'],
@@ -2990,7 +3037,6 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
         else:
             execute(['git','commit','-m','ATS: '+task[:65]],folder)
         print(f'Branch: {branch} | approved: {approved} | workspace: {folder}')
-        phase('finished', task_id, approved=approved, branch=branch, worktree=str(folder))
         if local_mode:
             patch = export_local_patch(folder)
             if patch:
@@ -3001,10 +3047,12 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             else:
                 print('No local patch generated.')
             print('Original project unchanged. GitHub PR unavailable without a project remote.')
-            return
+            phase('finished', task_id, approved=approved, branch=branch, worktree=str(folder))
+            return 'approved' if approved else 'escalated'
         if not approved:
             print('Independent review/checks incomplete: PR publishing blocked; worktree preserved')
-            return
+            phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
+            return 'escalated'
         parts = {}
         for c in history:   # the approving (last) cycle of every part
             if 'subtask' in c:
@@ -3021,22 +3069,28 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
                            f"{conf.get('base_branch', 'main')} without a human decision; worktree preserved")
                 record('escalated', message, task_id, branch=branch, blocking_reasons=[message])
                 print('ATS: ' + message, file=sys.stderr)
-                return
+                phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
+                return 'escalated'
             phase('pr', task_id, branch=branch)
             execute(['git','push','-u','origin',branch],folder)
             if not shutil.which('gh'):
-                print('gh missing: branch pushed but draft PR must be created manually');return
+                print('gh missing: branch pushed but draft PR must be created manually')
+                phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
+                return 'approved'
             base=conf.get('base_branch','main')
             outcome=execute(['gh','pr','create','--draft','--base',base,'--head',branch,'--title','ATS: '+task[:65],
                              '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n{attribution}\nReview/check outcomes in ATS data. Human merge required.'],folder)
             print(outcome.stdout)
             phase('pr_created', task_id, url=outcome.stdout.strip()[-300:])
+        phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
+        return 'approved'
     except AgentUsageExhausted as exc:
         message = str(exc) if isinstance(exc, BothAgentsExhausted) else 'Usage voor beide agents is op'
         print(message, file=sys.stderr)
         record('blocked', message, task_id, branch=branch, resets=exc.resets)
         if worktree_created:
             print('Worktree retained: '+str(folder),file=sys.stderr)
+        return 'blocked'
     except Exception as e:
         record('error',str(e)[:2000],task_id,implementer=agent,branch=branch)
         if worktree_created:
@@ -3058,6 +3112,15 @@ def child_run(argv):
     finally:
         for sig,handler in original.items():signal.signal(sig,handler)
 
+def positive_days(value):
+    try:
+        days = int(value)
+    except ValueError:
+        days = 0
+    if not 1 <= days <= 3650:
+        raise argparse.ArgumentTypeError('--days must be a whole number from 1 to 3650')
+    return days
+
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
@@ -3065,6 +3128,7 @@ def main():
     p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('performance')
+    p=sub.add_parser('report', help='Summarize the run reports of the last days');p.add_argument('--days',type=positive_days,default=7)
     p=sub.add_parser('feedback');p.add_argument('comments_json');p.add_argument('--existing-ids')
     p=sub.add_parser('knowledge-check');p.add_argument('items_json');p.add_argument('relations_json')
     p=sub.add_parser('event');p.add_argument('kind');p.add_argument('summary');p.add_argument('--task')
@@ -3102,6 +3166,9 @@ def main():
         elif args.command=='performance':
             directory = DATA / cleanname(project().get('project', APP.name)) / 'events'
             print(json.dumps(intelligence.performance(intelligence.read_events(directory)),indent=2))
+        elif args.command=='report':
+            name = cleanname(project().get('project', APP.name))
+            print(run_report.table(run_report.recent(DATA, name, args.days), args.days))
         elif args.command=='feedback':
             comments = json.loads(Path(args.comments_json).read_text(encoding='utf-8'))
             ids = json.loads(Path(args.existing_ids).read_text(encoding='utf-8')) if args.existing_ids else []

@@ -43,31 +43,31 @@ def risk_profile(task, paths=()):
 
 
 def performance(events, min_samples=3):
-    """Summarize completed work from task-tagged events, avoiding unverified success claims."""
+    """Use run_finished_v1 totals; revisions are review rounds beyond the first."""
     by_task = defaultdict(list)
     for event in events:
         if event.get("task_id") and event.get("event_type") in (
-            "assigned", "finished", "review_result", "usage", "token_usage"
+            "assigned", "run_finished", "usage", "token_usage"
         ):
-            by_task[event["task_id"]].append(event)
+            by_task[(event.get("project"), event["task_id"])].append(event)
     stats = defaultdict(lambda: {"tasks": 0, "approved": 0, "revisions": 0,
                                  "tokens": 0, "duration_seconds": 0, "samples": 0})
     for event_group in by_task.values():
         assigned = next((e for e in event_group if e["event_type"] == "assigned"), None)
-        finished = next((e for e in event_group if e["event_type"] == "finished"), None)
+        finished = next((e for e in event_group if e["event_type"] == "run_finished"), None)
         if not assigned or not finished:
             continue
         agent = assigned.get("implementer")
         if not agent:
             continue
         task_types = categories(assigned.get("summary", ""))
-        reviews = [e for e in event_group if e["event_type"] == "review_result"]
-        revision_count = max(0, len(reviews) - 1)
+        revision_count = max(0, finished.get("review_rounds", 0) - 1)
         for category in task_types:
             row = stats[(agent, category)]
             row["tasks"] += 1
             row["approved"] += int(finished.get("approved") is True)
             row["revisions"] += revision_count
+            row["duration_seconds"] += finished.get("duration_seconds", 0)
             row["tokens"] += sum(int(e.get("tokens", 0) or 0) for e in event_group
                                  if e["event_type"] in ("usage", "token_usage"))
             row["samples"] += 1

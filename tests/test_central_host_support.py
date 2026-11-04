@@ -130,10 +130,15 @@ class TaskFlowStreamTests(unittest.TestCase):
         sequence = [line['stage'] if line['event_type'] == 'phase' else line['event_type'] for line in lines]
         self.assertEqual(sequence, ['assigned', 'risk_profile', 'implementation', 'budget', 'implementation',
                                     'gate', 'pre_review_gate', 'checks', 'review', 'review_result', 'approved',
-                                    'finished'])
-        finished = lines[-1]
+                                    'finished', 'run_finished'])
+        finished = lines[-2]
         self.assertTrue(finished['approved'])
         self.assertIn('app-ats-' + task_id[:8], finished['worktree'])
+        completion = lines[-1]
+        self.assertTrue(completion['approved'])
+        self.assertEqual(completion['outcome'], 'approved')
+        self.assertEqual(completion['review_rounds'], 1)
+        self.assertGreaterEqual(completion['duration_seconds'], 0)
 
 
 if __name__ == '__main__':
