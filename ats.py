@@ -27,6 +27,7 @@ from ats_modules import context_pack
 from ats_modules import gate as pre_gate
 from ats_modules import knowledge_select
 from ats_modules import review_scope
+from ats_modules import run_report
 from ats_modules import usage as usage_meter
 
 from ats_contract import accepted_event, valid_phase
@@ -795,8 +796,10 @@ def worktree_tree(folder):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             copy = Path(temporary) / 'index'
             source = Path(folder) / index if index and not Path(index).is_absolute() else Path(index or '')
+            # copy2 keeps the index mtime, so git still rehashes files changed in the same second
+            # (racy entries); a fresh mtime would make the tree hash depend on timing.
             if index and source.is_file():
-                shutil.copyfile(source, copy)
+                shutil.copy2(source, copy)
             env = dict(os.environ, GIT_INDEX_FILE=str(copy))
             for args in (['git', 'add', '-A'], ['git', 'write-tree']):
                 result = subprocess.run(args, cwd=folder, env=env, capture_output=True, text=True, check=False)
@@ -2781,6 +2784,17 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
             if not propagating:
                 raise
             print('ATS: could not persist run_finished; original error preserved', file=sys.stderr)
+        save_run_report(task_id)
+
+
+def save_run_report(task_id):
+    """Best effort: a report that cannot be written never changes the outcome of the run."""
+    try:
+        name = cleanname(project().get('project', APP.name))
+        path = run_report.write(DATA, name, task_id, intelligence.read_events(DATA / name / 'events'))
+        print('Run report: ' + str(path))
+    except Exception as exc:
+        print('ATS: could not write the run report: ' + str(exc)[:300], file=sys.stderr)
 
 
 def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approved_risk=False,
@@ -3001,6 +3015,15 @@ def child_run(argv):
     finally:
         for sig,handler in original.items():signal.signal(sig,handler)
 
+def positive_days(value):
+    try:
+        days = int(value)
+    except ValueError:
+        days = 0
+    if not 1 <= days <= 3650:
+        raise argparse.ArgumentTypeError('--days must be a whole number from 1 to 3650')
+    return days
+
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
@@ -3008,6 +3031,7 @@ def main():
     p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('performance')
+    p=sub.add_parser('report', help='Summarize the run reports of the last days');p.add_argument('--days',type=positive_days,default=7)
     p=sub.add_parser('feedback');p.add_argument('comments_json');p.add_argument('--existing-ids')
     p=sub.add_parser('knowledge-check');p.add_argument('items_json');p.add_argument('relations_json')
     p=sub.add_parser('event');p.add_argument('kind');p.add_argument('summary');p.add_argument('--task')
@@ -3045,6 +3069,9 @@ def main():
         elif args.command=='performance':
             directory = DATA / cleanname(project().get('project', APP.name)) / 'events'
             print(json.dumps(intelligence.performance(intelligence.read_events(directory)),indent=2))
+        elif args.command=='report':
+            name = cleanname(project().get('project', APP.name))
+            print(run_report.table(run_report.recent(DATA, name, args.days), args.days))
         elif args.command=='feedback':
             comments = json.loads(Path(args.comments_json).read_text(encoding='utf-8'))
             ids = json.loads(Path(args.existing_ids).read_text(encoding='utf-8')) if args.existing_ids else []
