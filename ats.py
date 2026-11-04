@@ -970,8 +970,9 @@ def isolated_env(cwd=None):
     if _isolated_state is None:
         _isolated_state = tempfile.mkdtemp(prefix='ats-test-state-')
     # One state folder per worktree: the two parts of a parallel pair run their tests at the same time.
-    state = Path(_isolated_state) / hashlib.sha256(os.path.abspath(str(cwd or '.')).encode()).hexdigest()[:12]
-    state.mkdir(parents=True, exist_ok=True)
+    # os.path, not Path: tests patch os.name, and Path then picks the wrong flavour.
+    state = os.path.join(_isolated_state, hashlib.sha256(os.path.abspath(str(cwd or '.')).encode()).hexdigest()[:12])
+    os.makedirs(state, exist_ok=True)
     env = {key: value for key, value in os.environ.items() if not key.startswith('ATS_')}
     env.update(ATS_DATA_REPO='none', ATS_STATE_DIR=str(state))
     return env
