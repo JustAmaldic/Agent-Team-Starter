@@ -958,7 +958,7 @@ def agent_command(agent, *args):
 _isolated_state = None
 
 
-def isolated_env():
+def isolated_env(cwd=None):
     """The environment for test commands and agent CLIs.
 
     Without ATS's own control variables (ATS_EVENTS_FILE, ATS_TASK_ID, ...): a project's tests, or
@@ -969,8 +969,11 @@ def isolated_env():
     global _isolated_state
     if _isolated_state is None:
         _isolated_state = tempfile.mkdtemp(prefix='ats-test-state-')
+    # One state folder per worktree: the two parts of a parallel pair run their tests at the same time.
+    state = Path(_isolated_state) / hashlib.sha256(str(Path(cwd or '.').resolve()).encode()).hexdigest()[:12]
+    state.mkdir(parents=True, exist_ok=True)
     env = {key: value for key, value in os.environ.items() if not key.startswith('ATS_')}
-    env.update(ATS_DATA_REPO='none', ATS_STATE_DIR=_isolated_state)
+    env.update(ATS_DATA_REPO='none', ATS_STATE_DIR=str(state))
     return env
 
 
@@ -990,7 +993,7 @@ def run_check(command, cwd, timeout=900):
     try:
         return subprocess.run(argv, cwd=cwd, text=True, encoding='utf-8', errors='replace',
                               capture_output=True, check=False, timeout=timeout,
-                              shell=use_shell, env=isolated_env())
+                              shell=use_shell, env=isolated_env(cwd))
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout if isinstance(exc.stdout, str) else ''
         return subprocess.CompletedProcess(argv, 124, output or '',
@@ -1085,7 +1088,7 @@ def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None, ren
     `render` turns a stdout line into what is shown live (None hides it), e.g. JSON lines into text;
     the full raw output is returned either way.
     """
-    process = subprocess.Popen(command, cwd=cwd, env=isolated_env(), stdout=subprocess.PIPE,
+    process = subprocess.Popen(command, cwd=cwd, env=isolated_env(cwd), stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True,
                                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                                encoding='utf-8', errors='replace', bufsize=1)

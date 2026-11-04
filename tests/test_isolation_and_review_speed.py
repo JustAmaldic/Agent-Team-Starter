@@ -34,6 +34,11 @@ class IsolationTests(unittest.TestCase):
                                         '.', quiet=True)
         self.assertEqual(result.stdout.strip(), 'None')
 
+    def test_parallel_worktrees_get_their_own_state(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            self.assertNotEqual(ats.isolated_env(a)['ATS_STATE_DIR'], ats.isolated_env(b)['ATS_STATE_DIR'])
+            self.assertEqual(ats.isolated_env(a)['ATS_STATE_DIR'], ats.isolated_env(a)['ATS_STATE_DIR'])
+
     def test_data_repo_none_means_no_private_data(self):
         with patch.dict(os.environ, {'ATS_DATA_REPO': 'none'}):
             self.assertIsNone(ats.private_data_repo())
