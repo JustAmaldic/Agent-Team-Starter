@@ -3028,10 +3028,14 @@ def recheck_source(source_id, agent):
     folder = (APP.parent / f'{APP.name}-ats-{source_id[:8]}').resolve()
     if not folder.is_dir():
         raise RuntimeError('The kept worktree of that run no longer exists')
-    if execute(['git', 'rev-parse', '--show-toplevel'], folder, check=False).stdout.strip() != str(folder):
+    # Paths compared resolved: git prints forward slashes and long names on Windows.
+    top = execute(['git', 'rev-parse', '--show-toplevel'], folder, check=False).stdout.strip()
+    if not top or Path(top).resolve() != folder:
         raise RuntimeError('The kept folder is not a Git worktree')
-    roots = execute(['git', 'worktree', 'list', '--porcelain'], APP).stdout.splitlines()
-    if 'worktree ' + str(folder) not in roots:
+    roots = {Path(line[len('worktree '):]).resolve()
+             for line in execute(['git', 'worktree', 'list', '--porcelain'], APP).stdout.splitlines()
+             if line.startswith('worktree ')}
+    if folder not in roots:
         raise RuntimeError('The kept worktree is not attached to this project')
     branch = execute(['git', 'symbolic-ref', '--quiet', '--short', 'HEAD'], folder, check=False).stdout.strip()
     if not branch.startswith('ats/'):
