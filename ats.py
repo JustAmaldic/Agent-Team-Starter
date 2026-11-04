@@ -26,6 +26,7 @@ from ats_modules import budget as budgets
 from ats_modules import context_pack
 from ats_modules import gate as pre_gate
 from ats_modules import knowledge_select
+from ats_modules import lenient_json
 from ats_modules import plan_learning
 from ats_modules import review_scope
 from ats_modules import review_handoff
@@ -672,7 +673,7 @@ def parse_marked_json(output, marker):
     if not matches:
         return []
     try:
-        entries = json.loads(matches[-1])
+        entries = lenient_json.loads(matches[-1])
     except ValueError:
         return []
     return entries if isinstance(entries, list) else []
@@ -2200,7 +2201,7 @@ def subtask_plan(output):
             raw = dag_lines[-1].split('ATS_DAG_JSON:', 1)[1].strip()
             if len(raw) > 28000:
                 raise ValueError('DAG marker is too large')
-            return dag_planning.validate_dag(json.loads(raw))
+            return dag_planning.validate_dag(lenient_json.loads(raw))
         except (ValueError, TypeError) as exc:
             raise RuntimeError('Invalid task DAG: ' + str(exc)) from exc
     lines = re.findall(r'^\s*ATS_SUBTASKS_JSON:[^\r\n]*$', output, re.MULTILINE)
@@ -2270,6 +2271,9 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'before returning JSON count tasks, keep no more than this many, and verify every '
         'dependency and owned file. A later correction needs another expensive agent call. '
         'Return exactly ONE LINE starting ATS_DAG_JSON: followed by valid JSON. '
+        'Keep every title short (one or two sentences, under 300 characters): what the part delivers '
+        'and how it is tested; the implementer reads the full task anyway. Inside JSON strings never '
+        'write a bare double quote: copy quoted words from the task with single quotes (\'Nieuwe run\'). '
         'The JSON object has plan_version=2 and tasks (2-20 objects). Each task contains '
         'id, title, depends_on (list of prior task ids), and owned_paths (explicit source '
         'files or directories). Example: ATS_DAG_JSON: '
