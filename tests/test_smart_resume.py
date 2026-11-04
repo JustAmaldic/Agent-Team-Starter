@@ -78,7 +78,7 @@ class SmartResumeTests(unittest.TestCase):
                  patch.object(ats, "record"):
                 ok, _, _, _ = ats.subtask_flow(
                     "Build ARC", plan, "new-run", root, "ats/test",
-                    "codex", set(), {}, resumed=resumed)
+                    "codex", set(), {"integration_review": False}, resumed=resumed)
             self.assertTrue(ok)
             self.assertEqual([call.args[2] for call in run_part.call_args_list], [2, 3])
 

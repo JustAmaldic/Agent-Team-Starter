@@ -35,6 +35,7 @@ class ParallelPartsTests(unittest.TestCase):
         self.lock = threading.Lock()
         self.running = 0
         self.overlap = False
+        self.integration = False   # covered in test_smart_parallel.py
 
     def tearDown(self):
         self.temp.cleanup()
@@ -70,7 +71,8 @@ class ParallelPartsTests(unittest.TestCase):
              patch.object(ats, 'phase'), patch.object(ats, 'capture_learning_proposals'), \
              patch.object(ats, 'codex_preflight'), patch.object(ats, 'knowledge_context', return_value=''):
             return ats.subtask_flow('big task', plan, 'tid', self.folder, 'ats/b', 'codex',
-                                    ats.UnavailableAgents(), {'test_commands': [PASS], 'max_revisions': 0},
+                                    ats.UnavailableAgents(), {'test_commands': [PASS], 'max_revisions': 0,
+                                                              'integration_review': self.integration},
                                     quiet=True)
 
     def kinds(self):
