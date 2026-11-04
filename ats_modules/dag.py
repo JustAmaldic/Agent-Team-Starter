@@ -76,7 +76,10 @@ def validate_dag(plan):
     return {"plan_version": 2, "tasks": [
         {"id": n["id"], "title": n["title"].strip(), "depends_on": list(n.get("depends_on", [])),
          "owned_paths": list(n["owned_paths"]),
-         **({key: list(n[key]) for key in ("contracts_provided", "contracts_required") if key in n})}
+         **({key: list(n[key]) for key in ("contracts_provided", "contracts_required") if key in n}),
+         # An existing file or screen whose layout and components a UI part should follow.
+         **({"style_reference": n["style_reference"].strip()[:200]}
+            if isinstance(n.get("style_reference"), str) and n["style_reference"].strip() else {})}
         for n in nodes
     ]}
 

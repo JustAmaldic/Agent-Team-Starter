@@ -206,6 +206,8 @@ Project settings in `.ats-project.json` (all optional):
 | --- | --- | --- |
 | `max_plan_parts` | `5` | preferred maximum of parts in a plan; a longer plan is asked once to merge related steps |
 | `integration_review` | `true` | one review of the combined change after parallel or more than two parts |
+| `style_gate` | `true` | gate check on literal colours and fonts in added UI lines (projects with design tokens) |
+| `required_tools` | detected | programs the tests need, checked before agents start (`node` for JavaScript tests) |
 | `python_env` | `.venv` or `venv` when present | the project's virtualenv for test commands and agents (relative to the project folder, or absolute) |
 | `environment_check` | `true` | before any agent starts, check that the requirement files are installed in the Python the test commands use |
 | `pre_review_gate` | `true` | cheap checks before the review (see POLICY.md) |

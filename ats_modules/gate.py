@@ -17,7 +17,7 @@ import shlex
 import shutil
 from pathlib import Path, PurePosixPath
 
-from . import test_env
+from . import style_check, test_env
 
 PASSED, FAILED, SKIPPED, UNAVAILABLE = 'passed', 'failed', 'skipped', 'unavailable'
 FAST, TARGETED = 'fast', 'targeted'
@@ -283,6 +283,8 @@ def run_gate(conf, folder, diff, tracked, run):
     timeout = int(conf.get('gate_timeout', 300))
     paths = changed_paths(diff)
     results = [conflict_markers(diff), secrets(diff), python_syntax(folder, paths), json_syntax(folder, paths)]
+    if conf.get('style_gate', True):
+        results.append(style_check.gate_result(folder, added_lines(diff), result, PASSED, FAILED, SKIPPED))
     results += linters(folder, paths, conf, run, timeout)
     if failed(results):
         results.append(result('targeted tests', TARGETED, SKIPPED, 'fast checks failed first'))

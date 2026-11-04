@@ -184,3 +184,24 @@ def missing_module(output: str, folder: Path | None = None) -> str | None:
             if (base / top).is_dir() or (base / f'{top}.py').is_file():
                 return None
     return top
+
+
+def required_tools(conf: dict, root: Path) -> list[str]:
+    """Programs the tests need besides Python: `required_tools`, or `node` when the project has
+    JavaScript tests (tests/*.cjs, *.test.js, or a package.json). A test that skips itself when the
+    tool is missing would otherwise pass unnoticed."""
+    configured = conf.get('required_tools')
+    if isinstance(configured, list):
+        return [str(t) for t in configured if isinstance(t, str) and t.strip()]
+    root = Path(root)
+    tests = root / 'tests'
+    if (root / 'package.json').is_file() or (tests.is_dir() and (
+            any(tests.glob('*.cjs')) or any(tests.glob('*.test.js')) or any(tests.glob('*.mjs')))):
+        return ['node']
+    return []
+
+
+def missing_tools(tools, base_env: dict, env: Path | None) -> list[str]:
+    import shutil
+    path = environ(base_env, env).get('PATH')
+    return [tool for tool in tools if shutil.which(tool, path=path) is None]
