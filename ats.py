@@ -818,7 +818,7 @@ def worktree_tree(folder):
             copy = Path(temporary) / 'index'
             source = Path(folder) / index if index and not Path(index).is_absolute() else Path(index or '')
             if index and source.is_file():
-                shutil.copyfile(source, copy)
+                shutil.copy2(source, copy)   # keep the index mtime, or git's racy-file check can miss a same-second edit
             env = dict(os.environ, GIT_INDEX_FILE=str(copy))
             for args in (['git', 'add', '-A'], ['git', 'write-tree']):
                 result = subprocess.run(args, cwd=folder, env=env, capture_output=True, text=True, check=False)
