@@ -16,10 +16,44 @@ nothing new never closes them silently: only a fix the reviewer confirms does.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+from pathlib import Path
 
 ATTENTION = ('BLOCKER', 'MAJOR', 'MINOR')
-STILL_OPEN = ('open', 'deferred')
+STILL_OPEN = ('open', 'deferred', 'reopened')
+STOP = {'that', 'this', 'with', 'from', 'when', 'into', 'than', 'then', 'should', 'would', 'which', 'there'}
+
+
+def _line_text(folder, path, line):
+    """The code on the reported line, without whitespace: survives the line moving up or down."""
+    match = re.match(r'(\d+)', str(line or ''))
+    if folder is None or not path or not match:
+        return ''
+    try:
+        lines = (Path(folder) / path).read_text(encoding='utf-8', errors='replace').splitlines()
+    except (OSError, ValueError):
+        return ''
+    number = int(match.group(1))
+    return ''.join(lines[number - 1].split()) if 1 <= number <= len(lines) else ''
+
+
+def fingerprint(finding, folder=None):
+    """A stable id for a finding across review rounds, independent of the id the reviewer chose:
+    the file plus the code on the reported line, or (without a usable line) the file plus the
+    main words of the summary."""
+    path = str(finding.get('file') or '')
+    context = _line_text(folder, path, finding.get('line'))
+    if not context:
+        words = sorted({w for w in re.findall(r'[a-z][a-z0-9_]{3,}', str(finding.get('summary', '')).lower())
+                        if w not in STOP})[:8]
+        context = ' '.join(words)
+    return hashlib.sha1(f'{path}|{context}'.encode('utf-8')).hexdigest()[:12]
+
+
+def with_fingerprints(findings, folder=None):
+    return [dict(f, fingerprint=f.get('fingerprint') or fingerprint(f, folder)) for f in findings]
 MAX_NOTE = 2500
 
 
@@ -53,19 +87,28 @@ def build(history, plan=None):
         number = cycles[0].get('subtask')
         node = _node_id(plan, number) if where.startswith('part') else where
         last = cycles[-1]
+        keys = {}   # fingerprint -> key: a finding keeps its key when the reviewer renames it
         for index, cycle in enumerate(cycles):
             answers = {r.get('id'): r for r in cycle.get('responses') or []}
             for finding in cycle.get('findings') or []:
                 kind = 'security' if str(finding.get('id', '')).startswith('S') else 'review'
-                key = f"{where}/{kind}/{finding.get('id')}"
+                mark = finding.get('fingerprint')
+                key = keys.get(mark) if mark else None
+                key = key or f"{where}/{kind}/{finding.get('id')}"
+                if mark:
+                    keys.setdefault(mark, key)
                 answer = answers.get(finding.get('id')) or {}
+                earlier = entries.get(key)
                 status = 'open' if cycle is last else (answer.get('status') or 'open')
+                if earlier and earlier['status'] == 'fixed' and earlier.get('cycle', -1) < index:
+                    status = 'reopened'   # answered as fixed, and a later review finds it again
                 entries[key] = {
                     'key': key, 'part': node, 'severity': finding.get('severity'),
                     'file': finding.get('file') or '', 'line': finding.get('line') or '',
                     'summary': finding.get('summary') or '', 'status': status,
                     'owner': _owner(finding.get('file'), plan, node),
-                    'note': answer.get('note') or ''}
+                    'note': answer.get('note') or '', 'cycle': index,
+                    'fingerprint': mark or ''}
             # A later review of the same part that lists the finding again overwrites it (same key).
     return list(entries.values())
 

@@ -17,6 +17,15 @@ from __future__ import annotations
 import re
 from collections import Counter
 
+THEMES = (
+    ('missing or weak tests', r'\btests?\b|coverage|regression'),
+    ('error handling and messages', r'error|exception|oserror|http 500|traceback|fails? (silently|with)'),
+    ('edge cases (empty, missing, limits)', r'\bempty\b|\bnone\b|\bnull\b|edge|boundar|unicode|overflow|\blimit|missing'),
+    ('style and UI consistency', r'\bcss\b|style|class|colou?r|font|layout|\bui\b|spacing|inconsistent'),
+    ('security and secrets', r'secret|token|auth|csrf|injection|redos|backtrack|xss|traversal'),
+    ('docs and changelog out of date', r'changelog|\bdocs?\b|readme|documentation|stale'),
+)
+
 CONFLICT_LIST = re.compile(r'conflicts in: ([^\n]+?)(?:\. |\.$|$)')
 MAX_FILES = 8
 
@@ -40,6 +49,7 @@ def history(events):
     """What earlier runs of this project tell about dividing work."""
     parallel, base, drift, integration = Counter(), Counter(), Counter(), Counter()
     pairs, idle, runs = 0, [], set()
+    themes, first_reviews, first_rejected = Counter(), 0, 0
     for event in events:
         kind = event.get('event_type')
         if kind == 'task_split' and event.get('task_id'):
@@ -51,6 +61,17 @@ def history(events):
             drift.update(set(_files(event.get('paths'))))
         elif kind == 'integration_review':
             integration.update(set(_files(event.get('files'))))
+        elif kind == 'review_result':
+            if event.get('cycle') == 0 and event.get('review_kind') not in ('integration', 'update', 'merge'):
+                first_reviews += 1
+                first_rejected += not event.get('approved')
+            for finding in event.get('findings') or []:
+                if isinstance(finding, dict) and finding.get('severity') in ('BLOCKER', 'MAJOR', 'MINOR'):
+                    text = str(finding.get('summary', '')).lower()
+                    for theme, pattern in THEMES:
+                        if re.search(pattern, text):
+                            themes[theme] += 1
+                            break
         elif kind == 'wave_timing':
             pairs += 1
             try:
@@ -59,7 +80,8 @@ def history(events):
                 pass
     return {'runs': len(runs), 'pairs': pairs, 'parallel_conflicts': parallel, 'base_conflicts': base,
             'drift': drift, 'integration': integration,
-            'idle_seconds': round(sum(idle) / len(idle)) if idle else None}
+            'idle_seconds': round(sum(idle) / len(idle)) if idle else None,
+            'themes': themes, 'first_reviews': first_reviews, 'first_rejected': first_rejected}
 
 
 def shared_files(hist):
@@ -94,3 +116,22 @@ def planner_note(hist):
             'preferably a final integration node, and keep parallel nodes out of them: ATS blocks a '
             'parallel part that edits a shared file it does not own. When the faster part waits long, '
             'balance the sizes of paired parts.')
+
+
+def self_check_note(hist):
+    """For the builder only (never the reviewer): check your own work against the reviewer's rubric
+    before handing it in, with the findings reviewers in this project gave most often first. The
+    independent review stays exactly as strict."""
+    lines = ['\nSELF-CHECK BEFORE YOU FINISH (the independent reviewer checks the same things; this does not '
+             'replace the review): run the tests for what you changed; handle empty, missing and failing input '
+             'with a clear message; follow the existing style and components; update the tests and docs that '
+             'describe the change; leave no TODOs, debug output or unrelated edits; answer the acceptance '
+             'criteria of the task one by one.']
+    themes = (hist or {}).get('themes') or Counter()
+    if themes:
+        lines.append('Reviewers in this project most often found: '
+                     + ', '.join(f'{name} ({count}x)' for name, count in themes.most_common(4)) + '. Check those first.')
+    total, rejected = (hist or {}).get('first_reviews') or 0, (hist or {}).get('first_rejected') or 0
+    if total >= 3:
+        lines.append(f'{rejected} of the last {total} first reviews asked for changes.')
+    return ' '.join(lines)

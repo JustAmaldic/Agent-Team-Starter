@@ -207,16 +207,79 @@ def render_codex_line(line: str) -> str | None:
     return None
 
 
+def _object(line: str):
+    stripped = line.strip()
+    if not (stripped.startswith('{') and stripped.endswith('}')):
+        return None
+    try:
+        value = json.loads(stripped)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def render_claude_line(line: str) -> str | None:
-    """Claude prints a single result object at the end; show its answer instead of the JSON."""
-    parsed = parse_claude(line)
-    if parsed is None:
+    """Claude prints a result object at the end (json), or one object per step (stream-json);
+    show the answer and the steps instead of the JSON."""
+    value = _object(line)
+    if value is None:
         return line
-    return parsed['text'] + ('\n' if not parsed['text'].endswith('\n') else '')
+    if value.get('type') == 'result':
+        parsed = parse_claude(line)
+        text = parsed['text'] if parsed else ''
+        return text + ('\n' if not text.endswith('\n') else '')
+    step = activity_claude(line)
+    return (step['text'] + '\n') if step else None
+
+
+def _clip(text, limit=300):
+    text = ' '.join(str(text or '').split())
+    return text[:limit]
+
+
+def activity_codex(line: str):
+    """One step of `codex exec --json` as {kind, text}: a command, an edit or a message. None otherwise."""
+    event = _object(line)
+    if not event:
+        return None
+    item = event.get('item') if isinstance(event.get('item'), dict) else {}
+    kind = event.get('type')
+    if kind == 'item.started' and item.get('type') == 'command_execution':
+        return {'kind': 'command', 'text': _clip(item.get('command'))}
+    if kind == 'item.completed' and item.get('type') == 'file_change':
+        changes = item.get('changes') if isinstance(item.get('changes'), list) else []
+        paths = [str(c.get('path', '')) for c in changes if isinstance(c, dict)]
+        return {'kind': 'edit', 'text': _clip(', '.join(paths)), 'paths': paths[:20]}
+    if kind == 'item.completed' and item.get('type') in ('agent_message', 'assistant_message'):
+        return {'kind': 'message', 'text': _clip(item.get('text'))}
+    return None
+
+
+def activity_claude(line: str):
+    """One step of `claude -p --output-format stream-json --verbose`: a tool call or a message."""
+    event = _object(line)
+    if not event or event.get('type') != 'assistant':
+        return None
+    message = event.get('message') if isinstance(event.get('message'), dict) else {}
+    for part in message.get('content') or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get('type') == 'tool_use':
+            data = part.get('input') if isinstance(part.get('input'), dict) else {}
+            name = str(part.get('name') or '')
+            if name in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
+                return {'kind': 'edit', 'text': _clip(data.get('file_path')), 'paths': [str(data.get('file_path', ''))]}
+            if name == 'Bash':
+                return {'kind': 'command', 'text': _clip(data.get('command'))}
+            return {'kind': 'tool', 'text': _clip(name + ' ' + str(data.get('file_path') or data.get('pattern') or ''))}
+        if part.get('type') == 'text' and part.get('text'):
+            return {'kind': 'message', 'text': _clip(part.get('text'))}
+    return None
 
 
 PARSERS = {'claude': parse_claude, 'codex': parse_codex}
 RENDERERS = {'claude': render_claude_line, 'codex': render_codex_line}
+ACTIVITY = {'claude': activity_claude, 'codex': activity_codex}
 
 
 # ---------------------------------------------------------------- sessions (implementer only)

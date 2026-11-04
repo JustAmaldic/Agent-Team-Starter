@@ -485,16 +485,24 @@ def emit(item):
 
 
 def phase(stage, task_id, **fields):
-    """Live-only stage marker (not stored as an event file)."""
+    """Stage marker: live for the app (event_type phase) and stored as a phase_changed event file, so
+    a host that restarts can rebuild where every run was from the event files alone."""
     if not valid_phase(stage):
         raise ValueError('Unknown ATS event phase: ' + str(stage))
     # Agent calls in this thread are metered against this task, part and review round.
     usage_meter.set_context(task_id=task_id, subtask=fields.get('subtask'), cycle=fields.get('cycle'))
     emit(dict(timestamp=dt.datetime.now(dt.timezone.utc).isoformat(), task_id=task_id,
               event_type='phase', stage=stage, **fields))
+    if os.environ.get('ATS_PERSIST_PHASES', '1') != '0':
+        plain = {k: v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
+                 for k, v in fields.items() if k not in ('stage', 'live')}
+        try:
+            record('phase_changed', stage, task_id, stage=stage, live=False, **plain)
+        except (OSError, ValueError, RuntimeError):
+            pass   # the live marker went out; a failing write never stops the task
 
 
-def record(kind, summary, task=None, **fields):
+def record(kind, summary, task=None, live=True, **fields):
     conf = project()
     name = cleanname(conf.get('project', APP.name))
     target = DATA / name / 'events'
@@ -511,7 +519,8 @@ def record(kind, summary, task=None, **fields):
         with RUN_PROGRESS_LOCK:
             if task in _run_progress:
                 _run_progress[task] += 1
-    emit(item)
+    if live:
+        emit(item)
     return item
 
 KNOWLEDGE_KINDS = {'finding', 'feedback', 'lesson', 'rule', 'decision', 'pattern'}
@@ -1138,7 +1147,8 @@ def install_agents():
     print('Enabled agents ready.', flush=True)
 
 
-def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None, render=None):
+def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None, render=None, activity=None,
+                   agent=None):
     """Stream both process pipes while retaining full output for ATS checks.
 
     `stdin_text` (the agent prompt) is written to the process's stdin and then closed.
@@ -1150,10 +1160,17 @@ def stream_command(command, cwd, timeout=1800, quiet=False, stdin_text=None, ren
                                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                                encoding='utf-8', errors='replace', bufsize=1)
     chunks = {'stdout': [], 'stderr': []}
+    where = dict(usage_meter.context())   # the reader threads have no context of their own
     def reader(pipe, key, target):
         try:
             for line in iter(pipe.readline, ''):
                 chunks[key].append(line)
+                if activity and key == 'stdout' and where.get('task_id'):
+                    step = activity(line)
+                    if step:   # live only (agent_activity): what the agent is doing right now
+                        emit(dict(timestamp=dt.datetime.now(dt.timezone.utc).isoformat(), task_id=where['task_id'],
+                                  event_type='agent_activity', agent=agent, subtask=where.get('subtask'),
+                                  purpose=where.get('purpose'), **step))
                 if not quiet:
                     shown = render(line) if render and key == 'stdout' else line
                     if shown:
@@ -1308,7 +1325,10 @@ def agent_cli_command(agent, model=None, structured=False, resume=None):
     if model:
         command.extend(['--model', model])
     if agent == 'claude' and structured:
-        command += ['--output-format', 'json']
+        # stream-json (opt-in, ATS_CLAUDE_STREAM=1) shows each step live; the final result object,
+        # and so the parsed answer, is the same as with json.
+        command += (['--output-format', 'stream-json', '--verbose'] if os.environ.get('ATS_CLAUDE_STREAM') == '1'
+                    else ['--output-format', 'json'])
         if resume:
             command += ['--resume', resume]
     return command
@@ -1350,7 +1370,8 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementatio
     while True:
         p = stream_command(command, cwd, timeout=1800, quiet=quiet,
                            stdin_text=None if agent == 'opencode' else prompt,
-                           **({'render': usage_meter.RENDERERS[agent]} if structured else {}))
+                           **({'render': usage_meter.RENDERERS[agent], 'activity': usage_meter.ACTIVITY.get(agent),
+                               'agent': agent} if structured else {}))
         parsed = usage_meter.PARSERS[agent](p.stdout) if structured else None
         out = (parsed['text'] if parsed else (p.stdout or '')) + '\n' + (p.stderr or '')
         if structured and p.returncode and UNSUPPORTED_FLAG.search((p.stdout or '') + (p.stderr or '')):
@@ -2114,7 +2135,8 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             print(f'ATS: reviewer {reviewer} changed files in review-only mode; reverted: '
                   + ', '.join(tampered[:10]), file=sys.stderr)
         verdict = parse_verdict(review)
-        findings = floored(normalize_findings(parse_marked_json(review, 'ATS_FINDINGS_JSON')), task_id, context)
+        findings = findings_ledger.with_fingerprints(
+            floored(normalize_findings(parse_marked_json(review, 'ATS_FINDINGS_JSON')), task_id, context), folder)
         trespass = reserved_changes(full_stats['files'], reserved_paths, owned_paths)
         if trespass:
             # Enforced before the merge: a parallel part that edits its sibling's (or a learned shared)
@@ -2148,7 +2170,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                 reasons = [('security pass: ' + r) for r in evaluate_approval(
                     sec_verdict, checks, sec_findings, [], reviewer, implementer, conf,
                     tampered=bool(touched), fresh_same_provider=same_provider)]
-            findings = findings + sec_findings
+            findings = findings + findings_ledger.with_fingerprints(sec_findings, folder)
             security = {'verdict': sec_verdict, 'findings': len(sec_findings)}
             review = review + '\n\n--- Security and data-safety pass ---\n' + second
             if reasons:
@@ -2560,7 +2582,8 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
               'items, or ATS_LEARNINGS_JSON: [] when there are none.\n\n'
               f'Overall plan: {json.dumps(plan, ensure_ascii=False)}\n'
               f'Implement ONLY this part: {description}\n' + together + ownership
-              + contract_notes + previous_note + part_context(folder, conf, part, owned))
+              + contract_notes + previous_note + part_context(folder, conf, part, owned)
+              + plan_learning.self_check_note(plan_history()))
     existing_changes = False
     if resume_work:
         base_tree = execute(['git', 'rev-parse', str(base) + '^{tree}'], folder).stdout.strip()
@@ -3135,6 +3158,19 @@ def provided_task_plan(path, task):
     return plan
 
 
+def base_moved(start, expect_base):
+    """A blocking reason when the base branch moved since the caller made its preflight or plan."""
+    if not expect_base:
+        return None
+    if not re.fullmatch(r'[0-9a-f]{7,40}', str(expect_base)):
+        return 'Invalid --expect-base: give the commit SHA the plan was made on'
+    head = execute(['git', 'rev-parse', start], check=False).stdout.strip()
+    if head.startswith(expect_base) or expect_base.startswith(head) and head:
+        return None
+    return (f'The base branch moved since the plan was made: it was {expect_base[:12]}, it is now {head[:12]}. '
+            'Nothing was started. Check the plan against the new code (plan again), then start the run.')
+
+
 def fresh_base(conf):
     """The ref a new task starts from: origin/<base_branch> right after a fetch.
 
@@ -3252,7 +3288,7 @@ def recheck_source(source_id, agent):
 
 
 def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None,
-              resume_from=None, recheck_from=None):
+              resume_from=None, recheck_from=None, expect_base=None):
     """Persist run_finished_v1 once, after all work, including base updates and publishing."""
     task_id = preset_task_id() or str(uuid.uuid4())
     started = time.monotonic()
@@ -3262,7 +3298,7 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
     try:
         outcome = _task_flow(task, agent, push, task_id, quiet=quiet, parallel=parallel,
                              approved_risk=approved_risk, plan_file=plan_file, resume_from=resume_from,
-                             recheck_from=recheck_from)
+                             recheck_from=recheck_from, expect_base=expect_base)
     except (KeyboardInterrupt, SystemExit):
         outcome = 'interrupted'
         raise
@@ -3292,7 +3328,7 @@ def save_run_report(task_id):
 
 
 def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approved_risk=False,
-               plan_file=None, resume_from=None, recheck_from=None):
+               plan_file=None, resume_from=None, recheck_from=None, expect_base=None):
     conf=project()
     risk = intelligence.risk_profile(task)
     if risk['require_human_approval'] and not approved_risk:
@@ -3370,14 +3406,25 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
         elif resumed:
             record('resumed', 'Restored verified reviewed checkpoint', task_id,
                    source_run=resume_from, completed=resumed['completed'],
-                   completed_nodes=resumed.get('completed_nodes', []), branch=branch)
+                   completed_nodes=resumed.get('completed_nodes', []), branch=branch,
+                   plan_changed=bool(resumed.get('plan_changed')), replanned=resumed.get('replanned', []),
+                   routing_changed=bool(resumed.get('routing_changed')))
             print(f'ATS: resuming {resumed["completed"]} reviewed parts on {branch}.', flush=True)
         elif local_mode:
             make_local_workspace(folder, branch)
             print('ATS: project has no Git repository; using an isolated local snapshot.', flush=True)
         else:
             start = fresh_base(conf)
+            moved = base_moved(start, expect_base)
+            if moved:
+                # The plan (or preflight) was made on other code: never let agents work on code nobody looked at.
+                record('blocked', moved, task_id, branch=branch, blocking_reasons=[moved])
+                print('ATS: ' + moved, file=sys.stderr)
+                phase('finished', task_id, approved=False, branch=branch)
+                return 'blocked'
             execute(['git','worktree','add','-b',branch,str(folder),start])
+            record('base_commit', 'Task branch starts here', task_id, live=False, branch=branch, ref=start,
+                   commit=execute(['git', 'rev-parse', start], check=False).stdout.strip())
             print(f'ATS: task branch starts from {start}.', flush=True)
         worktree_created=True
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
@@ -3420,6 +3467,7 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
                   "Do not commit, push, merge, deploy, trade, expose secrets or modify .ats; "
                   "ATS commits your work after the review."
                   + part_context(folder, conf, task)
+                  + plan_learning.self_check_note(plan_history())
                   + '\nAt the end include ONE LINE ATS_LEARNINGS_JSON: '
                   + '[{"kind":"finding","title":"<title>","observation":"<observation>",'
                   + '"evidence":"<evidence>"}] (replace the placeholders, or use []). '
@@ -3453,6 +3501,12 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
         message = str(exc) if isinstance(exc, BothAgentsExhausted) else 'Usage voor beide agents is op'
         print(message, file=sys.stderr)
         record('blocked', message, task_id, branch=branch, resets=exc.resets)
+        saved = checkpoints.read_checkpoint(DATA, task_id) if worktree_created else None
+        if saved and (saved.get('completed') or saved.get('pending')):
+            # Reviewed work is safe in the checkpoint: the run can continue after the reset (Smart Resume).
+            record('usage_paused', 'Paused at the last reviewed checkpoint until the usage limit resets',
+                   task_id, branch=branch, resets=exc.resets, completed=saved.get('completed', 0),
+                   worktree=str(folder), resumable=True)
         if worktree_created:
             print('Worktree retained: '+str(folder),file=sys.stderr)
         return 'blocked'
@@ -3539,6 +3593,74 @@ def finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer
     return 'approved'
 
 
+AGENT_CHECK_REVIEW = (
+    'You review a tiny change in this repository. calc.py defines add(a, b) but returns a - b. '
+    'Do not edit any file. Report the bug as one finding and request changes. Output exactly these two '
+    'lines at the end:\nATS_FINDINGS_JSON: [{"id":"F1","severity":"MAJOR","file":"calc.py","line":"2",'
+    '"summary":"add returns a - b instead of a + b"}]\nVERDICT: CHANGES_REQUESTED')
+AGENT_CHECK_RESPONSE = (
+    'Fix calc.py so add(a, b) returns a + b. Change nothing else. End with exactly this line:\n'
+    'ATS_RESPONSES_JSON: [{"id":"F1","status":"fixed","note":"add returns a + b","reference":"calc.py:2"}]')
+
+
+def agent_version(agent):
+    try:
+        out = subprocess.run([executable(agent), '--version'], capture_output=True, text=True, timeout=60,
+                             encoding='utf-8', errors='replace')
+        return (out.stdout or out.stderr).strip().splitlines()[0][:120]
+    except (OSError, subprocess.SubprocessError, IndexError, TypeError):
+        return 'unknown'
+
+
+def agent_check(agents=None):
+    """The contract between ATS and the real agent CLIs, on a disposable fixture repository.
+
+    For each installed agent: one review (must give ATS_FINDINGS_JSON and a VERDICT line, and must not
+    change files) and one fix (must change calc.py and give ATS_RESPONSES_JSON). Records the CLI version
+    and the end of the output, so a failing CLI update gives a reproducible diagnosis.
+    """
+    chosen = [a for a in (agents or enabled_agents()) if a in ('codex', 'claude', 'gemini', 'opencode')]
+    report = {'ats': 'agent-check', 'platform': sys.platform, 'agents': {}}
+    for agent in chosen:
+        entry = {'version': None, 'ok': False, 'problems': [], 'review_tail': '', 'fix_tail': ''}
+        report['agents'][agent] = entry
+        if not executable(agent):
+            entry['problems'].append(f'{agent} is not installed or not in PATH')
+            continue
+        entry['version'] = agent_version(agent)
+        with tempfile.TemporaryDirectory(prefix='ats-agent-check-') as tmp:
+            repo = Path(tmp)
+            execute(['git', 'init', '-q'], repo)
+            (repo / 'calc.py').write_text('def add(a, b):\n    return a - b\n', encoding='utf-8')
+            execute(['git', *git_identity(repo), 'add', '-A'], repo)
+            execute(['git', *git_identity(repo), 'commit', '-q', '-m', 'fixture'], repo)
+            tree = index_tree(repo)
+            try:
+                review = invoke(agent, AGENT_CHECK_REVIEW, repo, quiet=True, backoff=(), purpose='review')
+            except Exception as exc:   # report, never crash the check
+                entry['problems'].append(f'review call failed: {str(exc)[:300]}')
+                continue
+            entry['review_tail'] = review[-1500:]
+            if parse_verdict(review) != 'CHANGES_REQUESTED':
+                entry['problems'].append('review: no valid last VERDICT line (expected VERDICT: CHANGES_REQUESTED)')
+            if not normalize_findings(parse_marked_json(review, 'ATS_FINDINGS_JSON')):
+                entry['problems'].append('review: ATS_FINDINGS_JSON missing or not parsable')
+            if restore_if_changed(repo, tree):
+                entry['problems'].append('review: the agent changed files in review-only mode')
+            try:
+                fix = invoke(agent, AGENT_CHECK_RESPONSE, repo, quiet=True, backoff=(), purpose='revision')
+            except Exception as exc:
+                entry['problems'].append(f'fix call failed: {str(exc)[:300]}')
+                continue
+            entry['fix_tail'] = fix[-1500:]
+            if 'a + b' not in (repo / 'calc.py').read_text(encoding='utf-8', errors='replace'):
+                entry['problems'].append('fix: calc.py was not changed to return a + b')
+            if not normalize_responses(parse_marked_json(fix, 'ATS_RESPONSES_JSON')):
+                entry['problems'].append('fix: ATS_RESPONSES_JSON missing or not parsable')
+        entry['ok'] = not entry['problems']
+    return report
+
+
 def child_run(argv):
     if not argv: raise RuntimeError('Usage: ats run -- command [args]')
     p=subprocess.Popen(argv,cwd=APP,start_new_session=(os.name!='nt'))
@@ -3566,10 +3688,11 @@ def positive_days(value):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file');p.add_argument('--resume-from');p.add_argument('--recheck-from',help='Test and review the kept worktree of an earlier run again, without rebuilding')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file');p.add_argument('--resume-from');p.add_argument('--recheck-from',help='Test and review the kept worktree of an earlier run again, without rebuilding');p.add_argument('--expect-base',help='Commit the plan was made on; the run stops when the base branch moved')
     p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('env-check', help='Check that the test commands find the project requirements (JSON)')
+    p=sub.add_parser('agent-check', help='Run each installed agent CLI on a tiny fixture repo and check ATS markers (JSON)');p.add_argument('--agent',action='append')
     sub.add_parser('performance')
     p=sub.add_parser('report', help='Summarize the run reports of the last days');p.add_argument('--days',type=positive_days,default=7)
     p=sub.add_parser('feedback');p.add_argument('comments_json');p.add_argument('--existing-ids')
@@ -3606,6 +3729,10 @@ def main():
                              indent=2))
         elif args.command=='risk':
             print(json.dumps(intelligence.risk_profile(' '.join(args.description)),indent=2))
+        elif args.command=='agent-check':
+            report = agent_check(args.agent)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0 if all(r['ok'] for r in report['agents'].values()) else 1
         elif args.command=='env-check':
             conf = project()
             base = {key: value for key, value in os.environ.items() if not key.startswith('ATS_')}
@@ -3624,7 +3751,7 @@ def main():
             items = json.loads(Path(args.items_json).read_text(encoding='utf-8'))
             relations = json.loads(Path(args.relations_json).read_text(encoding='utf-8'))
             print(json.dumps(intelligence.relation_issues(items, relations),indent=2))
-        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file,args.resume_from,args.recheck_from)
+        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file,args.resume_from,args.recheck_from,args.expect_base)
         elif args.command=='plan':preview_task_plan(' '.join(args.description), args.agent)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()

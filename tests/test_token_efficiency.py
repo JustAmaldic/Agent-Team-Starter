@@ -99,7 +99,7 @@ class StructuredInvokeTests(unittest.TestCase):
     def run_invoke(self, agent, stdout, **kwargs):
         seen = []
 
-        def fake_stream(command, cwd, timeout, quiet, stdin_text=None, render=None):
+        def fake_stream(command, cwd, timeout, quiet, stdin_text=None, render=None, **kw):
             seen.append((command, render))
             return subprocess.CompletedProcess(command, 0, stdout, '')
 
@@ -139,7 +139,7 @@ class StructuredInvokeTests(unittest.TestCase):
         budget = budgets.Budget(tokens=100)
         seen = []
 
-        def fake_stream(command, cwd, timeout, quiet, stdin_text=None, render=None):
+        def fake_stream(command, cwd, timeout, quiet, stdin_text=None, render=None, **kw):
             seen.append(command)
             return subprocess.CompletedProcess(command, 0, CLAUDE_RESULT, '')
 

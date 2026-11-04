@@ -194,6 +194,10 @@ Test commands such as `python -m unittest` use the project's virtualenv: `python
 
 A missing package stops the run as a configuration problem with the exact package and Python, before implementation, or, if it only shows in a test, without asking an agent to repair it. Agents never install packages. After installing, `ats task "<same task>" --recheck-from <run id>` tests and reviews the kept worktree again without rebuilding it.
 
+## Checking the agent CLIs
+
+`ats agent-check` runs every installed agent CLI on a throw-away fixture repository: one review (must end with `ATS_FINDINGS_JSON` and a `VERDICT` line and change nothing) and one fix (must change the file and give `ATS_RESPONSES_JSON`). It prints the CLI version, the problems and the end of each answer as JSON; run it after updating Codex or Claude. `ATS_LIVE_AGENT_TESTS=1` runs the same as a test. `ATS_CLAUDE_STREAM=1` lets Claude stream its steps (`stream-json`) so the app shows them live as `agent_activity`; Codex steps are always shown.
+
 ## Token-efficient runs
 
 ATS reads token usage and session ids from the CLIs' JSON output (`claude -p --output-format json`, `codex exec --json`) and records an `agent_usage` event per call: agent, model, phase, part, review round, and input, output, cache-read and cache-write tokens separately (no prompts or answers). `ATS_STRUCTURED_OUTPUT=0` switches back to plain text; an older CLI without JSON output falls back automatically.

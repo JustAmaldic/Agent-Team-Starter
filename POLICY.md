@@ -108,13 +108,18 @@ These rules save tokens without weakening the review:
 - **UI vocabulary and reference.** The style brief lists the project's most used CSS classes and UI helper functions. The planner gives a part that changes a screen a `style_reference` (an existing screen to follow); the builder reads it first and the reviewer compares with it. Style findings are distilled into project rules that name the class or token to use.
 - **Skipped tests and tools.** The checks show how many tests were skipped. Programs the tests need (`required_tools`, or `node` when the project has JavaScript tests) are checked before any agent starts, so a test that skips itself without them cannot pass unnoticed.
 - **Review labels.** Every review result says which review it was (`review_kind`: part, task, merge, update, integration) and which passes ran (functional, security).
+- **Builder self-check.** The implementer (never the reviewer) gets a short self-check before handing in, with the kinds of findings reviewers in this project gave most often and the share of first reviews that asked for changes. The independent review is unchanged.
+- **Base moved (enforced).** `--expect-base <sha>`: when the base branch is no longer at the commit a plan or preflight was made on, the run stops before any agent starts and says to plan again. ATS records the commit a task branch starts from (`base_commit`).
+- **Plan changes on resume (enforced).** A checkpoint stores a digest per plan node and of the model routing. A resume with a changed plan reuses the completed nodes only when none of them changed; changed or new nodes are planned again (`replanned`), and a changed model routing is reported, not blocking.
+- **Stable finding ids.** Every finding gets a fingerprint (file plus the code on the reported line, or the main words of the summary). A finding keeps its key when the reviewer renames it or the line moves, and one answered as fixed that a later review finds again is `reopened`.
+- **Usage pause.** A usage limit after reviewed parts records `usage_paused` with the reset hint: the checkpoint is kept and the run can continue with Smart Resume after the reset.
 - **Integration review.** After a plan with parallel parts or more than two parts, the other agent reviews the combined change once, only for how the parts work together (`integration_review`, on by default). A combined diff above `max_review_diff_chars` is skipped and recorded.
 - **Plans learn from earlier runs.** The planner gets a factual summary of this project's earlier merge conflicts, edits outside ownership, integration findings and waiting time between parallel parts, computed from the project's events.
 - **Owned paths.** A DAG part lists the files it owns. Changes outside them are reported to the reviewer (`ownership_drift`).
 
 ## Data and storage
 
-- **Events** are immutable, one JSON file per event, UTF-8:
+- **Events** are immutable, one JSON file per event, UTF-8 (phase changes too, as `phase_changed`, so a host can rebuild every run's state from the files):
   - with the private ATS-data clone: `~/.ats-data/data/<project>/events/`;
   - without it: `~/.ats-state/<project-id>/data/<project>/events/`.
 
