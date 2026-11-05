@@ -31,6 +31,8 @@ from ats_modules import plan_learning
 from ats_modules import review_scope
 from ats_modules import review_handoff
 from ats_modules import run_report
+from ats_modules import severity as severity_floor
+from ats_modules import findings_ledger
 from ats_modules import style_check
 from ats_modules import test_env
 from ats_modules import usage as usage_meter
@@ -764,8 +766,15 @@ def claude_allowed_tools(conf=None):
         if argv:
             prefix = ' '.join(argv[:3] if len(argv) >= 3 and argv[1] == '-m' else argv[:1])
             allowed.append(f'Bash({prefix}:*)')
+    pythons = ['python', 'python3']
+    if _test_env is not None:
+        pythons.insert(0, str(test_env.python_in(_test_env)))   # the exact interpreter ATS tells agents to use
+    for python in pythons:
+        for module in ('pytest', 'unittest', 'py_compile'):
+            allowed.append(f'Bash({python} -m {module}:*)')
+    if any(APP.glob('tests/*.cjs')) or any(APP.glob('tests/**/*.cjs')):
+        allowed.append('Bash(node tests/:*)')   # the project's own frontend tests
     allowed += [f'Bash({c}:*)' for c in READ_ONLY_GIT]
-    allowed += ['Bash(python3 -m py_compile:*)', 'Bash(python -m py_compile:*)']
     return list(dict.fromkeys(allowed))
 
 
@@ -1473,7 +1482,7 @@ def normalize_findings(entries):
             continue
         raw = str(entry.get('severity', '')).strip().upper()
         severity = raw if raw in SEVERITIES else SEVERITY_ALIASES.get(raw, 'MAJOR')
-        finding = {'id': str(entry.get('id') or f'F{number}').strip()[:20],
+        finding = {'id': str(entry.get('id') or f'F{number}').strip()[:40],
                    'severity': severity,
                    'file': str(entry.get('file', '')).strip()[:200],
                    'line': str(entry.get('line', '')).strip()[:40],
@@ -1494,10 +1503,20 @@ def normalize_responses(entries):
         finding_id = str(entry.get('id', '')).strip()
         if status not in RESPONSE_STATUSES or not finding_id or is_placeholder(finding_id):
             continue
-        responses.append({'id': finding_id[:20], 'status': status,
+        responses.append({'id': finding_id[:40], 'status': status,
                           'note': str(entry.get('note', '')).strip()[:500],
                           'reference': str(entry.get('reference', '')).strip()[:200]})
     return responses
+
+
+def floored(findings, task_id=None, context=None):
+    """Findings with the minimum severity applied (severity.py): host blocking, data loss, injection,
+    auth bypass and leaked secrets are at least MAJOR, whatever the reviewer chose."""
+    findings, raised = severity_floor.raise_floor(findings)
+    if raised and task_id:
+        record('severity_raised', 'High-impact findings raised to MAJOR: ' + ', '.join(raised), task_id,
+               **(context or {}), findings=raised)
+    return findings
 
 
 def evaluate_approval(verdict, checks, findings, history, reviewer, implementer, conf,
@@ -1720,6 +1739,7 @@ def shared_prefix(folder, conf, task_id=None, style=None):
     return (f"Follow {ATS/'POLICY.md'} and {ATS/'AGENTS.md'}; they take precedence over everything below. "
             "The essentials:\n" + POLICY_ESSENTIALS
             + "Read those files yourself only when you need a detail that is not summarised here."
+            + test_env.agent_instructions(conf or {}, _test_env)
             + style
             + task_knowledge(task_id, run.get('task', ''), run.get('paths', ()))
             + repo_context(folder, conf, task_id) + '\n\n')
@@ -2094,7 +2114,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             print(f'ATS: reviewer {reviewer} changed files in review-only mode; reverted: '
                   + ', '.join(tampered[:10]), file=sys.stderr)
         verdict = parse_verdict(review)
-        findings = normalize_findings(parse_marked_json(review, 'ATS_FINDINGS_JSON'))
+        findings = floored(normalize_findings(parse_marked_json(review, 'ATS_FINDINGS_JSON')), task_id, context)
         trespass = reserved_changes(full_stats['files'], reserved_paths, owned_paths)
         if trespass:
             # Enforced before the merge: a parallel part that edits its sibling's (or a learned shared)
@@ -2120,8 +2140,9 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                 second = 'VERDICT: CHANGES_REQUESTED'
                 reasons = ['security review pass failed: ' + str(exc)[:300]]
             touched = restore_if_changed(folder, tree)
-            sec_findings = [dict(f, id='S' + f['id'] if not f['id'].startswith('S') else f['id'])
-                            for f in normalize_findings(parse_marked_json(second, 'ATS_FINDINGS_JSON'))]
+            sec_findings = floored([dict(f, id='S' + f['id'] if not f['id'].startswith('S') else f['id'])
+                                    for f in normalize_findings(parse_marked_json(second, 'ATS_FINDINGS_JSON'))],
+                                   task_id, context)
             sec_verdict = parse_verdict(second)
             if not reasons:
                 reasons = [('security pass: ' + r) for r in evaluate_approval(
@@ -2364,6 +2385,7 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'deployment, live trading, or deletion without explicit approval. '
         'Do not implement any changes. Do not add explanations outside the JSON line.'
         + plan_learning.planner_note(plan_history())
+        + release_note(conf)
     )
     last_problem = None
     for attempt in range(2):
@@ -2483,6 +2505,12 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
     owned = list(node['owned_paths']) if node else []
     carried = review_handoff.relevant_findings(prior_cycles, part, owned)
     previous_note = review_handoff.handoff_note(carried)
+    owned_open = findings_ledger.for_owner(findings_ledger.build(prior_cycles, plan), node['id']) if node else []
+    if owned_open:
+        # Context is not ownership: findings in this part's files are this part's to fix.
+        previous_note = findings_ledger.owner_note(owned_open) + previous_note
+        record('review_handoff', 'Open findings in files this part owns', task_id, subtask=number,
+               count=len(owned_open), keys=[e['key'] for e in owned_open], owned=True)
     if carried:
         record('review_handoff', 'Relevant earlier review findings passed to next part',
                task_id, subtask=number, count=len(carried),
@@ -2490,6 +2518,14 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
 
     ownership = ('Files this part owns: ' + ', '.join(owned) + '. Change other files only when unavoidable, '
                  'and say which and why. ' if owned else '')
+    if isinstance(plan, dict) and plan.get('release_owner') and node:
+        release = release_files(conf)
+        if node['id'] == plan['release_owner']:
+            ownership += ('This part owns the release files (' + ', '.join(release) + '): raise the version once '
+                          'for the whole task and start its changelog section; later parts do not raise it again. ')
+        else:
+            ownership += ('Do NOT edit the release files (' + ', '.join(release) + '): the first part raised the '
+                          'version and ATS updates the notes for the combined change at the end. ')
     if alongside:
         sibling = dag_node(plan, alongside[1])
         shared = [f for f in plan_learning.shared_files(plan_history()) if not dag_planning.paths_conflict([f], owned)] \
@@ -2548,6 +2584,9 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
         sibling = dag_node(plan, alongside[1])
         reserved = list(sibling['owned_paths']) if sibling else []
         reserved += [f for f in plan_learning.shared_files(plan_history()) if f not in reserved]
+    if isinstance(plan, dict) and plan.get('release_owner') and node and node['id'] != plan['release_owner']:
+        # Version and changelog belong to the first part; the fix-up step updates the notes at the end.
+        reserved += [f for f in release_files(conf) if f not in reserved]
     try:
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
@@ -2806,19 +2845,129 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
         implementer = other   # the next wave starts with the other agent
     pairs = sum(len(w) == 2 for w in waves)
     combined = False
+    ledger = findings_ledger.build(history, plan)
     if conf.get('integration_review', True) and (pairs or total > 2):
-        ok, judge, author, cycles = integration_review(task, plan, total, task_id, folder, branch, author,
-                                                       unavailable, conf, quiet=quiet)
+        open_items = findings_ledger.needs_attention(ledger)
+        release = release_files(conf) if isinstance(plan, dict) and plan.get('release_owner') else []
+        fixer = alternate_agent(author, unavailable) or author   # the last reviewer knows the combined code
+        if conf.get('integration_fixup', True):
+            fixer, _ = integration_fixup(task, plan, task_id, folder, fixer, unavailable, conf, open_items,
+                                         release, quiet=quiet)
+        ok, judge, author, cycles = integration_review(task, plan, total, task_id, folder, branch, fixer,
+                                                       unavailable, conf, quiet=quiet,
+                                                       notes=findings_ledger.integration_note(open_items))
         history.extend(cycles)
+        if cycles:
+            ledger = findings_ledger.resolve(ledger, [f['id'] for f in cycles[-1]['findings']])
         if not ok:
+            record_ledger(task_id, ledger + findings_ledger.build(cycles))
             return False, judge, author, history
         combined = judge is not None
         reviewer = judge or reviewer
+        ledger = ledger + [e for e in findings_ledger.build(cycles)
+                           if not any(e['key'].endswith('/' + o['key']) for o in ledger)]
+    record_ledger(task_id, ledger, combined=combined)
     record('subtasks_completed', 'All parts independently reviewed' + (
                '; the combined change passed an integration review' if combined else
                '; combined diff has not been reviewed'),
            task_id, parts=attribution, branch=branch, combined_review=combined)
     return True, reviewer, author, history
+
+
+RELEASE_CANDIDATES = ('CHANGELOG.md', 'CHANGELOG', 'CHANGES.md', 'VERSION', 'version.txt')
+VERSION_ASSIGNMENT = re.compile(r'^(__version__|VERSION)\s*=\s*["\']\d+\.\d+', re.MULTILINE)
+
+
+def release_files(conf, root=None):
+    """The files every change bumps (version and changelog): `release_files`, or detected.
+
+    Detected: a changelog or VERSION file at the top, and a package __init__.py one level down that
+    assigns VERSION or __version__. When several parts each bumped these, they conflicted; ATS gives
+    them to one part (assign_release_files).
+    """
+    configured = (conf or {}).get('release_files')
+    if isinstance(configured, list):
+        return [str(p) for p in configured if isinstance(p, str) and p.strip()]
+    root = Path(root or APP)
+    found = [name for name in RELEASE_CANDIDATES if (root / name).is_file()]
+    for init in sorted(root.glob('*/__init__.py'))[:30]:
+        try:
+            if VERSION_ASSIGNMENT.search(init.read_text(encoding='utf-8', errors='replace')[:4000]):
+                found.append(init.relative_to(root).as_posix())
+        except OSError:
+            continue
+    return found
+
+
+def release_note(conf):
+    files = release_files(conf)
+    if not files:
+        return ''
+    return ('\nRelease files (version and changelog): ' + ', '.join(files) + '. Give them to the FIRST part '
+            '(no dependencies); no other part owns or edits them. ATS enforces this and updates the notes at the end.')
+
+
+def assign_release_files(plan, files):
+    """Give the release files to the FIRST part of a DAG plan and to no other part.
+
+    The first part is the one that has to pass a version check first; later parts no longer need
+    to bump (the check compares with the base branch), so they keep their hands off these files
+    and the fix-up step before the integration review updates the notes for the whole change.
+    """
+    if not files or not isinstance(plan, dict) or not plan.get('tasks'):
+        return plan
+    tasks = [dict(node) for node in plan['tasks']]
+    for node in tasks:
+        node['owned_paths'] = [p for p in node.get('owned_paths', [])
+                               if not dag_planning.paths_conflict([p], files)]
+    first = next((n for n in tasks if not n.get('depends_on')), tasks[0])
+    first['owned_paths'] = list(dict.fromkeys(first['owned_paths'] + list(files)))
+    return dict(plan, tasks=tasks, release_owner=first['id'])
+
+
+def integration_fixup(task, plan, task_id, folder, implementer, unavailable, conf, open_items, release,
+                      quiet=False):
+    """Before the integration review: fix the findings still open from the part reviews, and bring
+    the release notes in line with the combined change. One agent call; skipped when nothing to do."""
+    if not open_items and not release:
+        return implementer, []
+    work = []
+    if open_items:
+        work.append(findings_ledger.note(open_items, 'Fix these findings that are still open from the reviews of '
+                                                     'the parts (any file may be changed for them): '))
+    if release:
+        work.append('Update the release notes in ' + ', '.join(release) + ' so the section of the current version '
+                    'describes the combined change of all parts (no text about later parts); do not raise the '
+                    'version again.')
+    prompt = (shared_prefix(folder, conf, task_id) + 'ROLE: implementer, finishing a planned task before its '
+              'integration review. Do not commit, push or modify .ats; ATS commits after the review.\n'
+              f'Task: {task}\nPlan: {json.dumps(plan, ensure_ascii=False)}\n' + '\n'.join(work)
+              + '\nEnd with ONE LINE ATS_RESPONSES_JSON: [{"id":"<key>","status":"fixed|not_applicable|deferred",'
+              '"note":"<evidence>"}] for every finding key above (or [] when there were none).')
+    phase('revision', task_id, implementer=implementer, integration=True)
+    try:
+        implementer, output = invoke_with_fallback(implementer, prompt, folder, unavailable, task_id, 'revision',
+                                                   quiet=quiet)
+    except (AgentUsageExhausted, RuntimeError) as exc:
+        record('findings_fixup', 'Fix-up before the integration review failed: ' + str(exc)[:300], task_id,
+               implementer=implementer, keys=[e['key'] for e in open_items])
+        return implementer, []
+    responses = normalize_responses(parse_marked_json(output, 'ATS_RESPONSES_JSON'))
+    record('findings_fixup', f'{len(open_items)} open findings handed to the fix-up step', task_id,
+           implementer=implementer, keys=[e['key'] for e in open_items], responses=responses,
+           release_files=release)
+    capture_learning_proposals(output, task_id)
+    return implementer, responses
+
+
+def record_ledger(task_id, ledger, combined=None):
+    """The findings register of the task, for the run report and the PR description."""
+    open_items = findings_ledger.needs_attention(ledger)
+    _run_flags.setdefault(task_id, {})['ledger'] = ledger
+    if combined is not None:
+        _run_flags[task_id]['combined_review'] = combined
+    record('findings_ledger', f'{len(ledger)} findings, {len(open_items)} still open', task_id,
+           entries=ledger[:100], open=[e['key'] for e in open_items])
 
 
 def integration_base(folder, conf):
@@ -2831,7 +2980,8 @@ def integration_base(folder, conf):
     return roots[0] if roots else 'HEAD'
 
 
-def integration_review(task, plan, total, task_id, folder, branch, implementer, unavailable, conf, quiet=False):
+def integration_review(task, plan, total, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
+                       notes=''):
     """One review of the combined change after all parts: only how the parts work together.
 
     Parts are reviewed one by one, so problems between them (interfaces, duplicated logic, wiring)
@@ -2856,7 +3006,7 @@ def integration_review(task, plan, total, task_id, folder, branch, implementer, 
     try:
         approved, reviewer, implementer, cycles = review_loop(review_task, task_id, folder, branch, implementer,
                                                               unavailable, settings, quiet=quiet, base=base,
-                                                              kind='integration')
+                                                              earlier_review_notes=notes, kind='integration')
     except RuntimeError as exc:
         record('integration_review', 'Integration review could not run: ' + str(exc)[:300], task_id,
                branch=branch, approved=False, files=[])
@@ -3246,6 +3396,8 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
         else:
             preflight_plan = preplan_task(task, task_id, folder, agent, unavailable, conf,
                                          quiet=quiet, mode=parallel)
+        if isinstance(preflight_plan, dict) and not preflight_plan.get('release_owner'):
+            preflight_plan = assign_release_files(preflight_plan, release_files(conf))
         if isinstance(preflight_plan, dict):   # the files of every part help choose the learnings
             _run_flags[task_id]['paths'] = [p for n in preflight_plan.get('tasks', []) for p in n.get('owned_paths', [])]
         phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
@@ -3313,6 +3465,10 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
 def finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer, approved, history,
                 unavailable, quiet, local_mode):
     """After the review: learnings, the commit, and (when approved) the base update and draft PR."""
+    if history and 'ledger' not in _run_flags.get(task_id, {}):
+        ledger = findings_ledger.build(history)
+        if ledger:
+            record_ledger(task_id, ledger)
     learning_agent = reviewer or alternate_agent(implementer) or implementer
     distill_learnings(task, task_id, folder, history,
                       learning_agent, unavailable, quiet=quiet)
@@ -3348,9 +3504,15 @@ def finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer
     for c in history:   # the approving (last) cycle of every part
         if 'subtask' in c:
             parts[c['subtask']] = f"Part {c['subtask']}: implementer {c['implementer']}, reviewer {c['reviewer']}"
-    attribution = ('\n'.join(parts[n] for n in sorted(parts))
-                   + '\nEvery part was reviewed on its own diff; the combined change was not reviewed as a whole.'
-                   if parts else '')
+    run_flags = _run_flags.get(task_id, {})
+    scope = ('\nEvery part was reviewed on its own diff, and the combined change passed an integration review.'
+             if run_flags.get('combined_review') else
+             '\nEvery part was reviewed on its own diff; the combined change was not reviewed as a whole.')
+    attribution = ('\n'.join(parts[n] for n in sorted(parts)) + scope if parts else '')
+    still_open = findings_ledger.summary_lines(run_flags.get('ledger') or findings_ledger.build(history))
+    if still_open:
+        attribution += ('\nFindings still open (they did not block approval; decide before merging):\n'
+                        + '\n'.join(still_open[:20]))
     if push:
         updated, update_cycles = update_from_base(task, task_id, folder, branch, conf, implementer,
                                                   unavailable, quiet=quiet)

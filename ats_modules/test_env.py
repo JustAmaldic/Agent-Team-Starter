@@ -186,6 +186,34 @@ def missing_module(output: str, folder: Path | None = None) -> str | None:
     return top
 
 
+def absolute(command, env: Path | None):
+    """The test command with `python`/`python3` replaced by the virtualenv's interpreter."""
+    if env is None:
+        return command
+    argv = _argv(command)
+    if not argv or not python_of(command) or Path(argv[0]).is_absolute():
+        return command
+    parts = [str(python_in(env)), *argv[1:]]
+    # Windows runs test strings through cmd: quote the Windows way, not the POSIX way.
+    return subprocess.list2cmdline(parts) if os.name == 'nt' else ' '.join(shlex.quote(p) for p in parts)
+
+
+def agent_instructions(conf: dict, env: Path | None) -> str:
+    """How agents run tests: the exact interpreter, targeted tests only, the suite is ATS's job."""
+    commands = [absolute(c, env) if isinstance(c, str) else ' '.join(map(str, c))
+                for c in conf.get('test_commands') or []]
+    if not commands:
+        return ''
+    python = str(python_in(env)) if env is not None else None
+    lines = ['TESTS: ATS runs the full test commands itself after you and gives the results to the reviewer: '
+             + '; '.join(commands[:4]) + '. Do not run the whole suite yourself; run only the tests for what you '
+             'changed.']
+    if python:
+        lines.append(f'Use exactly this Python for every Python command: {python} (for example '
+                     f'{python} -m pytest -q tests/test_x.py). A login shell (zsh -l, bash -l) can put another '
+                     'Python first in PATH; that one lacks the project packages.')
+    return '\n' + ' '.join(lines)
+
 def required_tools(conf: dict, root: Path) -> list[str]:
     """Programs the tests need besides Python: `required_tools`, or `node` when the project has
     JavaScript tests (tests/*.cjs, *.test.js, or a package.json). A test that skips itself when the
