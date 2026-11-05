@@ -194,6 +194,10 @@ Test commands such as `python -m unittest` use the project's virtualenv: `python
 
 A missing package stops the run as a configuration problem with the exact package and Python, before implementation, or, if it only shows in a test, without asking an agent to repair it. Agents never install packages. After installing, `ats task "<same task>" --recheck-from <run id>` tests and reviews the kept worktree again without rebuilding it.
 
+## Checking the agent CLIs
+
+`ats agent-check` runs every installed agent CLI on a throw-away fixture repository: one review (must end with `ATS_FINDINGS_JSON` and a `VERDICT` line and change nothing) and one fix (must change the file and give `ATS_RESPONSES_JSON`). It prints the CLI version, the problems and the end of each answer as JSON; run it after updating Codex or Claude. `ATS_LIVE_AGENT_TESTS=1` runs the same as a test. `ATS_CLAUDE_STREAM=1` lets Claude stream its steps (`stream-json`) so the app shows them live as `agent_activity`; Codex steps are always shown.
+
 ## Token-efficient runs
 
 ATS reads token usage and session ids from the CLIs' JSON output (`claude -p --output-format json`, `codex exec --json`) and records an `agent_usage` event per call: agent, model, phase, part, review round, and input, output, cache-read and cache-write tokens separately (no prompts or answers). `ATS_STRUCTURED_OUTPUT=0` switches back to plain text; an older CLI without JSON output falls back automatically.
@@ -208,6 +212,7 @@ Project settings in `.ats-project.json` (all optional):
 | `integration_review` | `true` | one review of the combined change after parallel or more than two parts |
 | `integration_fixup` | `true` | before the integration review, one agent call fixes findings still open from the part reviews and updates the release notes |
 | `release_files` | detected | version and changelog files; only the first part of a plan edits them |
+| `required_tools` | detected | programs the tests need, checked before agents start (`node` for JavaScript tests) |
 | `python_env` | `.venv` or `venv` when present | the project's virtualenv for test commands and agents (relative to the project folder, or absolute) |
 | `environment_check` | `true` | before any agent starts, check that the requirement files are installed in the Python the test commands use |
 | `pre_review_gate` | `true` | cheap checks before the review (see POLICY.md) |
@@ -223,3 +228,38 @@ Project settings in `.ats-project.json` (all optional):
 
 `ATS_SESSION_REUSE=0` turns session reuse off; `ATS_SESSION_MAX_TURNS` (4) and `ATS_SESSION_MAX_CONTEXT` (400000 new tokens; cache reads do not count) bound it.
 
+
+### Consistent UI changes
+
+Put the project's visual contract in `DESIGN.md`: existing controls, CSS tokens,
+reference screens and UI language. ATS includes a bounded excerpt and an inventory
+of CSS classes/UI functions in both agents' style brief. The inventory is cached per
+worktree snapshot and refreshes when relevant files change.
+
+The pre-review gate checks only new UI declarations against the existing project.
+It flags hex/function colour literals, font families, px/em/rem sizes and inline style attributes/objects;
+named colours and other units are left to review. Comments are masked before checking;
+it does not require rewriting legacy CSS. Define new shared tokens centrally when
+necessary. This is a conservative static heuristic, not complete CSS parsing or a
+replacement for browser/visual testing. Projects without existing style declarations
+still receive the inventory and inline-style check, but no invented palette/scale.
+
+Intentional departures can be recorded in `.ats-project.json`:
+
+```json
+{
+  "style_check": true,
+  "style_check_exceptions": [
+    {"path": "web/chart.js", "rule": "inline", "reason": "Positions are calculated from chart data"}
+  ]
+}
+```
+
+Exceptions match the exact path and rule, require a reason, and appear in review
+evidence. Use `style_check: false` only as an explicit project decision. An exception
+never bypasses independent review. For DAG UI tasks, include e.g.
+`"reference_screen": "web/settings.js"`; it must be an existing file inside the
+worktree. The planner is instructed to choose it from the inventory. Legacy list
+plans remain valid; put the reference file directly in their part description.
+Style findings use the existing learning call to produce project-scoped rules;
+there is no extra learning-agent invocation or screenshot step.

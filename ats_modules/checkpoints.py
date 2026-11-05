@@ -10,6 +10,48 @@ def plan_digest(plan):
     return hashlib.sha256(json.dumps(plan, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def node_digest(node):
+    """What a DAG node asks for: title, dependencies, owned files and contracts (not its position)."""
+    keep = {k: node.get(k) for k in ("id", "title", "depends_on", "owned_paths",
+                                      "contracts_provided", "contracts_required") if k in node}
+    return hashlib.sha256(json.dumps(keep, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def node_digests(plan):
+    if not isinstance(plan, dict) or plan.get("plan_version") != 2:
+        return {}
+    return {node["id"]: node_digest(node) for node in plan.get("tasks", [])}
+
+
+def routing_digest(environ=None):
+    """The model routing of the run (ATS_MODEL_* variables): recorded so a resume can say it changed."""
+    environ = os.environ if environ is None else environ
+    routing = {k: v for k, v in sorted(environ.items()) if k.startswith("ATS_MODEL_") or k == "ATS_ANTIGRAVITY_MODEL"}
+    return hashlib.sha256(json.dumps(routing, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def compatible_prefix(plan, saved_digests, saved_nodes):
+    """How many completed nodes of an earlier plan can be reused under a changed plan.
+
+    A node is reusable when it is unchanged (same digest) and everything it depends on is reusable
+    too. Reuse follows the execution batches of the new plan, so a changed node, and every node
+    after it in that order, is planned again. Returns (count, changed node ids)."""
+    from ats_modules import dag
+    if not isinstance(plan, dict) or not isinstance(saved_digests, dict) or not isinstance(saved_nodes, list):
+        return 0, []
+    current = node_digests(plan)
+    done = set(saved_nodes)
+    reusable = {n for n in done if n in current and current[n] == saved_digests.get(n)}
+    changed = sorted(n for n in done if n not in reusable)
+    count = 0
+    for batch in dag.execution_batches(plan):
+        ids = [node["id"] for node in batch]
+        if not all(i in reusable for i in ids):
+            break
+        count += len(ids)
+    return count, changed
+
+
 def checkpoint_path(data, task_id):
     if not isinstance(task_id, str) or not task_id or not all(c.isalnum() or c == "-" for c in task_id):
         raise ValueError("Invalid checkpoint task id")
@@ -27,7 +69,14 @@ def save_checkpoint(data, task_id, plan, worktree, commit, completed, attributio
         "worktree": str(Path(worktree).resolve()), "commit": commit,
         "completed": completed, "attribution": attribution,
         "pending": list(pending or []),
+        "node_digests": node_digests(plan),
+        "routing_digest": routing_digest(),
     }
+    if isinstance(plan, dict):
+        try:
+            value["completed_nodes"] = completed_node_ids(plan, completed)
+        except ValueError:
+            value["completed_nodes"] = []
     path = checkpoint_path(data, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".checkpoint-", suffix=".tmp")
@@ -54,10 +103,21 @@ def load_checkpoint(data, task_id, plan, worktree, head):
         return None
     if not isinstance(value, dict) or value.get("version") != 1:
         return None
-    if (value.get("task_id") != task_id or value.get("plan_digest") != plan_digest(plan)
+    if (value.get("task_id") != task_id
             or value.get("worktree") != str(Path(worktree).resolve())
             or value.get("commit") != head or type(value.get("completed")) is not int):
         return None
+    value["routing_changed"] = value.get("routing_digest") not in (None, routing_digest())
+    if value.get("plan_digest") == plan_digest(plan):
+        return value
+    # The plan changed: reuse only unchanged nodes (and what they depend on); plan the rest again.
+    # A completed node that changed has its old code in the worktree: never build on that.
+    count, changed = compatible_prefix(plan, value.get("node_digests"), value.get("completed_nodes"))
+    if changed or count != value["completed"] or count == 0:
+        return None
+    saved = value.get("node_digests") or {}
+    value.update(pending=[], plan_changed=True,
+                 replanned=sorted(n for n, d in node_digests(plan).items() if saved.get(n) != d))
     return value
 
 

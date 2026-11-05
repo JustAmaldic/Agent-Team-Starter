@@ -32,6 +32,12 @@ class SmartResumeTests(unittest.TestCase):
             self.assertIsNone(checkpoints.verified_resume(temp, "prior-run", plan, directory, "b" * 40))
             changed = graph()
             changed["tasks"][1]["title"] = "A changed security scoring implementation"
+            # Only a part that was not built yet changed: the reviewed contract is reused, scoring is planned again.
+            state = checkpoints.verified_resume(temp, "prior-run", changed, directory, head)
+            self.assertEqual(state["completed_nodes"], ["contract"])
+            self.assertEqual(state["replanned"], ["scoring"])
+            # A completed part that changed has its old code in the worktree: no reuse.
+            changed["tasks"][0]["title"] = "Define different shared contracts"
             self.assertIsNone(checkpoints.verified_resume(temp, "prior-run", changed, directory, head))
 
     def test_partial_pair_does_not_claim_unmerged_node_complete(self):

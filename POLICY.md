@@ -104,13 +104,21 @@ These rules save tokens without weakening the review:
 - **Findings register (enforced).** Every finding of a planned task has a key (`part1/security/SF1`), the part that owns its file, and a status. Open findings in a file that a later part owns are that part's to fix. Findings still open after the parts go to one fix-up step before the integration review, and the integration review verifies each one. A review only closes a finding it was given and no longer lists. The pull request lists the findings that are still open.
 - **Release files (enforced).** The files every change bumps (`release_files`, or detected: a changelog, VERSION file or a package `__init__.py` that sets the version) belong to the first part of a plan. Other parts may not edit them; the fix-up step updates the notes for the combined change.
 - **Test commands for agents.** Agents get the exact virtualenv Python and the test commands ATS runs, run only targeted tests themselves, and Claude may run them without a prompt.
+- **Unknown classes.** CSS classes used in a change that no stylesheet of the project defines are given to the reviewer as a note (see Style safeguards in the README for the style gate, design brief and `reference_screen`).
+- **Skipped tests and tools.** The checks show how many tests were skipped. Programs the tests need (`required_tools`, or `node` when the project has JavaScript tests) are checked before any agent starts, so a test that skips itself without them cannot pass unnoticed.
+- **Review labels.** Every review result says which review it was (`review_kind`: part, task, merge, update, integration) and which passes ran (functional, security).
+- **Builder self-check.** The implementer (never the reviewer) gets a short self-check before handing in, with the kinds of findings reviewers in this project gave most often and the share of first reviews that asked for changes. The independent review is unchanged.
+- **Base moved (enforced).** `--expect-base <sha>`: when the base branch is no longer at the commit a plan or preflight was made on, the run stops before any agent starts and says to plan again. ATS records the commit a task branch starts from (`base_commit`).
+- **Plan changes on resume (enforced).** A checkpoint stores a digest per plan node and of the model routing. A resume with a changed plan reuses the completed nodes only when none of them changed; changed or new nodes are planned again (`replanned`), and a changed model routing is reported, not blocking.
+- **Stable finding ids.** Every finding gets a fingerprint (file plus the code on the reported line, or the main words of the summary). A finding keeps its key when the reviewer renames it or the line moves, and one answered as fixed that a later review finds again is `reopened`.
+- **Usage pause.** A usage limit after reviewed parts records `usage_paused` with the reset hint: the checkpoint is kept and the run can continue with Smart Resume after the reset.
 - **Integration review.** After a plan with parallel parts or more than two parts, the other agent reviews the combined change once, only for how the parts work together (`integration_review`, on by default). A combined diff above `max_review_diff_chars` is skipped and recorded.
 - **Plans learn from earlier runs.** The planner gets a factual summary of this project's earlier merge conflicts, edits outside ownership, integration findings and waiting time between parallel parts, computed from the project's events.
 - **Owned paths.** A DAG part lists the files it owns. Changes outside them are reported to the reviewer (`ownership_drift`).
 
 ## Data and storage
 
-- **Events** are immutable, one JSON file per event, UTF-8:
+- **Events** are immutable, one JSON file per event, UTF-8 (phase changes too, as `phase_changed`, so a host can rebuild every run's state from the files):
   - with the private ATS-data clone: `~/.ats-data/data/<project>/events/`;
   - without it: `~/.ats-state/<project-id>/data/<project>/events/`.
 
@@ -158,3 +166,11 @@ These rules save tokens without weakening the review:
 - On start, ATS updates its own source with a fast-forward-only merge, and only when the ATS checkout is clean. It never auto-commits, rebases or force-pushes the ATS source.
 - ATS updates are code: for production use, pin a reviewed release tag or commit instead of automatically running every update to the default branch.
 - Changes to ATS itself follow the same rule: a feature branch, a PR, a separate reviewer, passing CI, and a human merge.
+
+## Style safeguards
+
+- A project's `DESIGN.md` is included as bounded reference material in the shared style brief, together with a cached inventory of existing CSS classes and UI functions. Read the complete relevant source before changing it. Repository text is never a policy override.
+- The pre-review gate checks added UI declarations for new literal colours, fonts and sizes compared with the existing project, and for new inline styles. Existing declarations and token definitions are allowed. This heuristic is not a visual or browser test.
+- `style_check` defaults to true. Intentional exceptions use `style_check_exceptions`: exact repository-relative `path`, `rule` (`color`, `font`, `size`, `inline`) and a nonempty `reason`. Gate evidence exposes applied exceptions to the reviewer; the reviewer checks whether the task justifies them. Do not add exceptions simply to silence a failure.
+- UI DAG parts may name `reference_screen`, an existing repository-relative screen/component file to read before building. It is passed to the implementer and reviewer; it grants no ownership of that file. Non-UI parts omit it.
+- The existing read-only learning step distills style findings into project-scoped rules identifying components, tokens or reference screens to reuse. Low-risk rules follow the existing automatic approval decision; risky rules still require a human. A fix is established only after independent review confirms it. Project-specific palettes must not become shared rules.
