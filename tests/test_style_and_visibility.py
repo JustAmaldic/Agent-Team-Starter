@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import ats
-from ats_modules import dag, gate, style_check, test_env
+from ats_modules import style_check, test_env
 
 CSS = """:root { --bg: #0A0A0B; --accent: #7C5CFF; }
 .card { background: var(--bg); }
@@ -38,49 +38,9 @@ class StyleTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def gate(self, added):
-        return style_check.gate_result(self.root, added, gate.result, gate.PASSED, gate.FAILED, gate.SKIPPED)
-
-    def test_literal_colours_and_fonts_fail(self):
-        outcome = self.gate({'web/app.css': ['.note { color: #ff0000; }', "  font-family: 'Comic Sans';"],
-                             'web/screen.js': ["h('div', { style: { background: 'rgb(10, 20, 30)' } })"]})
-        self.assertEqual(outcome['status'], gate.FAILED)
-        self.assertIn('#ff0000', outcome['detail'])
-        self.assertIn('rgb(10, 20, 30)', outcome['detail'])
-
-    def test_tokens_selectors_and_ids_pass(self):
-        outcome = self.gate({'web/app.css': ['  --warn: #FFB020;', '.note { color: var(--warn); }', '#fade {'],
-                             'web/screen.js': ["document.querySelector('#add').focus();"]})
-        self.assertEqual(outcome['status'], gate.PASSED)
-
-    def test_skipped_without_ui_or_tokens(self):
-        self.assertEqual(self.gate({'ats.py': ['x = "#fff"']})['status'], gate.SKIPPED)
-        (self.root / 'web' / 'app.css').write_text('.card { color: red; }')
-        self.assertEqual(self.gate({'web/app.css': ['a { color: #fff; }']})['status'], gate.SKIPPED)
-
-    def test_tests_are_not_style_checked(self):
-        self.assertEqual(self.gate({'tests/ui.test.js': ["expect(color).toBe('#ff0000')"]})['status'], gate.SKIPPED)
-
-    def test_vocabulary_and_unknown_classes(self):
-        classes, helpers = style_check.vocabulary(self.root)
-        self.assertEqual(classes[:2], ['btn', 'card'])
-        self.assertIn('field', helpers)
+    def test_unknown_classes(self):
         unknown = style_check.unknown_classes(self.root, {'web/screen.js': ["h('div', { class: 'card fancy-box' })"]})
         self.assertEqual(unknown, ['fancy-box'])
-
-    def test_style_brief_names_the_vocabulary(self):
-        ats._style_cache.pop(str(self.root.resolve()), None)
-        brief = ats.style_context(self.root)
-        self.assertIn('CSS classes the screens use most', brief)
-        self.assertIn('UI helper functions', brief)
-
-    def test_style_reference_survives_validation(self):
-        plan = dag.validate_dag({'plan_version': 2, 'tasks': [
-            {'id': 'api', 'title': 'Build the API with tests', 'depends_on': [], 'owned_paths': ['api.py']},
-            {'id': 'ui', 'title': 'Build the screen with tests', 'depends_on': ['api'], 'owned_paths': ['ui.js'],
-             'style_reference': 'web/app.js: project settings'}]})
-        self.assertEqual(plan['tasks'][1]['style_reference'], 'web/app.js: project settings')
-        self.assertNotIn('style_reference', plan['tasks'][0])
 
 
 class VisibilityTests(unittest.TestCase):

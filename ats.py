@@ -23,6 +23,7 @@ import ats_intelligence as intelligence
 from ats_modules import checkpoints
 from ats_modules import dag as dag_planning
 from ats_modules import budget as budgets
+from ats_modules import style_guard
 from ats_modules import context_pack
 from ats_modules import gate as pre_gate
 from ats_modules import knowledge_select
@@ -1642,7 +1643,7 @@ STYLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', 'STYLEGUIDE.md', 'ST
                'tailwind.config.ts', 'tsconfig.json')
 STYLE_SKIP = {'node_modules', '.git', 'dist', 'build', '.venv', 'venv', '.venv-bouw', 'vendor', '__pycache__',
               '.next', 'coverage', 'site-packages'}
-STYLE_LIMIT = 3500
+STYLE_LIMIT = 5000
 _style_cache = {}
 
 
@@ -1666,7 +1667,10 @@ def style_context(folder, conf=None):
     style_guide notes from .ats-project.json. Cached per worktree.
     """
     folder = Path(folder)
-    key = str(folder.resolve())
+    evidence = style_guard.brief(folder)
+    key = (str(folder.resolve()), evidence,
+           tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in _style_sheets(folder)),
+           json.dumps((conf or {}).get('style_guide'), sort_keys=True))
     if key in _style_cache:
         return _style_cache[key]
     sources = [name for name in STYLE_FILES if (folder / name).is_file()]
@@ -1686,17 +1690,13 @@ def style_context(folder, conf=None):
              'test style and the language and tone of user-facing text. Reuse existing components, helpers, '
              'CSS classes and design tokens. Do not introduce new colours, fonts, spacing or radius values, UI '
              'libraries, frameworks or code styles unless the task asks for it; extend what is there instead.']
+    if evidence:
+        lines.append(evidence)
     if sources:
         lines.append('Style sources in this project (read the relevant ones): ' + ', '.join(sources) + '.')
     if tokens:
         lines.append(f'Design tokens in {token_file} (use these instead of literal values): '
-                     + '; '.join(f'{n}: {v.strip()}' for n, v in tokens[:40]) + '.')
-    classes, helpers = style_check.vocabulary(folder)
-    if classes:
-        lines.append('CSS classes the screens use most (build with these before adding new ones): '
-                     + ', '.join(classes) + '.')
-    if helpers:
-        lines.append('UI helper functions the project uses (reuse them): ' + ', '.join(helpers) + '.')
+                     + '; '.join(f'{n}: {v.strip()}' for n, v in tokens[:20]) + '.')
     if fonts:
         lines.append('Fonts in use: ' + ' | '.join(f for f, _ in sorted(fonts.items(), key=lambda x: -x[1])[:3]) + '.')
     notes = (conf or {}).get('style_guide')
@@ -1707,6 +1707,9 @@ def style_context(folder, conf=None):
     text = '\n' + '\n'.join(lines)
     if len(text) > STYLE_LIMIT:
         text = text[:STYLE_LIMIT].rsplit(';', 1)[0] + ' …'
+    for old in list(_style_cache):
+        if isinstance(old, tuple) and old[0] == key[0]:
+            del _style_cache[old]
     _style_cache[key] = text
     return text
 
@@ -1969,7 +1972,7 @@ def reserved_changes(paths, reserved, owned=()):
 
 def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
                 base='HEAD', subtask=None, owned_paths=None, earlier_review_notes='', reserved_paths=None,
-                style_reference=None, kind=None):
+                kind=None):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
 
     Per round: pre-review gate (cheap deterministic checks, repaired by the implementer), the
@@ -2101,9 +2104,6 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         if unknown:
             notes = ('CSS classes used in this change that no stylesheet of the project defines: '
                      + ', '.join(unknown) + '. Check whether an existing class was meant. ')
-        if style_reference:
-            notes += (f'UI reference for this part: {style_reference}. Compare layout, components and texts with it; '
-                      'a visible difference without reason is a finding. ')
         drift = outside_owned(full_stats['files'], owned_paths)
         if drift:
             notes = ('Changes outside the files this part owns (' + ', '.join(owned_paths) + '): '
@@ -2358,7 +2358,9 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'write a bare double quote: copy quoted words from the task with single quotes (\'Nieuwe run\'). '
         'The JSON object has plan_version=2 and tasks (2-20 objects). Each task contains '
         'id, title, depends_on (list of prior task ids), and owned_paths (explicit source '
-        'files or directories). Example: ATS_DAG_JSON: '
+        'files or directories). For UI parts add reference_screen: the repository-relative path of an existing '
+        'similar screen or component from the style inventory. Do not invent a path. '
+        'For non-UI parts omit it. Example: ATS_DAG_JSON: '
         '{"plan_version":2,"tasks":[{"id":"contract","title":"Define shared event contracts",'
         '"depends_on":[],"owned_paths":["contracts/"]},'
         '{"id":"scorer","title":"Implement sender safety scoring with regression tests",'
@@ -2400,8 +2402,6 @@ def preplan_task(task, task_id, folder, agent, unavailable, conf, quiet=False,
         'owned_paths unless both edits are unavoidable. Do not invent parallel tasks '
         'merely to increase concurrency; contract consumers must wait until reviewed. '
         'Never have two agents modify the same file concurrently. '
-        'For a part that adds or changes a screen, add "style_reference": an existing file and screen '
-        'whose layout and components it should follow (for example "ats_host/web/app.js: project settings"). '
         'Every part needs a testable acceptance criterion; include file boundaries '
         'where they are known. Do not include credentials, raw email data, '
         'deployment, live trading, or deletion without explicit approval. '
@@ -2524,6 +2524,9 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
     together = (f'Another agent builds part {alongside[0]} ({alongside[1]}) AT THE SAME TIME in a separate '
                 'copy; do not implement it and avoid changing the same code. ' if alongside else '')
     node = dag_node(plan, part)
+    reference = style_guard.reference_context(folder, node)
+    description += reference
+    review_task += reference
     owned = list(node['owned_paths']) if node else []
     carried = review_handoff.relevant_findings(prior_cycles, part, owned)
     previous_note = review_handoff.handoff_note(carried)
@@ -2557,9 +2560,6 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
             ownership += ('Do NOT edit these files (the parallel part owns them, or earlier runs showed they cause '
                           'conflicts): ' + ', '.join(off_limits[:20]) + '; ATS blocks the part if you do. ')
     contract_notes = ''
-    if node and node.get('style_reference'):
-        contract_notes += (f"UI REFERENCE: read {node['style_reference']} first and build this part's screens the same "
-                           'way: the same components, classes, spacing and tone of text. ')
     if node:
         provided = node.get('contracts_provided', [])
         required = node.get('contracts_required', [])
@@ -2614,8 +2614,7 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
             quiet=quiet, base=base, subtask=number, owned_paths=owned,
-            earlier_review_notes=previous_note, reserved_paths=reserved,
-            style_reference=node.get('style_reference') if node else None)
+            earlier_review_notes=previous_note, reserved_paths=reserved)
     except RuntimeError as exc:   # e.g. the part produced no changes
         record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
                blocking_reasons=[f'subtask {number}: {exc}'])
@@ -3068,13 +3067,15 @@ def distill_learnings(task, task_id, folder, history, preferred, unavailable, qu
               + json.dumps(findings[:40], ensure_ascii=False) +
               '\nAlready known (do not repeat): ' + json.dumps(known, ensure_ascii=False) +
               '\nWrite at most 5 learnings that help FUTURE tasks avoid these problems: general and actionable, '
-              'Write a style or UI-consistency finding as a project rule that names the component, class or '
-              'token to use instead (for example: inside .composer use the .input class on textareas). '
               'not a description of this change; skip one-off typos. kind: "lesson" (insight), "rule" (always/never '
               'do X) or "pattern". scope: "shared" when it applies to any project, else "project". risk: "high" only '
               'if following it could delete or overwrite data, rewrite git history, weaken review/tests/security, '
               'touch credentials or money, or do something irreversible; otherwise "low". evidence: file:line or '
-              'finding id.\nEnd with ONE LINE: ATS_LEARNINGS_JSON: [{"kind":"lesson","title":"<title>",'
+              'finding id. For style/visual consistency findings, propose an actionable project-scoped rule '
+              'that names the existing component, design token or reference screen to reuse. Do not generalize '
+              'one project palette into a shared rule. Only describe a fix as established when a later '
+              'independent review confirms it; unresolved findings are evidence for investigation, not proven fixes. '
+              'Keep the existing risk checks and never weaken validation.\nEnd with ONE LINE: ATS_LEARNINGS_JSON: [{"kind":"lesson","title":"<title>",'
               '"observation":"<observation>","evidence":"<evidence>","scope":"project","risk":"low"}] '
               '(replace the placeholders, or use []).')
     tree = index_tree(folder)

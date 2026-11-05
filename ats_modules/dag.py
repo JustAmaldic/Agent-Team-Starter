@@ -23,6 +23,11 @@ def validate_dag(plan):
         ids.add(node["id"])
         if not isinstance(node.get("title"), str) or not 12 <= len(node["title"].strip()) <= 1000:
             raise ValueError("DAG task needs bounded description")
+        reference = node.get("reference_screen")
+        if reference is not None and (not isinstance(reference, str) or not reference.strip()
+                                     or len(reference) > 240 or reference.startswith(("/", "\\"))
+                                     or ".." in reference.split("/") or "\\" in reference or ":" in reference):
+            raise ValueError("Invalid reference_screen")
         deps = node.get("depends_on", [])
         paths = node.get("owned_paths", [])
         if not isinstance(deps, list) or len(set(map(str, deps))) != len(deps) or not all(isinstance(x, str) for x in deps):
@@ -76,10 +81,8 @@ def validate_dag(plan):
     return {"plan_version": 2, "tasks": [
         {"id": n["id"], "title": n["title"].strip(), "depends_on": list(n.get("depends_on", [])),
          "owned_paths": list(n["owned_paths"]),
-         **({key: list(n[key]) for key in ("contracts_provided", "contracts_required") if key in n}),
-         # An existing file or screen whose layout and components a UI part should follow.
-         **({"style_reference": n["style_reference"].strip()[:200]}
-            if isinstance(n.get("style_reference"), str) and n["style_reference"].strip() else {})}
+         **({"reference_screen": n["reference_screen"]} if n.get("reference_screen") else {}),
+         **({key: list(n[key]) for key in ("contracts_provided", "contracts_required") if key in n})}
         for n in nodes
     ]}
 
