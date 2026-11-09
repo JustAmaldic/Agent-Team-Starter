@@ -34,6 +34,9 @@ from ats_modules import review_handoff
 from ats_modules import run_report
 from ats_modules import severity as severity_floor
 from ats_modules import findings_ledger
+from ats_modules import screen_map
+from ats_modules import snapshots
+from ats_modules import ui_preview
 from ats_modules import style_check
 from ats_modules import test_env
 from ats_modules import usage as usage_meter
@@ -753,7 +756,10 @@ def claude_print_command():
     --add-dir lets Claude read POLICY.md and AGENTS.md: ATS lives outside the task worktree, and
     Claude Code otherwise denies reading files outside its working directory.
     """
-    return agent_command('claude', '-p', '--permission-mode', 'acceptEdits', '--add-dir', str(ATS),
+    extra = []
+    for directory in usage_meter.context().get('read_dirs') or ():
+        extra += ['--add-dir', str(directory)]   # e.g. the review's screenshots, outside the worktree
+    return agent_command('claude', '-p', '--permission-mode', 'acceptEdits', '--add-dir', str(ATS), *extra,
                          '--allowedTools', *claude_allowed_tools())
 
 
@@ -1715,6 +1721,23 @@ def style_context(folder, conf=None):
 
 
 _repo_context = {}
+_screen_context = {}
+
+
+def screen_context(folder, conf, task_id=None):
+    """The screens the task names, from the project's .ats-screens.json (see screen_map). Made once per
+    task, like the repository map, so every prompt of the task starts with the same text."""
+    if not (conf or {}).get('screen_map', True):
+        return ''
+    if task_id and task_id in _screen_context:
+        return _screen_context[task_id]
+    data, problem = screen_map.load(folder)
+    if problem and task_id:
+        record('screen_map_invalid', problem, task_id)
+    text = screen_map.context(data, _run_flags.get(task_id, {}).get('task', '')) if data else ''
+    if task_id:
+        _screen_context[task_id] = text
+    return text
 
 
 def repo_context(folder, conf, task_id=None):
@@ -1766,6 +1789,7 @@ def shared_prefix(folder, conf, task_id=None, style=None):
             + test_env.agent_instructions(conf or {}, _test_env)
             + style
             + task_knowledge(task_id, run.get('task', ''), run.get('paths', ()))
+            + screen_context(folder, conf, task_id)
             + repo_context(folder, conf, task_id) + '\n\n')
 
 
@@ -1970,9 +1994,129 @@ def reserved_changes(paths, reserved, owned=()):
             and not (owned and dag_planning.paths_conflict([p], owned))]
 
 
+def environment_reason(broken):
+    """Why test commands that cannot start block the run (never something an agent repairs)."""
+    names = ', '.join(' '.join(c['command']) if isinstance(c['command'], list) else str(c['command'])
+                      for c in broken)
+    module = next((c['missing_module'] for c in broken if c.get('missing_module')), None)
+    if module:
+        return (f'test environment incomplete: {module} is not installed in the Python that runs '
+                f'{names}. Install the project requirements in .venv (or set python_env in '
+                f'.ats-project.json); agents never install packages: {broken[0]["output"][-200:]}')
+    return (f'test command cannot start on this computer: {names}. Fix test_commands in '
+            f'.ats-project.json (for example python3 instead of python): {broken[0]["output"][-200:]}')
+
+
+_background = None
+
+
+def background():
+    """Threads for work that runs next to a review (the full tests)."""
+    global _background
+    if _background is None:
+        import concurrent.futures
+        _background = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='ats-bg')
+    return _background
+
+
+def snapshot_parent():
+    folder = state_directory().parent / 'snapshots'
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def commands_can_start(conf, folder):
+    """Every test command's program exists (checked before the review starts, so a computer that cannot
+    run the tests still stops the run before any agent is spent on it)."""
+    path = isolated_env(folder).get('PATH')
+    for command in conf.get('test_commands', []):
+        try:
+            argv = shlex.split(command, posix=os.name != 'nt') if isinstance(command, str) else [str(p) for p in command]
+        except ValueError:
+            return False
+        if not argv:
+            return False
+        program = argv[0].strip('"')
+        if not (shutil.which(program, path=path) or (Path(folder) / program).is_file() or Path(program).is_file()):
+            return False
+    return True
+
+
+def tests_alongside_review(conf):
+    """Run the full test commands at the same time as the review (parallel_review_tests, default on).
+
+    Only with the pre-review gate on: its fast checks and the tests of the changed files have passed
+    before the review starts, so a review is rarely spent on code whose tests fail. Approval still
+    needs every test command to pass."""
+    return bool(conf.get('parallel_review_tests', True) and conf.get('pre_review_gate', True)
+                and conf.get('test_commands'))
+
+
+def snapshot_checks(conf, folder, tree):
+    """The project's test commands on a throw-away checkout of exactly `tree`, so files the tests
+    write never land in the worktree the reviewer is reading."""
+    with snapshots.checkout(folder, tree, parent=snapshot_parent()) as copy:
+        return run_checks(conf, copy)
+
+
+PARALLEL_TESTS_NOTE = (
+    'TESTS RUN IN PARALLEL: this time the full test commands run at the same time as your review, so their '
+    'results are not available to you (Checks shows them as running). The pre-review gate (fast checks and the '
+    'tests of the changed files) passed. ATS approves only when every test command passes; do not run the whole '
+    'suite yourself. Judge the code and the tests that were added or changed.')
+
+
+def failing_tests_note(checks):
+    failed = [c for c in checks or [] if not c.get('passed')]
+    if not failed:
+        return ''
+    return ('\n\nATS: the full test commands, which ran in parallel with the review, FAILED. Repair them as well '
+            '(they block approval even when the review approves): '
+            + json.dumps([{'command': c['command'], 'output': c['output'][-1200:]} for c in failed],
+                         ensure_ascii=False))
+
+
+def ui_review(task_id, context, folder, base, tree, changed, conf, cycle, reference, cache):
+    """Screenshots of the changed screens for the reviewer (ui_preview). Returns (note, folder)."""
+    preview = ui_preview.settings(conf)
+    if not preview or not ui_preview.touches_ui(changed):
+        return '', None
+    data, _ = screen_map.load(folder)
+    jobs, notes = ui_preview.plan(data, changed, reference)
+    where = f"part{context['subtask']}" if context.get('subtask') is not None else 'task'
+    directory = state_directory() / 'screenshots' / str(task_id) / where
+    shots = []
+    if jobs and not ui_preview.playwright_available():
+        notes.append("No screenshots: Playwright is not installed for ATS's Python (pip install playwright, then "
+                     'python -m playwright install chromium). ATS never installs it itself.')
+        jobs = []
+    if jobs:
+        phase('preview', task_id, **context, cycle=cycle)
+        env = isolated_env(folder)
+        try:
+            if preview['before'] and 'before' not in cache:
+                before = [dict(j, role='before') for j in jobs if j['role'] == 'after']
+                with snapshots.checkout(folder, base, parent=snapshot_parent()) as copy:
+                    taken, problem = ui_preview.capture(copy, preview, before, directory, 'before', env)
+                cache['before'] = taken
+                if problem:
+                    notes.append('No "before" screenshots: ' + problem)
+            with snapshots.checkout(folder, tree, parent=snapshot_parent()) as copy:
+                taken, problem = ui_preview.capture(copy, preview, jobs, directory, f'after-c{cycle}', env)
+            shots = cache.get('before', []) + taken
+            if problem:
+                notes.append('No screenshots of this change: ' + problem)
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+            notes.append('No screenshots: the preview could not run: ' + str(exc)[:300])
+    result = {'shots': shots, 'notes': notes}
+    record('ui_preview', f"{len([s for s in shots if not s.get('error')])} screenshots", task_id, **context,
+           cycle=cycle, directory=str(directory), shots=shots, notes=notes)
+    return ui_preview.reviewer_note(result, directory), (directory if shots else None)
+
+
 def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
                 base='HEAD', subtask=None, owned_paths=None, earlier_review_notes='', reserved_paths=None,
-                kind=None):
+                kind=None, reference_screen=None):
     """Independent review with enforced read-only reviewer and POLICY feedback loop.
 
     Per round: pre-review gate (cheap deterministic checks, repaired by the implementer), the
@@ -1995,6 +2139,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
     stuck = budgets.StuckDetector()
     reviewed_tree = None
     drift_reported = False
+    preview_cache = {}
     for cycle in range(max_revisions + 1):
         spent = budget.exceeded()
         if spent:
@@ -2010,24 +2155,18 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             if stop:
                 reasons = [stop]
                 break
-        phase('checks', task_id, **context, cycle=cycle)
-        checks = run_checks(conf, folder)
+        parallel_tests = tests_alongside_review(conf) and bool(gate_results) and commands_can_start(conf, folder)
+        checks = [] if parallel_tests else None
+        if not parallel_tests:
+            phase('checks', task_id, **context, cycle=cycle)
+            checks = run_checks(conf, folder)
         # Repair a narrowly failing test before spending tokens on a full diff review.
         # A successful repair still goes through the independent review below.
         failed = [c for c in checks if not c['passed']]
         broken = [c for c in failed if c.get('cannot_start')]
         if broken:
             # Never let an agent "fix" this by changing the computer (e.g. installing a python shim).
-            names = ', '.join(' '.join(c['command']) if isinstance(c['command'], list) else str(c['command'])
-                              for c in broken)
-            module = next((c['missing_module'] for c in broken if c.get('missing_module')), None)
-            if module:
-                reasons = [f'test environment incomplete: {module} is not installed in the Python that runs '
-                           f'{names}. Install the project requirements in .venv (or set python_env in '
-                           f'.ats-project.json); agents never install packages: {broken[0]["output"][-200:]}']
-            else:
-                reasons = [f'test command cannot start on this computer: {names}. Fix test_commands in '
-                           f'.ats-project.json (for example python3 instead of python): {broken[0]["output"][-200:]}']
+            reasons = [environment_reason(broken)]
             record('blocked', reasons[0], task_id, **context, implementer=implementer)
             break
         if (failed and cycle < max_revisions and conf.get('targeted_test_fix', True)
@@ -2086,6 +2225,10 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             reasons = ['diff too large to review completely']
             break
         tree = index_tree(folder)
+        pending = None
+        if parallel_tests:
+            phase('checks', task_id, **context, cycle=cycle, parallel=True)
+            pending = background().submit(snapshot_checks, conf, folder, tree)
         full_stats = review_scope.diff_stats(diff)
         risk = intelligence.risk_profile(task, full_stats['files'])
         level, level_reason = review_scope.review_level(task, full_stats, risk, conf)
@@ -2104,6 +2247,20 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         if unknown:
             notes = ('CSS classes used in this change that no stylesheet of the project defines: '
                      + ', '.join(unknown) + '. Check whether an existing class was meant. ')
+        if conf.get('screen_map', True):
+            screens, _ = screen_map.load(folder)
+            missing = screen_map.uncovered(folder, screens, pre_gate.added_lines(diff))
+            if missing:
+                notes += (f'New screens this change adds that {screen_map.FILE} does not list: '
+                          + ', '.join(f"{m['name']} ({m['files'][0]})" for m in missing[:8])
+                          + f'. Report a MINOR finding asking to add them to {screen_map.FILE} (name, aliases, '
+                          'route, files, functions, tests). ')
+        if parallel_tests:
+            notes += PARALLEL_TESTS_NOTE + ' '
+        shots_note, shots_dir = ui_review(task_id, context, folder, base, tree, full_stats['files'], conf, cycle,
+                                          reference_screen, preview_cache)
+        if shots_note:
+            notes += '\n' + shots_note + '\n'
         drift = outside_owned(full_stats['files'], owned_paths)
         if drift:
             notes = ('Changes outside the files this part owns (' + ', '.join(owned_paths) + '): '
@@ -2112,9 +2269,15 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                 record('ownership_drift', 'Changes outside the owned paths', task_id, **context,
                        implementer=implementer, paths=drift[:50], owned_paths=list(owned_paths))
                 drift_reported = True
-        phase('review', task_id, **context, cycle=cycle, reviewer=preferred, implementer=implementer)
-        prompt = review_prompt(task, checks, diff, history, prefix=prefix, gate=gate_results, level=level,
+        phase('review', task_id, **context, cycle=cycle, reviewer=preferred, implementer=implementer,
+              **({'tests_parallel': True} if parallel_tests else {}))
+        shown_checks = checks if not parallel_tests else [
+            {'command': c, 'passed': None, 'status': 'running in parallel with this review'}
+            for c in conf.get('test_commands', [])]
+        prompt = review_prompt(task, shown_checks, diff, history, prefix=prefix, gate=gate_results, level=level,
                                delta=delta, full_stats=full_stats, base=base, notes=(earlier_review_notes + '\n' + notes).strip())
+        if shots_dir:
+            usage_meter.set_context(read_dirs=[str(shots_dir)])
         try:
             reviewer, review = invoke_with_fallback(preferred, prompt, folder, unavailable, task_id, 'review',
                                                     quiet=quiet, fallback=False)
@@ -2130,10 +2293,27 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             record('review_skipped', str(exc)[:1200], task_id, **context, implementer=implementer, reviewer=preferred)
             reasons = ['review failed']
             break
+        finally:
+            if shots_dir:
+                usage_meter.set_context(read_dirs=[])
         tampered = restore_if_changed(folder, tree)
         if tampered:
             print(f'ATS: reviewer {reviewer} changed files in review-only mode; reverted: '
                   + ', '.join(tampered[:10]), file=sys.stderr)
+        if pending is not None:
+            try:
+                checks = pending.result()
+            except Exception as exc:   # e.g. no checkout possible: run them here, the review is done
+                record('tests_parallel_fallback', str(exc)[:300], task_id, **context)
+                checks = run_checks(conf, folder)
+                restore_if_changed(folder, tree)
+            record('tests_parallel', 'Full tests ran next to the review', task_id, live=False, **context,
+                   cycle=cycle, passed=all(c['passed'] for c in checks), tests=checks)
+            broken = [c for c in checks if not c['passed'] and c.get('cannot_start')]
+            if broken:
+                reasons = [environment_reason(broken)]
+                record('blocked', reasons[0], task_id, **context, implementer=implementer)
+                break
         verdict = parse_verdict(review)
         findings = findings_ledger.with_fingerprints(
             floored(normalize_findings(parse_marked_json(review, 'ATS_FINDINGS_JSON')), task_id, context), folder)
@@ -2195,6 +2375,12 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         if repeated:
             reasons = reasons + ['stuck: ' + repeated]
             break
+        if parallel_tests and any(not c['passed'] for c in checks):
+            repeated = stuck.same_failure(tuple(sorted(
+                (str(c['command']), c['output'][-300:]) for c in checks if not c['passed'])), 'tests')
+            if repeated:
+                reasons = reasons + ['stuck: ' + repeated]
+                break
         if cycle == max_revisions:
             break
         spent = budget.exceeded()
@@ -2206,10 +2392,11 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         before = worktree_tree(folder)
         try:
             implementer, response = invoke_with_fallback(
-                implementer, revision_prompt(task, review, findings, prefix=prefix,
-                                             handoff=handoff_summary(folder, base)),
+                implementer, revision_prompt(task, review + (failing_tests_note(checks) if parallel_tests else ''),
+                                             findings, prefix=prefix, handoff=handoff_summary(folder, base)),
                 folder, unavailable, task_id, 'revision', quiet=quiet,
-                resume_prompt=revision_followup(review, findings))
+                resume_prompt=revision_followup(review + (failing_tests_note(checks) if parallel_tests else ''),
+                                                findings))
         except AgentUsageExhausted as exc:
             print(str(exc), file=sys.stderr)
             record('blocked', str(exc), task_id, **context, phase='revision', resets=exc.resets)
@@ -2614,7 +2801,8 @@ def run_part(task, plan, number, total, part, task_id, folder, branch, implement
         approved, reviewer, author, cycles = review_loop(
             review_task, task_id, folder, branch, author, unavailable, conf,
             quiet=quiet, base=base, subtask=number, owned_paths=owned,
-            earlier_review_notes=previous_note, reserved_paths=reserved)
+            earlier_review_notes=previous_note, reserved_paths=reserved,
+            reference_screen=(node or {}).get('reference_screen'))
     except RuntimeError as exc:   # e.g. the part produced no changes
         record('escalated', str(exc), task_id, subtask=number, implementer=author, branch=branch,
                blocking_reasons=[f'subtask {number}: {exc}'])
@@ -3662,6 +3850,57 @@ def agent_check(agents=None):
     return report
 
 
+SCREEN_TASK = (
+    'Create or complete {file} in the project root: the map ATS uses to find the files of the screen a task names. '
+    'Below is a draft ATS made from the code; check every entry against the code. Keep entries a person already '
+    'wrote (no "generated" flag) unchanged unless they are wrong. For each real screen of the app: one entry with '
+    'name (as the app shows it), aliases (how the user says it, in Dutch and English, for example '
+    "'apparaatpagina', 'device detail'), route (path or #hash that opens it), preview (a path that opens it "
+    'without parameters, e.g. with a demo id, only when the route has a parameter), files (the HTML/JS/CSS and '
+    'server files that build it), symbols (render functions or components), api (endpoints it calls) and tests. '
+    'Merge entries that are the same screen (a view section and the function that renders it); drop entries that '
+    'are not a screen (helpers, small toggles); remove the "generated" flag from entries you checked. Change no '
+    'other file. Draft from the code: {draft}')
+
+
+SCREEN_TASK_LIMIT = 3900   # the ATS app accepts tasks up to 4000 characters
+
+
+def screen_task(draft):
+    """The task text with a compact draft (name | route | files | functions, one screen per entry)."""
+    lines = []
+    for screen in draft.get('screens', []):
+        mark = '' if screen.get('generated') else ' (written by a person)'
+        lines.append(' | '.join([screen['name'] + mark, screen.get('route') or '-', ','.join(screen.get('files', [])[:3]),
+                                 ','.join(screen.get('symbols', [])[:3])]))
+    head = SCREEN_TASK.format(file=screen_map.FILE, draft='')
+    room = SCREEN_TASK_LIMIT - len(head) - 80
+    text, kept = '', 0
+    for line in lines:
+        if len(text) + len(line) + 3 > room:
+            break
+        text += ('; ' if text else '') + line
+        kept += 1
+    if kept < len(lines):
+        text += f'; … {len(lines) - kept} more, look for them in the code'
+    return head + '[name | route | files | functions] ' + text
+
+
+def screens_command(text=None, task=False):
+    data, problem = screen_map.load(APP)
+    if text is not None:
+        return {'file': screen_map.FILE, 'exists': data is not None, 'problem': problem,
+                'matches': screen_map.match(data, text), 'context': screen_map.context(data, text).strip()}
+    draft, added = screen_map.generate(APP, data)
+    result = {'file': screen_map.FILE, 'exists': data is not None, 'problem': problem,
+              'screens': len((data or {}).get('screens', [])), 'detected_new': added}
+    if task:
+        result['task'] = screen_task(draft)
+    else:
+        result['draft'] = draft
+    return result
+
+
 def child_run(argv):
     if not argv: raise RuntimeError('Usage: ats run -- command [args]')
     p=subprocess.Popen(argv,cwd=APP,start_new_session=(os.name!='nt'))
@@ -3693,6 +3932,7 @@ def main():
     p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('env-check', help='Check that the test commands find the project requirements (JSON)')
+    p=sub.add_parser('screens', help='Show the screen map, a draft of it, the screens a task names, or the task that completes it (JSON)');p.add_argument('--match');p.add_argument('--task',action='store_true',help='Print the task text that lets agents complete .ats-screens.json through a normal reviewed run')
     p=sub.add_parser('agent-check', help='Run each installed agent CLI on a tiny fixture repo and check ATS markers (JSON)');p.add_argument('--agent',action='append')
     sub.add_parser('performance')
     p=sub.add_parser('report', help='Summarize the run reports of the last days');p.add_argument('--days',type=positive_days,default=7)
@@ -3734,6 +3974,8 @@ def main():
             report = agent_check(args.agent)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if all(r['ok'] for r in report['agents'].values()) else 1
+        elif args.command=='screens':
+            print(json.dumps(screens_command(args.match, args.task), ensure_ascii=False, indent=2))
         elif args.command=='env-check':
             conf = project()
             base = {key: value for key, value in os.environ.items() if not key.startswith('ATS_')}

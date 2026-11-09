@@ -225,6 +225,9 @@ Project settings in `.ats-project.json` (all optional):
 | `review_same_provider_fallback` | `false` | allow a new session of the same provider to review when the other agent is unavailable |
 | `context_package` | `true` | repository map and part context in prompts |
 | `knowledge_budget` | `4000` | characters of vetted learnings per task |
+| `parallel_review_tests` | `true` | run the full test commands at the same time as the review, in a throw-away checkout (needs the pre-review gate); approval still needs every test to pass |
+| `screen_map` | `true` | use `.ats-screens.json` in prompts and reviews (see below) |
+| `ui_preview` | off | start the app and give the reviewer screenshots of the changed screens (see below) |
 
 `ATS_SESSION_REUSE=0` turns session reuse off; `ATS_SESSION_MAX_TURNS` (4) and `ATS_SESSION_MAX_CONTEXT` (400000 new tokens; cache reads do not count) bound it.
 
@@ -262,4 +265,55 @@ never bypasses independent review. For DAG UI tasks, include e.g.
 worktree. The planner is instructed to choose it from the inventory. Legacy list
 plans remain valid; put the reference file directly in their part description.
 Style findings use the existing learning call to produce project-scoped rules;
-there is no extra learning-agent invocation or screenshot step.
+there is no extra learning-agent invocation.
+
+### Screen map
+
+`.ats-screens.json` in the project root tells ATS which files, functions, routes and tests make
+up each screen, and how the user calls it:
+
+```json
+{"version": 1, "screens": [
+  {"name": "Device detail", "aliases": ["apparaatpagina", "device pagina"], "route": "#device",
+   "files": ["static/js/overzicht.js", "static/index.html"], "symbols": ["showDevicePage"],
+   "api": ["GET /api/devices/{id}"], "tests": ["tests/test_devices.py"]}]}
+```
+
+When a task names a screen (by name, alias, route or function; also inside Dutch compounds such as
+`instellingenpagina`), planner, builder and reviewer get its files in the prompt and start there
+instead of searching the repository. A task that talks about a screen without naming a known one
+gets the list of screens. A change that adds a screen the map does not list gets a MINOR finding.
+
+`ats screens` prints a draft made from the code (render functions, `view-…` sections, file-based
+and router-config routes, HTML page handlers) next to what is already listed. `ats screens --task`
+prints a task text: run it as a normal task and the agents complete the map (aliases, routes,
+merging duplicates) through the usual review and pull request. `ats screens --match "<text>"`
+shows what a task would get.
+
+### Screenshots for the reviewer
+
+With `ui_preview` and a screen map, a change to UI files gets screenshots: ATS starts the app on a
+free 127.0.0.1 port in a throw-away checkout, opens each changed screen (and the part's
+`reference_screen`) with Playwright at the configured widths, and gives the reviewer the PNG files:
+`before` (base), `after` (this change) and `reference`. Browser console errors go along as text.
+
+```json
+{"ui_preview": {"command": "python3 server.py --port {port}", "url": "http://127.0.0.1:{port}",
+                "ready_path": "/", "timeout": 40, "widths": [1280, 390], "before": true}}
+```
+
+A route with a parameter needs a `preview` path in the screen map (for example `/devices/demo`).
+`env` adds variables for the preview app (no secrets). Playwright must be installed for the Python
+that runs ATS (`pip install playwright`, then `python -m playwright install chromium`); ATS never
+installs it. A preview that cannot start is a note for the reviewer, never a blocked run. The
+images stay in ATS's state folder (`~/.ats-state/…/screenshots/<run>`), not in the repository.
+
+### Tests next to the review
+
+With the pre-review gate on, the fast checks and the tests of the changed files pass before the
+review starts. The full test commands then run at the same time as the review, in a throw-away
+checkout of exactly the reviewed code (files the tests write never reach the worktree). Approval
+waits for them: a failing suite blocks approval and goes back to the builder together with the
+review's findings. A test command whose program is missing still stops the run before any agent
+starts. `parallel_review_tests: false` restores the old order (tests first, the reviewer sees their
+output).
