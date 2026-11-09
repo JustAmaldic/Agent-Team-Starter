@@ -347,6 +347,40 @@ class ParallelReviewTests(unittest.TestCase):
         self.assertIn('after · Apparaten · 800px', review)
         self.assertEqual(next(f for k, f in events if k == 'review_result')['tampered_paths'], [])
 
+    def test_a_review_that_stops_early_waits_for_the_running_tests(self):
+        # Otherwise the tests' checkout is still in use when the worktree is removed (fails on Windows).
+        finished = []
+        real = ats.snapshot_checks
+
+        def slow(conf, folder, tree):
+            result = real(conf, folder, tree)
+            finished.append(True)
+            return result
+
+        def exhausted(*args, **kwargs):
+            raise ats.AgentUsageExhausted('claude', 'resets 11am')
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        folder = repo(temp.name, {'app.py': 'x = 1\n', 'check.py': 'import time\ntime.sleep(1)\n'})
+        (folder / 'app.py').write_text('x = 2\n')
+        gate = [{'name': 'targeted tests', 'level': 'targeted', 'status': 'passed', 'detail': ''}]
+        with patch.object(ats, 'invoke', side_effect=exhausted), \
+             patch.object(ats, 'snapshot_checks', side_effect=slow), \
+             patch.object(ats, 'snapshot_parent', return_value=pathlib.Path(outside.name)), \
+             patch.object(ats, 'record'), patch.object(ats, 'phase'), \
+             patch.object(ats, 'pre_review_gate', return_value=(gate, 'codex', None)), \
+             patch.object(ats, 'shared_prefix', return_value=''), \
+             patch.object(ats, 'enabled_agents', return_value=['codex', 'claude']), \
+             patch('sys.stderr'):
+            approved, *_ = ats.review_loop('task', 'tid', folder, 'ats/b', 'codex', ats.UnavailableAgents(),
+                                           {'test_commands': [f'{sys.executable} check.py'], 'max_revisions': 0},
+                                           quiet=True)
+        self.assertFalse(approved)
+        self.assertEqual(finished, [True])
+
     def test_off_switch_and_missing_program_keep_the_old_order(self):
         approved, prompts, events, _ = self.run_loop('pass\n', [self.APPROVE], {'parallel_review_tests': False})
         self.assertTrue(approved)

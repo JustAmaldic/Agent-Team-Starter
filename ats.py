@@ -2052,6 +2052,17 @@ def tests_alongside_review(conf):
                 and conf.get('test_commands'))
 
 
+def settle(pending):
+    """Wait for tests still running next to a review that stopped early, so their checkout is removed
+    before the run (or a caller) cleans up the worktree; Windows cannot delete files still in use."""
+    if pending is None:
+        return
+    try:
+        pending.result()
+    except Exception:   # the outcome no longer matters: the review did not finish
+        pass
+
+
 def snapshot_checks(conf, folder, tree):
     """The project's test commands on a throw-away checkout of exactly `tree`, so files the tests
     write never land in the worktree the reviewer is reading."""
@@ -2286,12 +2297,14 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             record('review_skipped', str(exc), task_id, **context, implementer=implementer,
                    reviewer=preferred, resets=exc.resets)
             reasons = ['reviewer usage exhausted']
+            settle(pending)
             break
         except RuntimeError as exc:
             restore_if_changed(folder, tree)
             print(f'ATS: review by {preferred} failed: {exc}', file=sys.stderr)
             record('review_skipped', str(exc)[:1200], task_id, **context, implementer=implementer, reviewer=preferred)
             reasons = ['review failed']
+            settle(pending)
             break
         finally:
             if shots_dir:
