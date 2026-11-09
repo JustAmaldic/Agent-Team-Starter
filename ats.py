@@ -3860,7 +3860,30 @@ SCREEN_TASK = (
     'server files that build it), symbols (render functions or components), api (endpoints it calls) and tests. '
     'Merge entries that are the same screen (a view section and the function that renders it); drop entries that '
     'are not a screen (helpers, small toggles); remove the "generated" flag from entries you checked. Change no '
-    'other file. Draft: {draft}')
+    'other file. Draft from the code: {draft}')
+
+
+SCREEN_TASK_LIMIT = 3900   # the ATS app accepts tasks up to 4000 characters
+
+
+def screen_task(draft):
+    """The task text with a compact draft (name | route | files | functions, one screen per entry)."""
+    lines = []
+    for screen in draft.get('screens', []):
+        mark = '' if screen.get('generated') else ' (written by a person)'
+        lines.append(' | '.join([screen['name'] + mark, screen.get('route') or '-', ','.join(screen.get('files', [])[:3]),
+                                 ','.join(screen.get('symbols', [])[:3])]))
+    head = SCREEN_TASK.format(file=screen_map.FILE, draft='')
+    room = SCREEN_TASK_LIMIT - len(head) - 80
+    text, kept = '', 0
+    for line in lines:
+        if len(text) + len(line) + 3 > room:
+            break
+        text += ('; ' if text else '') + line
+        kept += 1
+    if kept < len(lines):
+        text += f'; … {len(lines) - kept} more, look for them in the code'
+    return head + '[name | route | files | functions] ' + text
 
 
 def screens_command(text=None, task=False):
@@ -3872,7 +3895,7 @@ def screens_command(text=None, task=False):
     result = {'file': screen_map.FILE, 'exists': data is not None, 'problem': problem,
               'screens': len((data or {}).get('screens', [])), 'detected_new': added}
     if task:
-        result['task'] = SCREEN_TASK.format(file=screen_map.FILE, draft=json.dumps(draft, ensure_ascii=False))
+        result['task'] = screen_task(draft)
     else:
         result['draft'] = draft
     return result

@@ -145,6 +145,11 @@ class ScreenMapTests(unittest.TestCase):
         self.assertIn('renderDeviceDetail', result['task'])
         self.assertIn('.ats-screens.json', result['task'])
         self.assertEqual(matched['matches'], [])
+        many = {'screens': [{'name': f'Screen {i}', 'route': f'/s{i}', 'files': [f'web/s{i}.js'],
+                             'symbols': [f'renderScreen{i}'], 'generated': True} for i in range(200)]}
+        text = ats.screen_task(many)
+        self.assertLessEqual(len(text), 4000)              # the app accepts tasks up to 4000 characters
+        self.assertIn('more, look for them in the code', text)
 
 
 class SnapshotTests(unittest.TestCase):
