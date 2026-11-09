@@ -100,7 +100,7 @@ def plan(data, changed, reference=None) -> tuple[list[dict], list[str]]:
             if not target:
                 notes.append(f"No screenshot of {screen['name']}: it has no route or preview path in {screen_map.FILE}.")
                 continue
-            if re.search(r'[:{\[]', target.split('#', 1)[0]) and not screen.get('preview'):
+            if re.search(r'[:{\[<]', target.split('#', 1)[0]) and not screen.get('preview'):
                 notes.append(f"No screenshot of {screen['name']}: its route {target} has a parameter; add a "
                              f"preview path with an example value to {screen_map.FILE}.")
                 continue

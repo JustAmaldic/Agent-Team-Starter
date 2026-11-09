@@ -198,6 +198,8 @@ class PreviewPlanTests(unittest.TestCase):
         jobs, notes = ui_preview.plan(self.DATA, ['web/device.js'])
         self.assertEqual(jobs, [])
         self.assertIn('has a parameter', notes[0])
+        jobs, notes = ui_preview.plan({'screens': [{'name': 'Run', 'route': '/app/run/<id>', 'files': ['r.js']}]}, ['r.js'])
+        self.assertEqual(jobs, [])
         jobs, notes = ui_preview.plan(None, ['web/device.js'])
         self.assertIn('.ats-screens.json', notes[0])
         self.assertFalse(ui_preview.touches_ui(['server.py', 'README.md']))
