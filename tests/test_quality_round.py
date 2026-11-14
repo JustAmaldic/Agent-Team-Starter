@@ -181,6 +181,19 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(chosen, 'claude')
 
 
+class StreamSequenceTests(unittest.TestCase):
+    def test_live_stream_lines_are_numbered_per_writer(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'events.jsonl'
+            with mock.patch.dict(os.environ, {'ATS_EVENTS_FILE': str(path)}):
+                ats.emit({'event_type': 'phase', 'timestamp': 't1'})
+                ats.emit({'event_type': 'phase', 'timestamp': 't2'})
+            first, second = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(second['stream_seq'], first['stream_seq'] + 1)
+            self.assertEqual(first['stream_src'], str(os.getpid()))
+
+
 class CliFixtureTests(unittest.TestCase):
     REPORT = {'ats': 'agent-check', 'platform': 'darwin', 'agents': {
         'claude': {'version': '2.1.0 (Claude Code)', 'ok': True, 'problems': [], 'review_tail': 'secret out'},

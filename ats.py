@@ -473,6 +473,9 @@ RUN_PROGRESS_LOCK = threading.Lock()
 _run_progress = {}   # task id -> number of persisted review_result events, including parallel parts
 
 
+_stream_seq = 0
+
+
 def emit(item):
     """Append one event as a JSON line to ATS_EVENTS_FILE for a live consumer.
 
@@ -481,9 +484,13 @@ def emit(item):
     path = os.environ.get('ATS_EVENTS_FILE')
     if not path:
         return
+    global _stream_seq
     try:
-        line = json.dumps(item, ensure_ascii=False, default=str) + '\n'
         with EMIT_LOCK, open(path, 'a', encoding='utf-8') as handle:   # parallel parts emit from two threads
+            # A number per writer, so the consumer can tell a lost or repeated line from a quiet run.
+            _stream_seq += 1
+            line = json.dumps(dict(item, stream_seq=_stream_seq, stream_src=str(os.getpid())),
+                              ensure_ascii=False, default=str) + '\n'
             handle.write(line)
             handle.flush()
     except OSError:
