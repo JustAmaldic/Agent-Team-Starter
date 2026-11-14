@@ -54,7 +54,12 @@
     "tests_parallel",
     "tests_parallel_fallback",
     "ui_preview",
-    "screen_map_invalid"
+    "screen_map_invalid",
+    "test_flaky",
+    "screen_map_stale",
+    "dependency_changes",
+    "agent_routing",
+    "write_scope"
   ],
   "run_finished_v1": {
     "description": "One persisted run_finished event per task_flow invocation, after all work including base update and publishing. Live phase finished is not a completion record. Preflight failures may have no assigned event. A hard process termination cannot guarantee completion storage.",

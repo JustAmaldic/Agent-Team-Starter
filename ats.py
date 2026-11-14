@@ -31,6 +31,8 @@ from ats_modules import lenient_json
 from ats_modules import plan_learning
 from ats_modules import review_scope
 from ats_modules import review_handoff
+from ats_modules import write_scope
+from ats_modules import cli_fixture
 from ats_modules import run_report
 from ats_modules import severity as severity_floor
 from ats_modules import findings_ledger
@@ -471,6 +473,9 @@ RUN_PROGRESS_LOCK = threading.Lock()
 _run_progress = {}   # task id -> number of persisted review_result events, including parallel parts
 
 
+_stream_seq = 0
+
+
 def emit(item):
     """Append one event as a JSON line to ATS_EVENTS_FILE for a live consumer.
 
@@ -479,9 +484,13 @@ def emit(item):
     path = os.environ.get('ATS_EVENTS_FILE')
     if not path:
         return
+    global _stream_seq
     try:
-        line = json.dumps(item, ensure_ascii=False, default=str) + '\n'
         with EMIT_LOCK, open(path, 'a', encoding='utf-8') as handle:   # parallel parts emit from two threads
+            # A number per writer, so the consumer can tell a lost or repeated line from a quiet run.
+            _stream_seq += 1
+            line = json.dumps(dict(item, stream_seq=_stream_seq, stream_src=str(os.getpid())),
+                              ensure_ascii=False, default=str) + '\n'
             handle.write(line)
             handle.flush()
     except OSError:
@@ -1415,28 +1424,52 @@ def invoke(agent, prompt, cwd, quiet=False, backoff=None, purpose='implementatio
     return out
 
 
-def select(task):
+def route(task):
+    """(agent, scores, reasons): which enabled agent implements this task and why.
+
+    Scores come from routing keywords in the task, the approvals of the last 100 review results and,
+    with enough samples, the measured results per task category.
+    """
     conf=project()
     scores={name: 0 for name in enabled_agents()}
     if not scores:
         raise RuntimeError('No available agents: check the host weekly usage limits.')
+    reasons={name: [] for name in scores}
     keywords={'codex':['test','bug','python','fix'], 'claude':['architecture','design','refactor']}
     keywords.update(conf.get('routing',{}))
     for agent, words in keywords.items():
-        if agent in scores: scores[agent] += sum(2 for x in words if x.lower() in task.lower())
+        hits=[x for x in words if x.lower() in task.lower()]
+        if agent in scores and hits:
+            scores[agent] += 2 * len(hits)
+            reasons[agent].append(f"keywords {', '.join(hits[:5])}: +{2 * len(hits)}")
     events=sorted((DATA / cleanname(conf.get('project', APP.name)) / 'events').glob('*.json'))[-100:]
+    history={name: 0 for name in scores}
     for file in events:
         try:
             e=read_json(file); agent=e.get('implementer')
             if agent in scores and e.get('event_type')=='review_result':
-                scores[agent] += 1 if e.get('approved') else -1
+                history[agent] += 1 if e.get('approved') else -1
         except (ValueError,OSError): pass
+    for agent, value in history.items():
+        if value:
+            scores[agent] += value
+            reasons[agent].append(f'recent reviews: {value:+d}')
     metrics = intelligence.performance(intelligence.read_events(DATA / cleanname(conf.get('project', APP.name)) / 'events'))
     relevant = set(intelligence.categories(task))
     for row in metrics:
         if row['reliable'] and row['agent'] in scores and row['category'] in relevant:
-            scores[row['agent']] += round(4 * row['approval_rate'] - min(3, row['revisions'] / row['samples']))
-    return max(scores,key=lambda n:(scores[n],n==conf.get('default_agent','codex')))
+            value = round(4 * row['approval_rate'] - min(3, row['revisions'] / row['samples']))
+            scores[row['agent']] += value
+            reasons[row['agent']].append(f"{row['category']} results ({row['samples']} runs): {value:+d}")
+    default = conf.get('default_agent','codex')
+    chosen = max(scores,key=lambda n:(scores[n],n==default))
+    if len(set(scores.values())) == 1 and len(scores) > 1:
+        reasons[chosen].append('equal scores: project default' if chosen == default else 'equal scores')
+    return chosen, scores, reasons
+
+
+def select(task):
+    return route(task)[0]
 
 NON_GIT_EXCLUDED_NAMES = {
     '.ats', '.git', '.venv', 'venv', 'node_modules', '__pycache__',
@@ -1610,10 +1643,23 @@ def skipped_tests(output):
     return total
 
 
+def flaky_retry_command(cmd):
+    """The command for the one extra run after a failure: pytest only repeats what failed (--lf)."""
+    if isinstance(cmd, str) and re.search(r'\bpytest\b', cmd) and '--lf' not in cmd and '--last-failed' not in cmd:
+        return cmd + ' --lf'
+    return cmd
+
+
 def run_checks(conf, folder):
+    """Run the project's test commands. A command that fails is run once more (flaky_rerun, default on,
+    only when the first run took under flaky_rerun_max_seconds): when it then passes, the test is
+    unstable rather than broken by this change, so it counts as passed and is marked `flaky`."""
     checks = []
+    timeout = int(conf.get('test_timeout', 900))
     for cmd in conf.get('test_commands', []):
-        outcome = run_check(cmd, folder, timeout=int(conf.get('test_timeout', 900)))
+        started = time.monotonic()
+        outcome = run_check(cmd, folder, timeout=timeout)
+        took = time.monotonic() - started
         output = (outcome.stdout or '') + (outcome.stderr or '')
         check = {'command': cmd, 'passed': outcome.returncode == 0, 'output': output[-1000:]}
         skipped = skipped_tests(output)
@@ -1622,8 +1668,36 @@ def run_checks(conf, folder):
         if outcome.returncode and cannot_start(outcome.returncode, output, folder):
             check['cannot_start'] = True
             check['missing_module'] = test_env.missing_module(output, folder)
+        elif (outcome.returncode and conf.get('flaky_rerun', True)
+              and took <= float(conf.get('flaky_rerun_max_seconds', 300))):
+            again = run_check(flaky_retry_command(cmd), folder, timeout=timeout)
+            if again.returncode == 0:
+                check.update(passed=True, flaky=True, first_output=output[-600:],
+                             output=((again.stdout or '') + (again.stderr or ''))[-1000:])
         checks.append(check)
     return checks
+
+
+def note_flaky(checks, task_id, **context):
+    """Record test commands that failed once and passed on the rerun (no repair round is spent on them)."""
+    for check in checks or []:
+        if check.get('flaky') and not check.get('flaky_recorded'):
+            check['flaky_recorded'] = True
+            record('test_flaky', f"Unstable test: {str(check['command'])[:200]} failed once and passed on the rerun",
+                   task_id, **context, command=str(check['command'])[:300], rerun_passed=True,
+                   confidence='medium', first_output=check.get('first_output', '')[-600:])
+
+
+def checks_for_prompt(checks):
+    """Checks as the reviewer sees them: a passing command needs no output (saves tokens every review)."""
+    slim = []
+    for check in checks or []:
+        item = {k: v for k, v in check.items() if k not in ('first_output', 'flaky_recorded')}
+        if item.get('passed') and not item.get('skipped') and not item.get('flaky'):
+            lines = (item.get('output') or '').strip().splitlines()
+            item['output'] = lines[-1][:200] if lines else ''
+        slim.append(item)
+    return slim
 
 
 CANNOT_START = re.compile(r"cannot run test command|command not found|No such file or directory|"
@@ -1734,7 +1808,13 @@ def screen_context(folder, conf, task_id=None):
     data, problem = screen_map.load(folder)
     if problem and task_id:
         record('screen_map_invalid', problem, task_id)
+    data, stale = screen_map.refresh(folder, data)
+    if stale and task_id:
+        record('screen_map_stale', f'{len(stale)} paths in {screen_map.FILE} no longer exist', task_id,
+               stale=stale[:20], relocated=len([s for s in stale if s['now']]))
     text = screen_map.context(data, _run_flags.get(task_id, {}).get('task', '')) if data else ''
+    if stale:
+        text += '\n' + screen_map.stale_note(stale)
     if task_id:
         _screen_context[task_id] = text
     return text
@@ -1872,7 +1952,7 @@ def review_prompt(task, checks, diff, history, style='', *, prefix=None, gate=No
             + f"\nReview ONLY these application changes for task {task!r} using {ATS/'POLICY.md'}.\n"
             + (notes + '\n' if notes else '')
             + previous_findings(history) + gate_text
-            + 'Checks: ' + json.dumps(checks, ensure_ascii=False) + '\n' + changes)
+            + 'Checks: ' + json.dumps(checks_for_prompt(checks), ensure_ascii=False) + '\n' + changes)
 
 
 RESPONSES_CONTRACT = (
@@ -2093,7 +2173,10 @@ def ui_review(task_id, context, folder, base, tree, changed, conf, cycle, refere
     if not preview or not ui_preview.touches_ui(changed):
         return '', None
     data, _ = screen_map.load(folder)
+    data, stale = screen_map.refresh(folder, data)   # a renamed file must not hide its screen from the preview
     jobs, notes = ui_preview.plan(data, changed, reference)
+    if stale:
+        notes.append(screen_map.stale_note(stale))
     where = f"part{context['subtask']}" if context.get('subtask') is not None else 'task'
     directory = state_directory() / 'screenshots' / str(task_id) / where
     shots = []
@@ -2171,6 +2254,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         if not parallel_tests:
             phase('checks', task_id, **context, cycle=cycle)
             checks = run_checks(conf, folder)
+            note_flaky(checks, task_id, **context, cycle=cycle)
         # Repair a narrowly failing test before spending tokens on a full diff review.
         # A successful repair still goes through the independent review below.
         failed = [c for c in checks if not c['passed']]
@@ -2260,12 +2344,24 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                      + ', '.join(unknown) + '. Check whether an existing class was meant. ')
         if conf.get('screen_map', True):
             screens, _ = screen_map.load(folder)
+            screens, stale_paths = screen_map.refresh(folder, screens)
+            if stale_paths:
+                notes += (screen_map.stale_note(stale_paths) + f' Report a MINOR finding when this change does not '
+                          f'correct {screen_map.FILE}. ')
             missing = screen_map.uncovered(folder, screens, pre_gate.added_lines(diff))
             if missing:
                 notes += (f'New screens this change adds that {screen_map.FILE} does not list: '
                           + ', '.join(f"{m['name']} ({m['files'][0]})" for m in missing[:8])
                           + f'. Report a MINOR finding asking to add them to {screen_map.FILE} (name, aliases, '
                           'route, files, functions, tests). ')
+        dependencies = pre_gate.dependency_changes(diff)
+        if dependencies:
+            notes += pre_gate.dependency_note(dependencies)
+            flags = _run_flags.setdefault(task_id, {})
+            if flags.get('dependencies') != dependencies:
+                flags['dependencies'] = dependencies
+                record('dependency_changes', f'{len(dependencies)} dependency files changed', task_id, **context,
+                       cycle=cycle, files=dependencies[:20])
         if parallel_tests:
             notes += PARALLEL_TESTS_NOTE + ' '
         shots_note, shots_dir = ui_review(task_id, context, folder, base, tree, full_stats['files'], conf, cycle,
@@ -2320,6 +2416,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                 record('tests_parallel_fallback', str(exc)[:300], task_id, **context)
                 checks = run_checks(conf, folder)
                 restore_if_changed(folder, tree)
+            note_flaky(checks, task_id, **context, cycle=cycle)
             record('tests_parallel', 'Full tests ran next to the review', task_id, live=False, **context,
                    cycle=cycle, passed=all(c['passed'] for c in checks), tests=checks)
             broken = [c for c in checks if not c['passed'] and c.get('cannot_start')]
@@ -3543,7 +3640,10 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
         raise RuntimeError('This project is not a Git repository. Run .ats task without --push; local changes will be exported as a patch.')
     if agent != 'auto' and agent not in enabled_agents():
         raise RuntimeError(f'{agent} is disabled. Use .ats agents --enable {agent}')
-    agent=select(task) if agent=='auto' else agent
+    routing = None
+    if agent == 'auto':
+        agent, route_scores, route_reasons = route(task)
+        routing = {'chosen': agent, 'scores': route_scores, 'reasons': route_reasons}
     unavailable=UnavailableAgents()
     branch='ats/'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d-%H%M%S')+'-'+task_id[:8]
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
@@ -3584,6 +3684,24 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
             raise RuntimeError('Source checkpoint is stale or invalid. Existing code was not modified')
     record('assigned',task,task_id,implementer=agent,branch=branch,task_categories=intelligence.categories(task))
     record('risk_profile', 'Risk-based execution profile', task_id, **risk)
+    if routing:
+        record('agent_routing', f"Routing chose {routing['chosen']}: "
+               + '; '.join(f"{name} {score}" for name, score in sorted(routing['scores'].items())), task_id, **routing)
+    outside = write_scope.external_targets(task, APP) if conf.get('write_scope', 'block') != 'off' else []
+    if outside:
+        problem = write_scope.reason(outside)
+        if conf.get('write_scope', 'block') == 'warn':
+            record('write_scope', 'Task names write targets outside the project', task_id, categories=outside,
+                   blocked=False)
+            print('ATS: warning: ' + problem, file=sys.stderr)
+        else:
+            # Before any agent starts; the event holds the path category only, never the path.
+            record('write_scope', 'Task names write targets outside the project', task_id, categories=outside,
+                   blocked=True)
+            record('blocked', problem, task_id, branch=branch, blocking_reasons=[problem])
+            print('ATS: ' + problem, file=sys.stderr)
+            phase('finished', task_id, approved=False, branch=branch)
+            return 'blocked'
     resolved_env = configure_test_env(conf)
     if resolved_env['env'] is not None:
         print(f"ATS: tests use the virtualenv {resolved_env['env']}.", flush=True)
@@ -3788,11 +3906,20 @@ def finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer
             return 'approved'
         base=conf.get('base_branch','main')
         outcome=execute(['gh','pr','create','--draft','--base',base,'--head',branch,'--title','ATS: '+task[:65],
-                         '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n{attribution}\nReview/check outcomes in ATS data. Human merge required.'],folder)
+                         '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n{attribution}\n{dependency_lines(task_id)}Review/check outcomes in ATS data. Human merge required.'],folder)
         print(outcome.stdout)
         phase('pr_created', task_id, url=outcome.stdout.strip()[-300:])
     phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
     return 'approved'
+
+
+def dependency_lines(task_id):
+    """New or changed dependencies, always listed separately in the PR description."""
+    changes = [c for c in _run_flags.get(task_id, {}).get('dependencies', []) if c.get('added')]
+    if not changes:
+        return ''
+    return ('New or changed dependencies:\n' + '\n'.join(f"- {c['file']}: {', '.join(c['added'][:10])}" for c in changes[:10])
+            + '\n')
 
 
 AGENT_CHECK_REVIEW = (
@@ -3947,6 +4074,7 @@ def main():
     sub.add_parser('env-check', help='Check that the test commands find the project requirements (JSON)')
     p=sub.add_parser('screens', help='Show the screen map, a draft of it, the screens a task names, or the task that completes it (JSON)');p.add_argument('--match');p.add_argument('--task',action='store_true',help='Print the task text that lets agents complete .ats-screens.json through a normal reviewed run')
     p=sub.add_parser('agent-check', help='Run each installed agent CLI on a tiny fixture repo and check ATS markers (JSON)');p.add_argument('--agent',action='append')
+    p.add_argument('--fixture', help='Also write an anonymous fixture (versions, OS, error categories) to this JSON file; with an existing file the differences are printed')
     sub.add_parser('performance')
     p=sub.add_parser('report', help='Summarize the run reports of the last days');p.add_argument('--days',type=positive_days,default=7)
     p=sub.add_parser('feedback');p.add_argument('comments_json');p.add_argument('--existing-ids')
@@ -3986,6 +4114,16 @@ def main():
         elif args.command=='agent-check':
             report = agent_check(args.agent)
             print(json.dumps(report, ensure_ascii=False, indent=2))
+            if args.fixture:
+                target = Path(args.fixture)
+                fixture = cli_fixture.build(report)
+                if target.is_file():
+                    try:
+                        for line in cli_fixture.compare(read_json(target), fixture) or ['same outcome as the saved fixture']:
+                            print('ATS fixture: ' + line, file=sys.stderr)
+                    except (ValueError, OSError):
+                        pass
+                target.write_text(json.dumps(fixture, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
             return 0 if all(r['ok'] for r in report['agents'].values()) else 1
         elif args.command=='screens':
             print(json.dumps(screens_command(args.match, args.task), ensure_ascii=False, indent=2))

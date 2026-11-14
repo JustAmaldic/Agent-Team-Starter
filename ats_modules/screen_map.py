@@ -356,3 +356,60 @@ def for_files(data, paths) -> list[dict]:
     paths = set(paths or ())
     hits = [s for s in data.get('screens', []) if paths & set(s.get('files', []))]
     return sorted(hits, key=lambda s: len(s.get('files', [])))
+
+
+def refresh(folder, data) -> tuple[dict | None, list[dict]]:
+    """The map with file paths that no longer exist looked up again, and what was stale.
+
+    A screen's file may be renamed or moved between planning and review. A missing path is searched
+    again by file name: exactly one file with that name means it moved (the map is used with the new
+    path), otherwise the path is dropped. Returns (map to use, [{'screen', 'path', 'now'}]); the file
+    on disk is not changed, the agent is asked to update it in its change.
+    """
+    if not data:
+        return data, []
+    folder = Path(folder)
+    stale, by_name, screens = [], None, []
+    for screen in data.get('screens', []):
+        fixed = dict(screen)
+        for field in ('files', 'tests'):
+            kept = []
+            for path in screen.get(field, []):
+                if (folder / path).exists():
+                    kept.append(path)
+                    continue
+                if by_name is None:
+                    by_name = {}
+                    for found in tracked_like(folder):
+                        by_name.setdefault(PurePosixPath(found).name, []).append(found)
+                moved = by_name.get(PurePosixPath(path).name, [])
+                now = moved[0] if len(moved) == 1 else None
+                stale.append({'screen': screen['name'], 'path': path, 'now': now})
+                if now and now not in kept:
+                    kept.append(now)
+            if field in screen:
+                fixed[field] = kept
+        screens.append(fixed)
+    return {**data, 'screens': screens}, stale
+
+
+def tracked_like(folder) -> list[str]:
+    """Every file below the project (skipping dependency and build folders), as posix paths."""
+    folder = Path(folder)
+    found = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith('.')]
+        for name in files:
+            found.append((Path(root) / name).relative_to(folder).as_posix())
+            if len(found) >= MAX_FILES * 5:
+                return found
+    return found
+
+
+def stale_note(stale) -> str:
+    if not stale:
+        return ''
+    parts = [f"{s['path']} ({s['screen']})" + (f" is now {s['now']}" if s['now'] else ' no longer exists')
+             for s in stale[:8]]
+    return (f'STALE PATHS in {FILE}: ' + '; '.join(parts) + f'. Do not rely on those entries; find the current '
+            f'files in the code and correct {FILE} in this change.')

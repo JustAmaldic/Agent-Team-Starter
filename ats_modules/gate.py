@@ -65,6 +65,61 @@ def added_lines(diff: str) -> dict[str, list[str]]:
     return found
 
 
+DEPENDENCY_FILES = re.compile(
+    r'(^|/)(requirements[^/]*\.txt|pyproject\.toml|setup\.py|setup\.cfg|Pipfile|package\.json|go\.mod|Cargo\.toml|'
+    r'Gemfile|composer\.json|pom\.xml|build\.gradle(\.kts)?)$')
+LOCK_FILES = re.compile(r'(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock|Cargo\.lock|'
+                        r'uv\.lock|go\.sum|composer\.lock|Gemfile\.lock)$')
+_PY_REQ = re.compile(r'^\s*["\']?([A-Za-z0-9][A-Za-z0-9._-]*)\s*(\[[^\]]*\])?\s*([<>=!~]=?[^"\',;#]*)?')
+_JSON_DEP = re.compile(r'^\s*"(@?[\w./-]+)"\s*:\s*"([~^<>=*\w./:#@+-]*)"\s*,?\s*$')
+_JSON_SKIP = {'name', 'version', 'description', 'main', 'module', 'type', 'license', 'author', 'homepage',
+              'repository', 'private', 'types', 'bin', 'url', 'email', 'node', 'npm'}
+
+
+def dependency_changes(diff: str) -> list[dict]:
+    """New or changed dependencies in this change: [{'file', 'added': [...]}].
+
+    Read from the added lines of dependency manifests; lock files are only named. A heuristic for the
+    reviewer and the PR description, never a reason to fail the gate.
+    """
+    found = []
+    for path, lines in added_lines(diff).items():
+        if LOCK_FILES.search(path):
+            found.append({'file': path, 'added': [], 'lock': True})
+            continue
+        if not DEPENDENCY_FILES.search(path):
+            continue
+        names = []
+        for line in lines:
+            text = line.strip()
+            if not text or text.startswith(('#', '//', '[', '-r ', '--')):
+                continue
+            if path.endswith('.json'):
+                hit = _JSON_DEP.match(text)
+                if hit and hit.group(1) not in _JSON_SKIP and hit.group(2)[:1] in ('~', '^', '<', '>', '=', '*') + tuple('0123456789'):
+                    names.append(f'{hit.group(1)} {hit.group(2)}'.strip())
+            elif path.endswith('.txt') or path.endswith('pyproject.toml') and text.startswith(('"', "'")):
+                hit = _PY_REQ.match(text)
+                if hit:
+                    names.append((hit.group(1) + (hit.group(3) or '')).strip())
+            else:
+                names.append(text[:80])
+        if names:
+            found.append({'file': path, 'added': names[:20]})
+    return found
+
+
+def dependency_note(changes) -> str:
+    listed = [c for c in changes or [] if c.get('added')]
+    if not listed:
+        return ''
+    return ('NEW OR CHANGED DEPENDENCIES in this change: '
+            + '; '.join(f"{c['file']}: {', '.join(c['added'][:10])}" for c in listed[:6])
+            + '. Check that each one is really needed for the task, is a known maintained package under that exact '
+            'name (typosquatting) and is pinned the way the project pins its other dependencies. An unneeded or '
+            'unknown dependency is a MAJOR finding. ')
+
+
 def conflict_markers(diff: str):
     hits = [path for path, lines in added_lines(diff).items() if CONFLICT.search('\n'.join(lines))]
     return result('conflict markers', FAST, FAILED if hits else PASSED,
