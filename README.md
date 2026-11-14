@@ -334,3 +334,16 @@ output).
 - **CLI fixture.** `ats agent-check --fixture cli-fixture.json` also writes an anonymous record
   (CLI versions, OS, error categories; paths, tokens and e-mail addresses redacted) and prints
   what differs from the fixture already in that file.
+
+## Fixing the merge conflicts of a pull request
+
+    ats task "Resolve the merge conflicts of pull request #12" --fix-pr 12 --pr-head feature-x --pr-base main --push
+
+ATS starts a worktree at the head of the pull request, merges its base in and lets an agent resolve
+the conflicts with one rule above all: keep the functionality of both sides. Afterwards the merge
+guard compares the names both sides define (functions, classes, tests, routes, constants, ids) with
+the resolved files and gives the reviewer every name that disappeared, unless one side removed it on
+purpose (`merge_guard` event). The other agent reviews the whole change on top of the new base and
+every test command must pass. Only then is the pull request's own branch updated, with a normal
+fast-forward push: never forced, so work pushed meanwhile is never overwritten. ATS never merges the
+pull request. Pull requests from forks are not supported.
