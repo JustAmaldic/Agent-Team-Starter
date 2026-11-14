@@ -59,7 +59,9 @@
     "screen_map_stale",
     "dependency_changes",
     "agent_routing",
-    "write_scope"
+    "write_scope",
+    "merge_guard",
+    "pr_conflicts_resolved"
   ],
   "run_finished_v1": {
     "description": "One persisted run_finished event per task_flow invocation, after all work including base update and publishing. Live phase finished is not a completion record. Preflight failures may have no assigned event. A hard process termination cannot guarantee completion storage.",

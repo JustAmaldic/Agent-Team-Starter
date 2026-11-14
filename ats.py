@@ -32,6 +32,7 @@ from ats_modules import plan_learning
 from ats_modules import review_scope
 from ats_modules import review_handoff
 from ats_modules import write_scope
+from ats_modules import merge_guard
 from ats_modules import cli_fixture
 from ats_modules import run_report
 from ats_modules import severity as severity_floor
@@ -3487,12 +3488,16 @@ def fresh_base(conf):
     return 'HEAD'
 
 
-def update_from_base(task, task_id, folder, branch, conf, implementer, unavailable, quiet=False):
+def update_from_base(task, task_id, folder, branch, conf, implementer, unavailable, quiet=False, rules='',
+                     guard=None):
     """Bring the latest base branch into the task branch before it is published.
 
     Already up to date: nothing to do. A clean merge whose checks pass: done. A conflict or failing
     checks: the implementer resolves it and the other agent reviews the whole change on top of the
     new base (same approval gate). Returns (ok, review cycles).
+
+    `rules`: extra instructions for the agent that resolves (used when fixing a pull request).
+    `guard`: called after the resolution, returns a note for the reviewer (see merge_guard).
     """
     base = conf.get('base_branch', 'main')
     ref = f'origin/{base}'
@@ -3519,6 +3524,7 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
         problem = (f'While you worked, {base} changed. Merging it into your branch produced conflicts in: '
                    + ', '.join(conflicts[:30]) + f'. Resolve every conflict marker: keep everything that is new on '
                    f'{base} and re-apply the intent of your change on top of it.')
+    problem += rules
     record('merge_conflict', problem[:1200], task_id, implementer=implementer, branch=branch, base=ref,
            files=conflicts[:50] if merged.returncode else [])
     fixer = implementer if implementer not in unavailable else ('claude' if implementer == 'codex' else 'codex')
@@ -3532,11 +3538,13 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
         record('escalated', str(exc), task_id, branch=branch, blocking_reasons=[f'update with {ref}: {exc}'])
         return False, []
     record('implementation', output[-1600:], task_id, implementer=fixer, branch=branch)
+    guard_note = guard(folder) if guard else ''
     review_task = (f'{task}\n(Update: the branch was merged with the latest {base}. The diff is the whole change '
                    f'on top of the new {base}; check it is still correct, including the conflict resolution.)')
     try:
         approved, reviewer, fixer, cycles = review_loop(review_task, task_id, folder, branch, fixer, unavailable,
-                                                        conf, quiet=quiet, base=ref, kind='update')
+                                                        conf, quiet=quiet, base=ref, kind='update',
+                                                        earlier_review_notes=guard_note)
     except RuntimeError as exc:
         record('escalated', str(exc), task_id, branch=branch, blocking_reasons=[f'update with {ref}: {exc}'])
         return False, []
@@ -3551,6 +3559,94 @@ def update_from_base(task, task_id, folder, branch, conf, implementer, unavailab
         record('base_merged', f'{ref} merged after a reviewed resolution', task_id, implementer=fixer,
                reviewer=reviewer, branch=branch)
     return approved, cycles
+
+
+PR_CONFLICT_RULES = (
+    ' This branch is pull request #{number}. KEEP THE FUNCTIONALITY OF BOTH SIDES: every function, class, test, '
+    'route, setting, UI element and text that exists on either side must still exist and work after your '
+    'resolution, unless one side removed it on purpose. Never resolve a conflict by taking one side wholesale: '
+    'read both versions, understand what each side intended and combine them. Where both sides changed the same '
+    'lines, write code that does both. In version and changelog files keep the entries of both sides (the pull '
+    'request gets a version above the one on {base}). Do not remove or weaken tests to make the merge pass. '
+    'Change nothing that the merge does not need.')
+BRANCH_NAME = re.compile(r'(?!-)[A-Za-z0-9._/-]{1,200}')
+
+
+def _show(folder, ref, path):
+    out = execute(['git', 'show', f'{ref}:{path}'], folder, check=False)
+    return out.stdout if out.returncode == 0 else None
+
+
+def merge_guard_note(folder, task_id, ours, theirs):
+    """Compare what both sides define with the resolved files; record and return the note for the reviewer."""
+    ancestor = execute(['git', 'merge-base', ours, theirs], folder, check=False).stdout.strip()
+    if not ancestor:
+        return ''
+    changed = lambda ref: set(execute(['git', 'diff', '--name-only', ancestor, ref], folder, check=False).stdout.split('\n'))
+    both = sorted(p for p in changed(ours) & changed(theirs) if p)[:200]
+    files = {}
+    for path in both:
+        target = Path(folder) / path
+        try:
+            resolved = target.read_text(encoding='utf-8', errors='replace') if target.is_file() else None
+        except OSError:
+            resolved = None
+        files[path] = (_show(folder, ancestor, path), _show(folder, ours, path), _show(folder, theirs, path), resolved)
+    found = merge_guard.check(files)
+    record('merge_guard', f'{len(found)} files lost names in the conflict resolution' if found
+           else 'The conflict resolution kept every name of both sides', task_id, files=found[:30],
+           checked=len(both))
+    return merge_guard.note(found)
+
+
+def fix_pr_conflicts(task, task_id, folder, branch, conf, pr, agent, unavailable, push, quiet=False):
+    """Resolve the merge conflicts of an open pull request and update its branch.
+
+    The worktree is on a new ATS branch that starts at the PR's head. The PR's base is merged in; an
+    agent resolves the conflicts under PR_CONFLICT_RULES, the merge guard lists names that got lost,
+    the other agent reviews the whole change and every test command must pass. Only then is the PR's
+    own branch updated, with a normal fast-forward push (never forced). ATS never merges the PR.
+    """
+    number, head, base = pr['number'], pr['head'], pr['base']
+    ours = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+    theirs = f'origin/{base}'
+    pr_conf = dict(conf, base_branch=base)
+    ok, cycles = update_from_base(
+        task, task_id, folder, branch, pr_conf, agent, unavailable, quiet=quiet,
+        rules=PR_CONFLICT_RULES.format(number=number, base=base),
+        guard=lambda where: merge_guard_note(where, task_id, ours, theirs))
+    merged = execute(['git', 'merge-base', '--is-ancestor', theirs, 'HEAD'], folder, check=False).returncode == 0
+    if not ok or not merged:
+        if ok:   # nothing was merged (for example the fetch failed): never report a fix that did not happen
+            reason = f'could not merge {theirs} into pull request #{number}; nothing was changed'
+            record('escalated', reason, task_id, branch=branch, blocking_reasons=[reason])
+        print(f'ATS: the conflicts of pull request #{number} were not resolved; its branch is unchanged.',
+              file=sys.stderr)
+        phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
+        return 'escalated'
+    if execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip() == ours:
+        reason = f'pull request #{number} already contains {theirs}; there is nothing to resolve'
+        record('blocked', reason, task_id, branch=branch, blocking_reasons=[reason])
+        phase('finished', task_id, approved=False, branch=branch)
+        return 'blocked'
+    phase('approved', task_id, cycle=max(0, len(cycles) - 1))
+    if push:
+        phase('pr', task_id, branch=head)
+        # A plain push: it only succeeds as a fast-forward, so work pushed to the PR meanwhile is never lost.
+        pushed = execute(['git', 'push', '--quiet', 'origin', f'HEAD:refs/heads/{head}'], folder, check=False,
+                         timeout=180)
+        if pushed.returncode:
+            reason = (f'the resolution is ready on {branch}, but the branch of pull request #{number} changed '
+                      'meanwhile or could not be pushed: ' + (pushed.stderr or pushed.stdout).strip()[-300:])
+            record('escalated', reason, task_id, branch=branch, blocking_reasons=[reason])
+            phase('finished', task_id, approved=False, branch=branch, worktree=str(folder))
+            return 'escalated'
+        record('pr_conflicts_resolved', f'Pull request #{number} updated with {base}; a human still merges it',
+               task_id, branch=head, number=number, base=base, review_cycles=len(cycles))
+        if pr.get('url'):
+            phase('pr_created', task_id, url=pr['url'])
+    phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
+    return 'approved'
 
 
 def recheck_source(source_id, agent):
@@ -3587,7 +3683,7 @@ def recheck_source(source_id, agent):
 
 
 def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=False, plan_file=None,
-              resume_from=None, recheck_from=None, expect_base=None):
+              resume_from=None, recheck_from=None, expect_base=None, fix_pr=None):
     """Persist run_finished_v1 once, after all work, including base updates and publishing."""
     task_id = preset_task_id() or str(uuid.uuid4())
     started = time.monotonic()
@@ -3597,7 +3693,7 @@ def task_flow(task, agent, push, quiet=False, parallel='auto', approved_risk=Fal
     try:
         outcome = _task_flow(task, agent, push, task_id, quiet=quiet, parallel=parallel,
                              approved_risk=approved_risk, plan_file=plan_file, resume_from=resume_from,
-                             recheck_from=recheck_from, expect_base=expect_base)
+                             recheck_from=recheck_from, expect_base=expect_base, fix_pr=fix_pr)
     except (KeyboardInterrupt, SystemExit):
         outcome = 'interrupted'
         raise
@@ -3627,7 +3723,7 @@ def save_run_report(task_id):
 
 
 def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approved_risk=False,
-               plan_file=None, resume_from=None, recheck_from=None, expect_base=None):
+               plan_file=None, resume_from=None, recheck_from=None, expect_base=None, fix_pr=None):
     conf=project()
     risk = intelligence.risk_profile(task)
     if risk['require_human_approval'] and not approved_risk:
@@ -3649,6 +3745,8 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
     folder=APP.parent / f'{APP.name}-ats-{task_id[:8]}'
     resumed = None
     rechecked = None
+    if fix_pr and (local_mode or resume_from or plan_file or recheck_from):
+        raise RuntimeError('Fixing a pull request needs a Git project and cannot be combined with a plan, resume or recheck')
     if recheck_from:
         if local_mode or resume_from or plan_file:
             raise RuntimeError('Recheck needs a Git project and cannot be combined with a resume or plan file')
@@ -3730,6 +3828,17 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
                    plan_changed=bool(resumed.get('plan_changed')), replanned=resumed.get('replanned', []),
                    routing_changed=bool(resumed.get('routing_changed')))
             print(f'ATS: resuming {resumed["completed"]} reviewed parts on {branch}.', flush=True)
+        elif fix_pr:
+            for name in (fix_pr['head'], fix_pr['base']):
+                if execute(['git', 'fetch', '--quiet', 'origin', name], check=False, timeout=180).returncode:
+                    raise RuntimeError(f'Could not fetch origin/{name} for pull request #{fix_pr["number"]}')
+            start = 'origin/' + fix_pr['head']
+            execute(['git', 'worktree', 'add', '-b', branch, str(folder), start])
+            record('base_commit', 'Branch starts at the head of the pull request', task_id, live=False, branch=branch,
+                   ref=start, commit=execute(['git', 'rev-parse', start], check=False).stdout.strip(),
+                   pull_request=fix_pr['number'])
+            print(f'ATS: resolving the conflicts of pull request #{fix_pr["number"]} ({start} with origin/{fix_pr["base"]}).',
+                  flush=True)
         elif local_mode:
             make_local_workspace(folder, branch)
             print('ATS: project has no Git repository; using an isolated local snapshot.', flush=True)
@@ -3748,6 +3857,9 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
             print(f'ATS: task branch starts from {start}.', flush=True)
         worktree_created=True
         base_commit = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+        if fix_pr:
+            phase('implementation', task_id, implementer=agent, branch=branch, worktree=str(folder))
+            return fix_pr_conflicts(task, task_id, folder, branch, conf, fix_pr, agent, unavailable, push, quiet=quiet)
         if rechecked:
             approved, reviewer, implementer, history = review_loop(
                 task, task_id, folder, branch, agent, unavailable, conf, quiet=quiet,
@@ -4056,6 +4168,18 @@ def child_run(argv):
     finally:
         for sig,handler in original.items():signal.signal(sig,handler)
 
+def pull_request_argument(args):
+    if not args.fix_pr:
+        return None
+    if args.fix_pr < 1 or not args.pr_head or not args.pr_base:
+        raise RuntimeError('--fix-pr needs a pull request number, --pr-head and --pr-base')
+    for name in (args.pr_head, args.pr_base):
+        if not BRANCH_NAME.fullmatch(name) or '..' in name:
+            raise RuntimeError('Invalid branch name for --fix-pr')
+    url = args.pr_url if args.pr_url and re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/pull/\d+', args.pr_url) else None
+    return {'number': args.fix_pr, 'head': args.pr_head, 'base': args.pr_base, 'url': url}
+
+
 def positive_days(value):
     try:
         days = int(value)
@@ -4068,7 +4192,7 @@ def positive_days(value):
 def main():
     parser=argparse.ArgumentParser()
     sub=parser.add_subparsers(dest='command',required=True)
-    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file');p.add_argument('--resume-from');p.add_argument('--recheck-from',help='Test and review the kept worktree of an earlier run again, without rebuilding');p.add_argument('--expect-base',help='Commit the plan was made on; the run stops when the base branch moved')
+    p=sub.add_parser('task');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto');p.add_argument('--push',action='store_true');p.add_argument('--quiet',action='store_true',help='Hide live agent output and progress messages');p.add_argument('--parallel',choices=['auto','always','never'],default='auto',help='Pre-plan and parallelize independent subtasks');p.add_argument('--approve-risk',action='store_true');p.add_argument('--plan-file');p.add_argument('--resume-from');p.add_argument('--recheck-from',help='Test and review the kept worktree of an earlier run again, without rebuilding');p.add_argument('--expect-base',help='Commit the plan was made on; the run stops when the base branch moved');p.add_argument('--fix-pr',type=int,help='Resolve the merge conflicts of this open pull request (needs --pr-head and --pr-base); with --push its branch is updated after review');p.add_argument('--pr-head');p.add_argument('--pr-base');p.add_argument('--pr-url')
     p=sub.add_parser('plan');p.add_argument('description',nargs='+');p.add_argument('--agent',choices=['auto', *SUPPORTED_AGENTS],default='auto')
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('env-check', help='Check that the test commands find the project requirements (JSON)')
@@ -4145,7 +4269,7 @@ def main():
             items = json.loads(Path(args.items_json).read_text(encoding='utf-8'))
             relations = json.loads(Path(args.relations_json).read_text(encoding='utf-8'))
             print(json.dumps(intelligence.relation_issues(items, relations),indent=2))
-        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file,args.resume_from,args.recheck_from,args.expect_base)
+        elif args.command=='task':task_flow(' '.join(args.description),args.agent,args.push,args.quiet,args.parallel,args.approve_risk,args.plan_file,args.resume_from,args.recheck_from,args.expect_base,pull_request_argument(args))
         elif args.command=='plan':preview_task_plan(' '.join(args.description), args.agent)
         elif args.command=='event':record(args.kind,args.summary,args.task)
         elif args.command=='data-sync':sync_private_data()
