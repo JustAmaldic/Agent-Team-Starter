@@ -227,6 +227,8 @@ Project settings in `.ats-project.json` (all optional):
 | `knowledge_budget` | `4000` | characters of vetted learnings per task |
 | `parallel_review_tests` | `true` | run the full test commands at the same time as the review, in a throw-away checkout (needs the pre-review gate); approval still needs every test to pass |
 | `screen_map` | `true` | use `.ats-screens.json` in prompts and reviews (see below) |
+| `flaky_rerun` | `true` | a failing test command is run once more (pytest: only the failed tests); when it then passes it counts as passed and is recorded as unstable (`test_flaky`), so no repair round is spent on it. Skipped when the first run took longer than `flaky_rerun_max_seconds` (300) |
+| `write_scope` | `"block"` | a task that asks to write outside the project (home folder, system or temp folder, another drive, `..`) stops before any agent starts; `"warn"` only records it, `"off"` skips the check. Events hold the path category only |
 | `ui_preview` | off | start the app and give the reviewer screenshots of the changed screens (see below) |
 
 `ATS_SESSION_REUSE=0` turns session reuse off; `ATS_SESSION_MAX_TURNS` (4) and `ATS_SESSION_MAX_CONTEXT` (400000 new tokens; cache reads do not count) bound it.
@@ -317,3 +319,18 @@ waits for them: a failing suite blocks approval and goes back to the builder tog
 review's findings. A test command whose program is missing still stops the run before any agent
 starts. `parallel_review_tests: false` restores the old order (tests first, the reviewer sees their
 output).
+
+## Quality checks added to every run
+
+- **Routing reason.** With `--agent auto` the `agent_routing` event holds the score per agent and
+  why (keywords, recent reviews, results per task category).
+- **Dependencies.** New or changed entries in `requirements*.txt`, `pyproject.toml`, `package.json`
+  and similar files are named to the reviewer (needed? known package? pinned?), recorded as
+  `dependency_changes` and listed separately in the PR description.
+- **Stale screen map.** A path in `.ats-screens.json` that no longer exists is looked up again by
+  file name (a moved file is used with its new path), reported as `screen_map_stale` and the
+  agent is asked to correct the map in its change.
+- **Fewer tokens.** The reviewer gets only the last line of the output of passing test commands.
+- **CLI fixture.** `ats agent-check --fixture cli-fixture.json` also writes an anonymous record
+  (CLI versions, OS, error categories; paths, tokens and e-mail addresses redacted) and prints
+  what differs from the fixture already in that file.
