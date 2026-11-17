@@ -4,7 +4,7 @@ This file is read by every agent before implementation and review. Rules marked 
 
 ## Task lifecycle
 
-`assigned → implementation → pre-review gate → checks → independent review → revisions → approved, or escalated → draft PR (only when approved) → human merge`.
+`assigned → implementation → pre-review gate → checks → independent review → revisions → approved, or escalated → pull request ready for review (only when approved) → human merge`.
 
 ## Roles
 
@@ -81,7 +81,7 @@ A task is approved only when **all** of these hold:
 - no BLOCKER is `deferred`;
 - the diff was reviewed completely (diffs above `max_review_diff_chars` are not reviewed).
 
-Only approved tasks may become a draft PR. Never fake an approval, test result, push or merge.
+Only approved tasks may become a pull request. ATS opens it ready for review (a draft only with `draft_pr: true`) and never merges it. Never fake an approval, test result, push or merge.
 
 ## Spending tokens well (enforced where noted)
 

@@ -225,5 +225,16 @@ class ClarifyTests(unittest.TestCase):
         self.assertIn('meerdere', tie['why'])
 
 
+class PullRequestModeTests(unittest.TestCase):
+    def test_pull_request_is_ready_for_review_unless_draft_is_asked(self):
+        ready = ats.pr_create_command({}, 'main', 'ats/x', 'ATS: t', 'body')
+        self.assertNotIn('--draft', ready)
+        self.assertEqual(ready[:3], ['gh', 'pr', 'create'])
+        self.assertEqual(ready[ready.index('--base') + 1], 'main')
+        self.assertIn('--draft', ats.pr_create_command({'draft_pr': True}, 'main', 'ats/x', 'ATS: t', 'body'))
+        self.assertNotIn('--draft', ats.pr_create_command({'draft_pr': 'yes'}, 'main', 'ats/x', 'ATS: t', 'body'))
+        self.assertNotIn('merge', ' '.join(ready))
+
+
 if __name__ == '__main__':
     unittest.main()
