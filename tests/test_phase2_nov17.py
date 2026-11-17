@@ -152,5 +152,78 @@ class MainCheckTests(unittest.TestCase):
                     ats.main_check('--upload-pack=x')
 
 
+class PreviewCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.app = Path(self.temp.name) / 'app'
+        self.app.mkdir()
+        git('init', '-q', cwd=self.app)
+        git('config', 'user.name', 't', cwd=self.app)
+        git('config', 'user.email', 't@t', cwd=self.app)
+        (self.app / '.ats-screens.json').write_text(json.dumps({'version': 1, 'screens': [
+            {'name': 'Home', 'route': '/', 'files': ['index.html']}]}))
+        (self.app / 'index.html').write_text('<h1>hi</h1>')
+        git('add', '-A', cwd=self.app)
+        git('commit', '-q', '-m', 'x', cwd=self.app)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def check(self, conf, playwright=True, capture=None):
+        state = Path(self.temp.name) / 'state'
+        with mock.patch.object(ats, 'APP', self.app), mock.patch.object(ats, 'project', return_value=conf), \
+                mock.patch.object(ats.ui_preview, 'playwright_available', return_value=playwright), \
+                mock.patch.object(ats.ui_preview, 'capture', side_effect=capture or (lambda *a: ([], 'should not run'))), \
+                mock.patch.object(ats, 'state_directory', return_value=state), mock.patch('builtins.print'):
+            return ats.preview_check()
+
+    def test_missing_settings_and_playwright_are_named_and_nothing_starts(self):
+        result = self.check({}, playwright=False)
+        self.assertFalse(result['ready'])
+        failed = {s['step'] for s in result['steps'] if not s['ok']}
+        self.assertEqual(failed, {'settings', 'playwright'})
+
+    def test_ready_project_takes_one_screenshot_on_a_checkout(self):
+        seen = []
+
+        def capture(folder, preview, jobs, directory, label, env):
+            seen.append((Path(folder), preview['widths'], jobs))
+            return [{'file': 'check-home-1280.png', 'console_errors': []}], None
+        conf = {'ui_preview': {'command': 'python3 -m http.server {port}'}}
+        result = self.check(conf, capture=capture)
+        self.assertTrue(result['ready'], result)
+        self.assertTrue(result['shot'].endswith('check-home-1280.png'))
+        folder, widths, jobs = seen[0]
+        self.assertNotEqual(folder, self.app)               # never in the project itself
+        self.assertEqual((widths, jobs[0]['path']), ([1280], '/'))
+
+    def test_start_problem_is_reported(self):
+        conf = {'ui_preview': {'command': 'python3 nope.py --port {port}'}}
+        result = self.check(conf, capture=lambda *a: ([], 'the preview command stopped with exit code 2'))
+        self.assertFalse(result['ready'])
+        self.assertIn('exit code 2', next(s for s in result['steps'] if s['step'] == 'start')['detail'])
+
+
+class ClarifyTests(unittest.TestCase):
+    MAP = {'version': 1, 'screens': [
+        {'name': 'Projecten', 'aliases': ['projectenlijst'], 'route': '/app'},
+        {'name': 'Inbox', 'aliases': ['meldingen'], 'route': '/app/inbox'},
+        {'name': 'Instellingen', 'aliases': ['settings'], 'route': '/app/instellingen'}]}
+
+    def test_question_only_for_vague_ui_tasks(self):
+        from ats_modules import screen_map
+        self.assertIsNone(screen_map.clarify(self.MAP, 'Maak de knop in de Inbox groter'))
+        self.assertIsNone(screen_map.clarify(self.MAP, 'Repareer de race condition in de runner'))
+        self.assertIsNone(screen_map.clarify(None, 'Maak de knop groter'))
+        vague = screen_map.clarify(self.MAP, 'Maak de knop groter')
+        self.assertEqual(vague['choices'][:3], ['Projecten', 'Inbox', 'Instellingen'])
+        self.assertEqual(vague['default'], 'Projecten')
+        self.assertLessEqual(len(vague['choices']), 4)
+        shared = {'version': 1, 'screens': [{'name': 'Runs', 'aliases': ['lijst']}, {'name': 'Kennis', 'aliases': ['lijst']}]}
+        tie = screen_map.clarify(shared, 'Sorteer de lijst op datum')
+        self.assertEqual(tie['choices'][:2], ['Runs', 'Kennis'])
+        self.assertIn('meerdere', tie['why'])
+
+
 if __name__ == '__main__':
     unittest.main()

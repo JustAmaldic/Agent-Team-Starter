@@ -413,3 +413,40 @@ def stale_note(stale) -> str:
              for s in stale[:8]]
     return (f'STALE PATHS in {FILE}: ' + '; '.join(parts) + f'. Do not rely on those entries; find the current '
             f'files in the code and correct {FILE} in this change.')
+
+
+UI_WORDS = re.compile(
+    r'\b(scherm\w*|pagina\w*|page|pages|screen\w*|knop\w*|button\w*|dropdown\w*|menu\w*|tab|tabblad\w*|kaart\w*|'
+    r'card\w*|dialoog\w*|dialog\w*|modal\w*|venster\w*|formulier\w*|form|layout|styling|stijl\w*|kleur\w*|'
+    r'design|ui|ux|weergave|lijst|overzicht|sidebar|header|footer)\b', re.IGNORECASE)
+
+
+def clarify(data, task: str) -> dict | None:
+    """One question with 2-4 choices when a UI task does not say which screen, else None.
+
+    Deterministic (no agent, no tokens): asked only when the task talks about the interface and the
+    screen map gives no match or several equally good ones. The first choice is the most likely
+    reading; a run started without an answer uses it and says so.
+    """
+    if not data or not task or not UI_WORDS.search(task):
+        return None
+    text = _norm(task)
+    scored = []
+    for screen in data.get('screens', []):
+        hits = [t for t in _terms(screen) if _hit(t, text)]
+        if hits:
+            scored.append((max(len(h) for h in hits), screen['name']))
+    scored.sort(key=lambda item: -item[0])
+    if len(scored) == 1 or (len(scored) > 1 and scored[0][0] > scored[1][0]):
+        return None   # one screen is clearly meant
+    if scored:
+        best = scored[0][0]
+        names = [name for score, name in scored if score == best][:3]
+        why = 'De opdracht past bij meerdere schermen.'
+    else:
+        names = [s['name'] for s in data.get('screens', [])[:3]]
+        why = 'De opdracht noemt geen scherm uit de schermkaart.'
+    if not names:
+        return None
+    return {'question': 'Welk scherm bedoel je?', 'why': why,
+            'choices': names + ['Een ander scherm (leg het uit in de opdracht)'], 'default': names[0]}

@@ -2277,6 +2277,53 @@ def ui_review(task_id, context, folder, base, tree, changed, conf, cycle, refere
     return ui_preview.reviewer_note(result, directory), (directory if shots else None)
 
 
+def preview_check(screen=None):
+    """Is this project ready for screenshot reviews? Checks every step a review would take, on a
+    throw-away checkout of HEAD, and takes one screenshot. Changes nothing in the project.
+
+    Returns {'ready', 'steps': [{'step', 'ok', 'detail'}], 'shot'} and prints ATS_PREVIEW_CHECK_JSON.
+    """
+    conf = project()
+    steps = []
+
+    def step(name, ok, detail=''):
+        steps.append({'step': name, 'ok': bool(ok), 'detail': str(detail)[:400]})
+        return ok
+
+    result = {'ready': False, 'steps': steps, 'shot': None}
+    preview = ui_preview.settings(conf)
+    data, problem = screen_map.load(APP)
+    routed = [s for s in (data or {}).get('screens', []) if s.get('preview') or s.get('route')]
+    if step('settings', preview, 'ui_preview in .ats-project.json' if preview else
+            'no ui_preview with a start command in .ats-project.json'):
+        step('local address', re.match(r'^http://(127\.0\.0\.1|localhost)(:\{port\}|:\d+)?(/|$)', preview['url']),
+             preview['url'])
+    step('screen map', routed, problem or (f'{len(routed)} screens with a route' if routed else
+                                         f'no screen with a route or preview path in {screen_map.FILE}'))
+    step('playwright', ui_preview.playwright_available(),
+         'installed' if ui_preview.playwright_available() else
+         'pip install playwright, then python -m playwright install chromium (ATS never installs it)')
+    if all(s['ok'] for s in steps):
+        target = next((s for s in routed if s['name'] == screen), routed[0])
+        job = {'role': 'check', 'screen': target['name'], 'path': target.get('preview') or target['route']}
+        one = dict(preview, widths=preview['widths'][:1])
+        directory = state_directory() / 'preview-check'
+        try:
+            with snapshots.checkout(APP, 'HEAD', parent=snapshot_parent()) as copy:
+                shots, why = ui_preview.capture(copy, one, [job], directory, 'check', isolated_env(copy))
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError) as exc:
+            shots, why = [], str(exc)
+        if step('start', not why, why or f"the app answered and {target['name']} was opened"):
+            shot = shots[0] if shots else {}
+            if step('screenshot', shots and not shot.get('error'), shot.get('error') or str(directory / shot.get('file', ''))):
+                result['shot'] = str(directory / shot['file'])
+            if shot.get('console_errors'):
+                step('console', False, ' | '.join(shot['console_errors'][:3]))
+    result['ready'] = all(s['ok'] for s in steps)
+    print('ATS_PREVIEW_CHECK_JSON: ' + json.dumps(result, ensure_ascii=False), flush=True)
+    return result
+
+
 def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, quiet=False,
                 base='HEAD', subtask=None, owned_paths=None, earlier_review_notes='', reserved_paths=None,
                 kind=None, reference_screen=None):
@@ -4313,6 +4360,8 @@ def main():
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('env-check', help='Check that the test commands find the project requirements (JSON)')
     p=sub.add_parser('screens', help='Show the screen map, a draft of it, the screens a task names, or the task that completes it (JSON)');p.add_argument('--match');p.add_argument('--task',action='store_true',help='Print the task text that lets agents complete .ats-screens.json through a normal reviewed run')
+    p=sub.add_parser('clarify', help='One question with choices when a UI task does not say which screen (JSON; no agent)');p.add_argument('description',nargs='+')
+    p=sub.add_parser('preview-check', help='Check that screenshot reviews work for this project (start command, screen map, Playwright) and take one screenshot');p.add_argument('--screen')
     p=sub.add_parser('main-check', help='Run the test commands on a clean checkout of origin/<base_branch> (local CI; changes nothing)');p.add_argument('--ref')
     p=sub.add_parser('agent-check', help='Run each installed agent CLI on a tiny fixture repo and check ATS markers (JSON)');p.add_argument('--agent',action='append')
     p.add_argument('--fixture', help='Also write an anonymous fixture (versions, OS, error categories) to this JSON file; with an existing file the differences are printed')
@@ -4352,6 +4401,10 @@ def main():
                              indent=2))
         elif args.command=='risk':
             print(json.dumps(intelligence.risk_profile(' '.join(args.description)),indent=2))
+        elif args.command=='clarify':
+            print(json.dumps({'question': screen_map.clarify(screen_map.load(APP)[0], ' '.join(args.description))}, ensure_ascii=False))
+        elif args.command=='preview-check':
+            sys.exit(0 if preview_check(args.screen)['ready'] else 1)
         elif args.command=='main-check':
             outcome = main_check(args.ref)
             sys.exit(0 if outcome['passed'] in (True, None) else 1)

@@ -371,3 +371,17 @@ Fetches the base branch, checks that exact commit out in a throw-away worktree, 
 command there and prints one `ATS_MAIN_CHECK_JSON` line (commit, passed, per command the result and
 the last output). It changes nothing in the project, its branches or the remote. ATS-app runs it
 after a merge so a red main is visible even without GitHub Actions.
+
+## Screenshot reviews: `ats preview-check`
+
+Checks every step a screenshot review takes (ui_preview settings, a local address, a screen with a
+route, Playwright), then starts the app on a throw-away checkout of HEAD and takes one screenshot.
+It prints one `ATS_PREVIEW_CHECK_JSON` line with each step and why it failed. Nothing in the
+project changes.
+
+## One question before the start: `ats clarify "<task>"`
+
+For a task about the interface that names no screen from `.ats-screens.json`, or matches several
+equally well, it prints one question with two to four choices (JSON). Deterministic, no agent and
+no tokens. ATS-app asks it before starting; without an answer the run uses the first choice and
+says so in the task.
