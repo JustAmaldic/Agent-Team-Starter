@@ -1595,9 +1595,13 @@ def evaluate_approval(verdict, checks, findings, history, reviewer, implementer,
         reasons.append('no independent reviewer')
     if verdict != 'APPROVE':
         reasons.append('verdict: ' + (verdict or 'missing VERDICT line'))
-    failed = [c['command'] for c in checks if not c['passed']]
+    failed = [c['command'] for c in checks if not c['passed'] and not c.get('fails_on_base')]
     if failed:
         reasons.append('failing checks: ' + ', '.join(map(str, failed)))
+    existing = [c['command'] for c in checks if not c['passed'] and c.get('fails_on_base')]
+    if existing:   # still blocks approval, but says it is not this change's fault
+        reasons.append('failing checks that already fail on the base branch (not caused by this change): '
+                       + ', '.join(map(str, existing)))
     if not checks and not conf.get('allow_approval_without_tests', False):
         reasons.append('no test_commands configured (set allow_approval_without_tests to override)')
     open_blocking = [f['id'] for f in findings if f['severity'] in BLOCKING_SEVERITIES]
@@ -1689,11 +1693,75 @@ def note_flaky(checks, task_id, **context):
                    confidence='medium', first_output=check.get('first_output', '')[-600:])
 
 
+FLAKY_REPEAT = 3
+
+
+def flaky_history(command, events_dir) -> int:
+    """How often this test command was recorded as unstable in earlier runs of the project."""
+    count = 0
+    for file in sorted(Path(events_dir).glob('*.json'))[-2000:]:
+        try:
+            event = read_json(file)
+        except (ValueError, OSError):
+            continue
+        if event.get('event_type') == 'test_flaky' and event.get('command') == command:
+            count += 1
+    return count
+
+
+def note_repeated_flaky(checks, task_id, **context):
+    """After FLAKY_REPEAT unstable runs of the same command: propose a task to make that test reliable."""
+    events_dir = DATA / cleanname(project().get('project', APP.name)) / 'events'
+    for check in checks or []:
+        if not check.get('flaky') or check.get('flaky_repeat_recorded'):
+            continue
+        check['flaky_repeat_recorded'] = True
+        command = str(check['command'])[:300]
+        times = flaky_history(command, events_dir)
+        if times >= FLAKY_REPEAT:
+            record('test_flaky_repeated', f'{command[:160]} was unstable in {times} runs: make this test reliable',
+                   task_id, **context, command=command, times=times,
+                   proposed_task=f'Make the unstable test command reliable: {command[:200]} '
+                                 f'(failed and then passed on a rerun in {times} runs).')
+
+
+def mark_failing_on_base(conf, folder, base, checks, task_id, **context):
+    """Run each failing test command once on a clean checkout of the base: a test that fails there too
+    is an existing problem, not something this change broke. Approval still needs every test to pass;
+    the note only keeps the implementer from 'repairing' it blindly and makes the escalation clear."""
+    failed = [c for c in checks or [] if not c['passed'] and not c.get('cannot_start') and 'fails_on_base' not in c]
+    if not failed or not conf.get('baseline_check', True):
+        return []
+    cache = _run_flags.setdefault(task_id, {}).setdefault('base_failures', {})
+    try:
+        ref = execute(['git', 'rev-parse', base], folder).stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return []
+    todo = [c for c in failed if (ref, str(c['command'])) not in cache]
+    if todo:
+        try:
+            with snapshots.checkout(folder, ref, parent=Path(folder).parent) as copy:
+                for check in todo:
+                    outcome = run_check(check['command'], copy, timeout=int(conf.get('test_timeout', 900)))
+                    cache[(ref, str(check['command']))] = outcome.returncode != 0
+        except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+            record('baseline_check_skipped', str(exc)[:300], task_id, **context)
+            return []
+    existing = []
+    for check in failed:
+        check['fails_on_base'] = bool(cache.get((ref, str(check['command']))))
+        if check['fails_on_base']:
+            existing.append(check)
+            record('test_fails_on_base', f"{str(check['command'])[:200]} also fails without this change",
+                   task_id, **context, command=str(check['command'])[:300], base=ref)
+    return existing
+
+
 def checks_for_prompt(checks):
     """Checks as the reviewer sees them: a passing command needs no output (saves tokens every review)."""
     slim = []
     for check in checks or []:
-        item = {k: v for k, v in check.items() if k not in ('first_output', 'flaky_recorded')}
+        item = {k: v for k, v in check.items() if k not in ('first_output', 'flaky_recorded', 'flaky_repeat_recorded')}
         if item.get('passed') and not item.get('skipped') and not item.get('flaky'):
             lines = (item.get('output') or '').strip().splitlines()
             item['output'] = lines[-1][:200] if lines else ''
@@ -2256,6 +2324,8 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
             phase('checks', task_id, **context, cycle=cycle)
             checks = run_checks(conf, folder)
             note_flaky(checks, task_id, **context, cycle=cycle)
+            note_repeated_flaky(checks, task_id, **context, cycle=cycle)
+            mark_failing_on_base(conf, folder, base, checks, task_id, **context, cycle=cycle)
         # Repair a narrowly failing test before spending tokens on a full diff review.
         # A successful repair still goes through the independent review below.
         failed = [c for c in checks if not c['passed']]
@@ -2268,11 +2338,15 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
         if (failed and cycle < max_revisions and conf.get('targeted_test_fix', True)
                 and budget.take_repair()):
             phase('revision', task_id, **context, cycle=cycle, implementer=implementer)
-            problem = [{'command': c['command'], 'output': c['output'][-1200:]} for c in failed]
+            problem = [{'command': c['command'], 'output': c['output'][-1200:],
+                        **({'fails_without_this_change': True} if c.get('fails_on_base') else {})} for c in failed]
             fix_prompt = (prefix + "ROLE: implementer, repairing failing tests. Never commit, push, merge, "
                           "deploy or modify .ats.\n"
                           f'Task: {task}\nOnly repair these failing checks in the EXISTING worktree (never change the computer outside it: no installs, PATH shims or files in the home folder): '
                           + json.dumps(problem, ensure_ascii=False)
+                          + ('\nChecks marked fails_without_this_change already fail on the base branch: repair '
+                             'them only when the task is about them or your change touches their cause; never '
+                             'weaken or skip a test to make it pass.' if any(c.get('fails_on_base') for c in failed) else '')
                           + '\nKeep already working functionality. Do not restart the task or rewrite '
                           'unrelated files. After editing, state what you changed.')
             try:
@@ -2418,6 +2492,8 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                 checks = run_checks(conf, folder)
                 restore_if_changed(folder, tree)
             note_flaky(checks, task_id, **context, cycle=cycle)
+            note_repeated_flaky(checks, task_id, **context, cycle=cycle)
+            mark_failing_on_base(conf, folder, base, checks, task_id, **context, cycle=cycle)
             record('tests_parallel', 'Full tests ran next to the review', task_id, live=False, **context,
                    cycle=cycle, passed=all(c['passed'] for c in checks), tests=checks)
             broken = [c for c in checks if not c['passed'] and c.get('cannot_start')]
@@ -3779,7 +3855,11 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
         head = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
         resumed = checkpoints.verified_resume(DATA, source_id, plan_for_resume, folder, head)
         if not resumed:
-            raise RuntimeError('Source checkpoint is stale or invalid. Existing code was not modified')
+            reason = checkpoints.diagnose(DATA, source_id, plan_for_resume, folder, head) or 'INVALID'
+            record('resume_rejected', checkpoints.explain(reason), task_id, live=False, reason=reason,
+                   source_run=source_id)
+            raise RuntimeError(f'Source checkpoint cannot be resumed ({reason}): {checkpoints.explain(reason)}. '
+                               'Existing code was not modified')
     record('assigned',task,task_id,implementer=agent,branch=branch,task_categories=intelligence.categories(task))
     record('risk_profile', 'Risk-based execution profile', task_id, **risk)
     if routing:
