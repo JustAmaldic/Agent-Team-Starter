@@ -4077,7 +4077,7 @@ def _task_flow(task, agent, push, task_id, quiet=False, parallel='auto', approve
 
 def finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer, approved, history,
                 unavailable, quiet, local_mode):
-    """After the review: learnings, the commit, and (when approved) the base update and draft PR."""
+    """After the review: learnings, the commit, and (when approved) the base update and the pull request."""
     if history and 'ledger' not in _run_flags.get(task_id, {}):
         ledger = findings_ledger.build(history)
         if ledger:
@@ -4140,16 +4140,24 @@ def finish_task(task, task_id, folder, branch, push, conf, implementer, reviewer
         phase('pr', task_id, branch=branch)
         execute(['git','push','-u','origin',branch],folder)
         if not shutil.which('gh'):
-            print('gh missing: branch pushed but draft PR must be created manually')
+            print('gh missing: branch pushed but the pull request must be created manually')
             phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
             return 'approved'
         base=conf.get('base_branch','main')
-        outcome=execute(['gh','pr','create','--draft','--base',base,'--head',branch,'--title','ATS: '+task[:65],
-                         '--body',f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n{attribution}\n{dependency_lines(task_id)}Review/check outcomes in ATS data. Human merge required.'],folder)
+        body = (f'Task ID: {task_id}\nImplementer: {implementer}\nReviewer: {reviewer}\nReview cycles: {len(history)}\n'
+                f'{attribution}\n{dependency_lines(task_id)}Review/check outcomes in ATS data. Human merge required.')
+        outcome=execute(pr_create_command(conf, base, branch, 'ATS: '+task[:65], body),folder)
         print(outcome.stdout)
         phase('pr_created', task_id, url=outcome.stdout.strip()[-300:])
     phase('finished', task_id, approved=True, branch=branch, worktree=str(folder))
     return 'approved'
+
+
+def pr_create_command(conf, base, branch, title, body):
+    """`gh pr create` for an approved run: ready for review, so it can be reviewed and merged at once.
+    `draft_pr: true` in .ats-project.json opens a draft instead. ATS never merges either way."""
+    draft = ['--draft'] if conf.get('draft_pr', False) is True else []
+    return ['gh', 'pr', 'create', *draft, '--base', base, '--head', branch, '--title', title, '--body', body]
 
 
 def dependency_lines(task_id):
