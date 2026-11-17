@@ -33,10 +33,13 @@ def validate_dag(plan):
         if not isinstance(deps, list) or len(set(map(str, deps))) != len(deps) or not all(isinstance(x, str) for x in deps):
             raise ValueError("Invalid dependencies")
         if not isinstance(paths, list) or not paths or len(paths) > 30 or not all(
-            isinstance(p, str) and p.strip() and not p.startswith(("/", "\\\\")) and
-            ".." not in p.split("/") and "\\\\" not in p for p in paths
+            isinstance(p, str) and p.strip() for p in paths
         ):
             raise ValueError("DAG tasks need safe, explicit owned_paths")
+        outside = [p for p in paths if not inside_project(p)]
+        if outside:
+            # A part may only own files inside the worktree; the path itself is not repeated (it can hold a name).
+            raise ValueError(f"DAG task owns {len(outside)} path(s) outside the project worktree")
     # Explicit shared contracts are reviewed as their own DAG nodes before consumers run.
     providers = {}
     for node in nodes:
@@ -85,6 +88,15 @@ def validate_dag(plan):
          **({key: list(n[key]) for key in ("contracts_provided", "contracts_required") if key in n})}
         for n in nodes
     ]}
+
+
+def inside_project(path: str) -> bool:
+    """A relative path that stays inside the worktree: no root, drive, home, variable or '..' segment."""
+    text = path.strip().replace("\\", "/")
+    if (text.startswith(("/", "~", "$", "%")) or re.match(r"^[A-Za-z]:", text)
+            or any(part == ".." for part in text.split("/"))):
+        return False
+    return True
 
 
 def paths_conflict(a, b):

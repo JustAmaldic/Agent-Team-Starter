@@ -347,3 +347,41 @@ purpose (`merge_guard` event). The other agent reviews the whole change on top o
 every test command must pass. Only then is the pull request's own branch updated, with a normal
 fast-forward push: never forced, so work pushed meanwhile is never overwritten. ATS never merges the
 pull request. Pull requests from forks are not supported.
+
+## Failing tests that are not this change's fault
+
+- A test command that fails is also run once on a clean checkout of the base (`baseline_check`,
+  default on; cached per base commit). When it fails there too, the check is marked
+  `fails_on_base`, recorded as `test_fails_on_base`, and the implementer is told not to "repair"
+  it blindly. Approval still needs every test to pass; the escalation says the failure already
+  existed.
+- A test command that is unstable (`test_flaky`) in three runs of a project gets a
+  `test_flaky_repeated` event with a proposed task to make it reliable.
+- A resume that is refused names the reason (`resume_rejected`): MISSING, INVALID, HEAD_CHANGED,
+  WORKTREE_CHANGED or PLAN_CHANGED. The decision itself is unchanged.
+- A plan part whose `owned_paths` point outside the worktree (absolute, home, drive letter,
+  variable or `..`) is refused before any agent starts.
+
+## Local CI: `ats main-check`
+
+    ats main-check            # tests on a clean checkout of origin/<base_branch>
+    ats main-check --ref HEAD # or any local ref
+
+Fetches the base branch, checks that exact commit out in a throw-away worktree, runs every test
+command there and prints one `ATS_MAIN_CHECK_JSON` line (commit, passed, per command the result and
+the last output). It changes nothing in the project, its branches or the remote. ATS-app runs it
+after a merge so a red main is visible even without GitHub Actions.
+
+## Screenshot reviews: `ats preview-check`
+
+Checks every step a screenshot review takes (ui_preview settings, a local address, a screen with a
+route, Playwright), then starts the app on a throw-away checkout of HEAD and takes one screenshot.
+It prints one `ATS_PREVIEW_CHECK_JSON` line with each step and why it failed. Nothing in the
+project changes.
+
+## One question before the start: `ats clarify "<task>"`
+
+For a task about the interface that names no screen from `.ats-screens.json`, or matches several
+equally well, it prints one question with two to four choices (JSON). Deterministic, no agent and
+no tokens. ATS-app asks it before starting; without an answer the run uses the first choice and
+says so in the task.

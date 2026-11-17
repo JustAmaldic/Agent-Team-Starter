@@ -121,6 +121,39 @@ def load_checkpoint(data, task_id, plan, worktree, head):
     return value
 
 
+REASONS = {
+    "MISSING": "there is no reviewed checkpoint for that run",
+    "INVALID": "the checkpoint file is damaged or from another ATS version",
+    "HEAD_CHANGED": "the branch has commits that are not in the checkpoint",
+    "WORKTREE_CHANGED": "the checkpoint belongs to another worktree",
+    "PLAN_CHANGED": "the plan changed in a part that was already built",
+}
+
+
+def diagnose(data, task_id, plan, worktree, head):
+    """Why load_checkpoint rejects this checkpoint (a code from REASONS), or None when it accepts it.
+
+    Read-only and only for explaining: the decision itself stays with load_checkpoint.
+    """
+    if load_checkpoint(data, task_id, plan, worktree, head) is not None:
+        return None
+    path = checkpoint_path(data, task_id)
+    if not path.is_file():
+        return "MISSING"
+    value = read_checkpoint(data, task_id)
+    if not value or type(value.get("completed")) is not int or value.get("task_id") != task_id:
+        return "INVALID"
+    if value.get("worktree") != str(Path(worktree).resolve()):
+        return "WORKTREE_CHANGED"
+    if value.get("commit") != head:
+        return "HEAD_CHANGED"
+    return "PLAN_CHANGED"
+
+
+def explain(code) -> str:
+    return REASONS.get(code, "the checkpoint does not match")
+
+
 def read_checkpoint(data, task_id):
     """Read an untrusted prior record; caller must verify plan, worktree and HEAD."""
     path = checkpoint_path(data, task_id)
