@@ -361,3 +361,13 @@ pull request. Pull requests from forks are not supported.
   WORKTREE_CHANGED or PLAN_CHANGED. The decision itself is unchanged.
 - A plan part whose `owned_paths` point outside the worktree (absolute, home, drive letter,
   variable or `..`) is refused before any agent starts.
+
+## Local CI: `ats main-check`
+
+    ats main-check            # tests on a clean checkout of origin/<base_branch>
+    ats main-check --ref HEAD # or any local ref
+
+Fetches the base branch, checks that exact commit out in a throw-away worktree, runs every test
+command there and prints one `ATS_MAIN_CHECK_JSON` line (commit, passed, per command the result and
+the last output). It changes nothing in the project, its branches or the remote. ATS-app runs it
+after a merge so a red main is visible even without GitHub Actions.

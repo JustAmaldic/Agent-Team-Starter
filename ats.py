@@ -4248,6 +4248,42 @@ def child_run(argv):
     finally:
         for sig,handler in original.items():signal.signal(sig,handler)
 
+def main_check(ref=None):
+    """Run the project's test commands on a clean checkout of the base branch (a local CI).
+
+    Fetches origin/<base_branch>, checks that exact commit out in a throw-away worktree, runs every
+    test command there (unstable tests get their one rerun) and prints one ATS_MAIN_CHECK_JSON line.
+    Changes nothing in the project, its branches or the remote.
+    """
+    conf = project()
+    base = conf.get('base_branch', 'main')
+    target = ref or f'origin/{base}'
+    if not re.fullmatch(r'[A-Za-z0-9._/-]{1,200}', target) or '..' in target or target.startswith('-'):
+        raise RuntimeError('Invalid ref for main-check')
+    if not (APP / '.git').exists():
+        raise RuntimeError('main-check needs a Git project')
+    if ref is None:
+        execute(['git', 'fetch', '--quiet', 'origin', base], check=False, timeout=180)
+    commit = execute(['git', 'rev-parse', '--verify', target + '^{commit}'], check=False).stdout.strip()
+    if not re.fullmatch(r'[0-9a-f]{40}', commit):
+        raise RuntimeError(f'{target} not found')
+    result = {'ref': target, 'commit': commit, 'checks': [], 'passed': None}
+    if not conf.get('test_commands'):
+        result['note'] = 'no test_commands configured'
+    else:
+        configure_test_env(conf)
+        with snapshots.checkout(APP, commit, parent=APP.parent) as copy:
+            started = time.monotonic()
+            checks = run_checks(conf, copy)
+            result['seconds'] = round(time.monotonic() - started, 1)
+        result['checks'] = [{'command': str(c['command'])[:300], 'passed': c['passed'], 'flaky': bool(c.get('flaky')),
+                             'cannot_start': bool(c.get('cannot_start')), 'output': c.get('output', '')[-800:]}
+                            for c in checks]
+        result['passed'] = all(c['passed'] for c in checks)
+    print('ATS_MAIN_CHECK_JSON: ' + json.dumps(result, ensure_ascii=False), flush=True)
+    return result
+
+
 def pull_request_argument(args):
     if not args.fix_pr:
         return None
@@ -4277,6 +4313,7 @@ def main():
     p=sub.add_parser('risk');p.add_argument('description',nargs='+')
     sub.add_parser('env-check', help='Check that the test commands find the project requirements (JSON)')
     p=sub.add_parser('screens', help='Show the screen map, a draft of it, the screens a task names, or the task that completes it (JSON)');p.add_argument('--match');p.add_argument('--task',action='store_true',help='Print the task text that lets agents complete .ats-screens.json through a normal reviewed run')
+    p=sub.add_parser('main-check', help='Run the test commands on a clean checkout of origin/<base_branch> (local CI; changes nothing)');p.add_argument('--ref')
     p=sub.add_parser('agent-check', help='Run each installed agent CLI on a tiny fixture repo and check ATS markers (JSON)');p.add_argument('--agent',action='append')
     p.add_argument('--fixture', help='Also write an anonymous fixture (versions, OS, error categories) to this JSON file; with an existing file the differences are printed')
     sub.add_parser('performance')
@@ -4315,6 +4352,9 @@ def main():
                              indent=2))
         elif args.command=='risk':
             print(json.dumps(intelligence.risk_profile(' '.join(args.description)),indent=2))
+        elif args.command=='main-check':
+            outcome = main_check(args.ref)
+            sys.exit(0 if outcome['passed'] in (True, None) else 1)
         elif args.command=='agent-check':
             report = agent_check(args.agent)
             print(json.dumps(report, ensure_ascii=False, indent=2))

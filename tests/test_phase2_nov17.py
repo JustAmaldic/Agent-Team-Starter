@@ -122,5 +122,35 @@ class FailingOnBaseTests(unittest.TestCase):
         self.assertFalse(record.called)
 
 
+class MainCheckTests(unittest.TestCase):
+    def test_runs_the_tests_on_the_remote_main_without_touching_the_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            origin, app = base / 'origin.git', base / 'app'
+            git('init', '-q', '--bare', '-b', 'main', str(origin), cwd=base)
+            git('clone', '-q', str(origin), str(app), cwd=base)
+            git('config', 'user.name', 't', cwd=app)
+            git('config', 'user.email', 't@t', cwd=app)
+            (app / 'check.py').write_text('import pathlib, sys\nsys.exit(0 if pathlib.Path("ok").exists() else 1)\n')
+            (app / 'ok').write_text('1')
+            git('add', '-A', cwd=app)
+            git('commit', '-q', '-m', 'green', cwd=app)
+            git('push', '-q', 'origin', 'main', cwd=app)
+            (app / 'ok').unlink()                         # local, uncommitted change: must not matter
+            conf = {'test_commands': [f'{sys.executable} check.py'], 'flaky_rerun': False}
+            with mock.patch.object(ats, 'APP', app), mock.patch.object(ats, 'project', return_value=conf), \
+                    mock.patch('builtins.print'):
+                result = ats.main_check()
+                self.assertTrue(result['passed'])
+                self.assertEqual(result['commit'], git('rev-parse', 'main', cwd=origin))
+                self.assertFalse((app / 'ok').exists())
+                git('rm', '-q', 'ok', cwd=app)
+                git('commit', '-q', '-m', 'red', cwd=app)
+                git('push', '-q', 'origin', 'main', cwd=app)
+                self.assertFalse(ats.main_check()['passed'])
+                with self.assertRaises(RuntimeError):
+                    ats.main_check('--upload-pack=x')
+
+
 if __name__ == '__main__':
     unittest.main()
