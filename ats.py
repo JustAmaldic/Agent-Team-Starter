@@ -1667,7 +1667,8 @@ def run_checks(conf, folder):
         outcome = run_check(cmd, folder, timeout=timeout)
         took = time.monotonic() - started
         output = (outcome.stdout or '') + (outcome.stderr or '')
-        check = {'command': cmd, 'passed': outcome.returncode == 0, 'output': output[-1000:]}
+        check = {'command': cmd, 'passed': outcome.returncode == 0, 'output': output[-1000:],
+                 'seconds': round(took, 1)}   # measurable: the run report adds these up per run
         skipped = skipped_tests(output)
         if skipped:
             check['skipped'] = skipped   # shown to the reviewer: a passing suite can hide skipped tests
@@ -1682,6 +1683,24 @@ def run_checks(conf, folder):
                              output=((again.stdout or '') + (again.stderr or ''))[-1000:])
         checks.append(check)
     return checks
+
+
+def retest_after_repair(conf, folder, checks, failed, task_id, context, cycle):
+    """After a test repair in a middle round, first rerun only the commands that failed (quick_retest,
+    default on, only when other commands passed). Still failing: the commands that passed before are
+    not run again, because this round cannot be approved anyway. All repaired: every command runs, so
+    an approval always rests on the full suite."""
+    if not conf.get('quick_retest', True) or len(failed) >= len(checks):
+        return run_checks(conf, folder)
+    again = run_checks({**conf, 'test_commands': [c['command'] for c in failed]}, folder)
+    if all(c['passed'] for c in again):
+        return run_checks(conf, folder)
+    rerun = {str(c['command']): c for c in again}
+    saved = round(sum(c.get('seconds') or 0 for c in checks if c['passed']), 1)
+    record('quick_retest', f'Repair did not fix every failing test; {len(checks) - len(failed)} passing '
+           f'command(s) not rerun (about {saved}s saved)', task_id, live=False, **context, cycle=cycle,
+           saved_seconds=saved, still_failing=[str(c['command'])[:300] for c in again if not c['passed']])
+    return [rerun.get(str(c['command']), {**c, 'not_rerun': True}) for c in checks]
 
 
 def note_flaky(checks, task_id, **context):
@@ -2405,7 +2424,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                                    'worktree and state what you changed: ' + json.dumps(problem, ensure_ascii=False)))
                 record('targeted_test_fix', response[-1200:], task_id, **context,
                        implementer=implementer, failed_commands=[c['command'] for c in failed])
-                checks = run_checks(conf, folder)
+                checks = retest_after_repair(conf, folder, checks, failed, task_id, context, cycle)
             except (AgentUsageExhausted, RuntimeError) as exc:
                 record('targeted_test_fix_skipped', str(exc)[:500], task_id, **context)
                 # Keep existing behavior: the full independent review still decides.
