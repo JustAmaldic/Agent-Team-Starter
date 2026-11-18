@@ -2,6 +2,8 @@
 
 Read `POLICY.md` before implementation or review. This document applies to Codex, Claude Code and the coordinator (`ats.py`).
 
+`ats.py` holds the command line, agents, events and data sync. The review loop lives in `ats_modules/review_flow.py`, split tasks (planning, parts, merges, integration review) in `ats_modules/part_flow.py` and a whole task run in `ats_modules/task_flow.py`. Those modules reach shared names as `ats.<name>`, looked up at call time, so tests can keep patching the `ats` module; `ats.py` re-exports them. Keep `ats.py` under 2,000 lines (tests/test_split_modules.py).
+
 - Work on isolated branches/worktrees. Never push or merge into the application's default branch directly.
 - The implementing agent cannot approve its own implementation. The other agent reviews every code change; if it is unavailable, the task is escalated, not self-reviewed.
 - In review-only mode, never create, edit or delete files. ATS reverts any change and rejects the review.
