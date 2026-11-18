@@ -452,7 +452,10 @@ def sync_in():
         )
     branch = git('branch', '--show-current').stdout.strip()
     if not branch:
-        raise RuntimeError('ATS must be on a named branch to synchronize.')
+        # A detached checkout is a pinned version (e.g. the ATS-app submodule): whoever pinned it
+        # manages updates, so run this version as-is instead of refusing every command.
+        print('ATS: pinned checkout (detached HEAD); self-update skipped.', file=sys.stderr)
+        return
     git('fetch', 'origin', branch)
     git('merge', '--ff-only', f'origin/{branch}')
 
