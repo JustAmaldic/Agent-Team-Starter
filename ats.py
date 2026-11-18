@@ -22,6 +22,7 @@ from pathlib import Path
 import ats_intelligence as intelligence
 from ats_modules import checkpoints
 from ats_modules import dag as dag_planning
+from ats_modules import dag_rolling
 from ats_modules import budget as budgets
 from ats_modules import style_guard
 from ats_modules import context_pack
@@ -3115,6 +3116,113 @@ def merge_parallel_part(task, plan, number, part, task_id, folder, branch, side_
     return approved, reviewer, cycles
 
 
+def rolling_flow(task, plan, task_id, folder, branch, implementer, unavailable, conf, history, attribution,
+                 quiet=False):
+    """Run a plan_version 2 DAG without a wave barrier (dag_rolling, see ats_modules/dag_rolling).
+
+    The task worktree starts its next ready part as soon as its own part is approved; a side part
+    is merged when the task worktree is between parts. Returns (ok, reviewer, author, overlapping)
+    where overlapping counts parts that ran next to another part. No mid-run checkpoint: a failed
+    rolling run keeps its worktrees for diagnosis and a retry starts in wave mode."""
+    other = alternate_agent(implementer, unavailable)
+    if implementer in unavailable or other is None:
+        record('escalated', 'Both agents are required for rolling DAG execution', task_id, branch=branch)
+        return False, None, implementer, 0
+    pipe = dag_rolling.Pipeline(plan)
+    total = len(pipe.nodes)
+    agents = {'main': implementer, 'side': other}
+    commit_all(folder, 'ATS: start of rolling parts')
+    numbers, results, threads, side = {}, {}, {}, {}
+    started, idle_since, idle = {}, {}, {'main': 0.0, 'side': 0.0}
+    overlapping, reviewer, author = set(), None, implementer
+    finished = threading.Event()
+
+    def build(slot, *args):
+        try:
+            results[slot] = run_part(*args)
+        except Exception as exc:
+            record('escalated', str(exc), task_id, subtask=args[2], branch=branch,
+                   blocking_reasons=[f'subtask {args[2]}: {exc}'])
+            results[slot] = (False, None, args[8], [])
+        finally:
+            finished.set()
+
+    def wait_all():
+        for thread in threads.values():
+            thread.join()
+
+    phase('parallel', task_id, mode='rolling', parts=total)
+    while not pipe.done():
+        for slot in ('main', 'side'):
+            node = pipe.next_for(slot)
+            if node is None:
+                if not pipe.busy(slot):
+                    idle_since.setdefault(slot, time.monotonic())
+                continue
+            if slot in idle_since and pipe.running:
+                idle[slot] += time.monotonic() - idle_since.pop(slot)
+            idle_since.pop(slot, None)
+            number = len(numbers) + 1
+            numbers[node['id']] = number
+            where = folder
+            if slot == 'side':
+                where = folder.parent / f'{folder.name}-part{number}'
+                side.update(path=where, branch=f'{branch}-part{number}', number=number, title=node['title'])
+                if where.exists():
+                    raise RuntimeError('Parallel side worktree unexpectedly exists: ' + str(where))
+                execute(['git', 'worktree', 'add', '-b', side['branch'], str(where), 'HEAD'], folder)
+            base = execute(['git', 'rev-parse', 'HEAD'], folder).stdout.strip()
+            mate = next(((numbers[i], pipe.nodes[i]['title']) for s, i in pipe.running.items()), None)
+            if mate:
+                overlapping.update({number, mate[0]})
+            pipe.start(slot, node['id'])
+            started[slot] = time.monotonic()
+            threads[slot] = threading.Thread(target=build, args=(
+                slot, task, plan, number, total, node['title'], task_id, where, branch, agents[slot],
+                unavailable, conf, base, quiet, mate, False, tuple(history)))
+            threads[slot].start()
+        if pipe.stuck():
+            wait_all()
+            record('escalated', 'Rolling DAG cannot progress', task_id, branch=branch)
+            return False, reviewer, author, len(overlapping)
+        finished.wait(timeout=1.0)
+        finished.clear()
+        for slot in [s for s in list(pipe.running) if s in results]:
+            approved, judge, writer, cycles = results.pop(slot)
+            threads.pop(slot).join()
+            history.extend(cycles)
+            node_id = pipe.running[slot]
+            number = numbers[node_id]
+            if not approved:
+                wait_all()
+                print(f'ATS: part {number} not approved; rolling worktrees kept for diagnosis', file=sys.stderr)
+                return False, judge, writer, len(overlapping)
+            pipe.finished(slot)
+            commit_all(folder if slot == 'main' else side['path'], f'ATS: part {number}')
+            attribution.append(dict(subtask=number, implementer=writer, reviewer=judge))
+            reviewer, author = judge or reviewer, writer
+            record('rolling_part', f'Part {number} approved in the {slot} worktree', task_id, live=False,
+                   subtask=number, slot=slot, seconds=round(time.monotonic() - started.pop(slot), 1),
+                   branch=branch)
+        if pipe.merge_ready():
+            merged, judge, cycles = merge_parallel_part(
+                task, plan, side['number'], side['title'], task_id, folder, branch, side['branch'],
+                agents['side'], unavailable, conf, quiet=quiet)
+            history.extend(cycles)
+            if not merged:
+                wait_all()
+                print(f"ATS: merging part {side['number']} needs a human decision; side worktree kept: "
+                      f"{side['path']}", file=sys.stderr)
+                return False, judge, agents['side'], len(overlapping)
+            execute(['git', 'worktree', 'remove', '--force', str(side['path'])], folder, check=False)
+            execute(['git', 'branch', '-D', side['branch']], folder, check=False)
+            pipe.merged_side()
+    record('dag_rolling', f'{total} parts without a wave barrier; idle main {idle["main"]:.1f}s, '
+           f'side {idle["side"]:.1f}s', task_id, live=False, parts=total, overlapping=len(overlapping),
+           idle_seconds={k: round(v, 1) for k, v in idle.items()}, branch=branch)
+    return True, reviewer, author, len(overlapping) // 2
+
+
 def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, conf,
                  quiet=False, resumed=None):
     """Build a split task part by part; independent pairs are built and reviewed in parallel.
@@ -3131,7 +3239,15 @@ def subtask_flow(task, plan, task_id, folder, branch, implementer, unavailable, 
     attribution = list((resumed or {}).get('attribution', []))
     completed = int((resumed or {}).get('completed', 0))
     reviewer, author, number = None, implementer, 0
-    for wave in waves:
+    rolling = (conf.get('dag_rolling', False) and not resumed and isinstance(plan, dict)
+               and plan.get('plan_version') == 2)
+    if rolling:
+        ok, reviewer, author, rolled = rolling_flow(task, plan, task_id, folder, branch, implementer,
+                                                    unavailable, conf, history, attribution, quiet=quiet)
+        if not ok:
+            return False, reviewer, author, history
+        waves = [[None, None]] * rolled   # only the count of overlapping parts matters below
+    for wave in ([] if rolling else waves):
         if number + len(wave) <= completed:
             for skipped in range(number + 1, number + len(wave) + 1):
                 record('subtask_resumed', 'Reusing independently reviewed code at a verified Git checkpoint',
