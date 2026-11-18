@@ -267,6 +267,10 @@ def build(events, project, task_id):
         else:
             tokens[purpose] = tokens.get(purpose, 0) + int(value)
     waits = [_number(w.get('idle_seconds')) for w in waves]
+    # Time spent in test commands per review round (the checks the review saw), plus what quick_retest saved.
+    test_times = [_number(c.get('seconds')) for e in reviews for c in (e.get('tests') if isinstance(e.get('tests'), list) else [])
+                  if isinstance(c, dict) and not c.get('not_rerun')]
+    saved = [_number(e.get('saved_seconds')) for e in kind('quick_retest')]
     return {
         'project': project, 'task_id': task_id, 'outcome': outcome,
         'approved': finished.get('approved') if isinstance(finished.get('approved'), bool) else None,
@@ -284,6 +288,8 @@ def build(events, project, task_id):
                  'repairs': len(kind('gate_repair')) if gates or kind('gate_repair') else None},
         'tokens': tokens or None,
         'wait_seconds': round(sum(waits), 1) if waits and all(w is not None for w in waits) else None,
+        'test_seconds': round(sum(test_times), 1) if test_times and all(t is not None for t in test_times) else None,
+        'retest_saved_seconds': round(sum(saved), 1) if saved and all(t is not None for t in saved) else None,
         'escalation': _escalation(own, outcome),
     }
 
@@ -343,6 +349,8 @@ def render(report):
               '- Findings: ' + (', '.join(f'{s} {findings[s]}' for s in SEVERITIES) if findings else UNKNOWN),
               f"- Pre-review gate: {_show(gate['runs'])} runs, {_show(gate['failed'])} failed, "
               f"{_show(gate['repairs'])} repairs",
+              f"- Test time in review rounds: {_show(report.get('test_seconds'), ' s')}"
+              + (f" (quick retest saved {report['retest_saved_seconds']} s)" if report.get('retest_saved_seconds') else ''),
               '', '## Tokens and waiting', '']
     if report['tokens']:
         lines += [f'- {cell(purpose)}: {_show(count)}' for purpose, count in sorted(report['tokens'].items())]
