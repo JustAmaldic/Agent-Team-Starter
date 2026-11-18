@@ -32,7 +32,7 @@ from ats_modules.agent_limits import AgentUsageExhausted
 
 import ats
 
-__all__ = ['parse_verdict', 'normalize_findings', 'normalize_responses', 'floored', 'evaluate_approval', 'index_tree', 'restore_if_changed', 'SKIPPED_COUNT', 'skipped_tests', 'flaky_retry_command', 'run_checks', 'note_flaky', 'FLAKY_REPEAT', 'flaky_history', 'note_repeated_flaky', 'mark_failing_on_base', 'checks_for_prompt', 'CANNOT_START', 'cannot_start', 'STYLE_FILES', 'STYLE_SKIP', 'STYLE_LIMIT', '_style_cache', '_style_sheets', 'style_context', '_repo_context', '_screen_context', 'screen_context', 'repo_context', 'part_context', 'shared_prefix', 'POLICY_ESSENTIALS', 'REVIEW_ROLE', 'LIGHT_CHECKLIST', 'OUTPUT_CONTRACT', 'SECURITY_FOCUS', 'previous_findings', 'review_prompt', 'RESPONSES_CONTRACT', 'revision_prompt', 'revision_followup', 'handoff_summary', 'tracked_files', 'gate_repair_prompt', 'gate_followup', 'pre_review_gate', 'outside_owned', 'reserved_changes', 'environment_reason', 'snapshot_parent', 'commands_can_start', 'tests_alongside_review', 'settle', 'snapshot_checks', 'PARALLEL_TESTS_NOTE', 'failing_tests_note', 'ui_review', 'preview_check', 'review_loop']
+__all__ = ['retest_after_repair', 'parse_verdict', 'normalize_findings', 'normalize_responses', 'floored', 'evaluate_approval', 'index_tree', 'restore_if_changed', 'SKIPPED_COUNT', 'skipped_tests', 'flaky_retry_command', 'run_checks', 'note_flaky', 'FLAKY_REPEAT', 'flaky_history', 'note_repeated_flaky', 'mark_failing_on_base', 'checks_for_prompt', 'CANNOT_START', 'cannot_start', 'STYLE_FILES', 'STYLE_SKIP', 'STYLE_LIMIT', '_style_cache', '_style_sheets', 'style_context', '_repo_context', '_screen_context', 'screen_context', 'repo_context', 'part_context', 'shared_prefix', 'POLICY_ESSENTIALS', 'REVIEW_ROLE', 'LIGHT_CHECKLIST', 'OUTPUT_CONTRACT', 'SECURITY_FOCUS', 'previous_findings', 'review_prompt', 'RESPONSES_CONTRACT', 'revision_prompt', 'revision_followup', 'handoff_summary', 'tracked_files', 'gate_repair_prompt', 'gate_followup', 'pre_review_gate', 'outside_owned', 'reserved_changes', 'environment_reason', 'snapshot_parent', 'commands_can_start', 'tests_alongside_review', 'settle', 'snapshot_checks', 'PARALLEL_TESTS_NOTE', 'failing_tests_note', 'ui_review', 'preview_check', 'review_loop']
 
 
 def parse_verdict(review):
@@ -173,7 +173,8 @@ def run_checks(conf, folder):
         outcome = ats.run_check(cmd, folder, timeout=timeout)
         took = time.monotonic() - started
         output = (outcome.stdout or '') + (outcome.stderr or '')
-        check = {'command': cmd, 'passed': outcome.returncode == 0, 'output': output[-1000:]}
+        check = {'command': cmd, 'passed': outcome.returncode == 0, 'output': output[-1000:],
+                 'seconds': round(took, 1)}   # measurable: the run report adds these up per run
         skipped = ats.skipped_tests(output)
         if skipped:
             check['skipped'] = skipped   # shown to the reviewer: a passing suite can hide skipped tests
@@ -188,6 +189,24 @@ def run_checks(conf, folder):
                              output=((again.stdout or '') + (again.stderr or ''))[-1000:])
         checks.append(check)
     return checks
+
+
+def retest_after_repair(conf, folder, checks, failed, task_id, context, cycle):
+    """After a test repair in a middle round, first rerun only the commands that failed (quick_retest,
+    default on, only when other commands passed). Still failing: the commands that passed before are
+    not run again, because this round cannot be approved anyway. All repaired: every command runs, so
+    an approval always rests on the full suite."""
+    if not conf.get('quick_retest', True) or len(failed) >= len(checks):
+        return ats.run_checks(conf, folder)
+    again = ats.run_checks({**conf, 'test_commands': [c['command'] for c in failed]}, folder)
+    if all(c['passed'] for c in again):
+        return ats.run_checks(conf, folder)
+    rerun = {str(c['command']): c for c in again}
+    saved = round(sum(c.get('seconds') or 0 for c in checks if c['passed']), 1)
+    ats.record('quick_retest', f'Repair did not fix every failing test; {len(checks) - len(failed)} passing '
+               f'command(s) not rerun (about {saved}s saved)', task_id, live=False, **context, cycle=cycle,
+               saved_seconds=saved, still_failing=[str(c['command'])[:300] for c in again if not c['passed']])
+    return [rerun.get(str(c['command']), {**c, 'not_rerun': True}) for c in checks]
 
 
 def note_flaky(checks, task_id, **context):
@@ -913,7 +932,7 @@ def review_loop(task, task_id, folder, branch, implementer, unavailable, conf, q
                                    'worktree and state what you changed: ' + json.dumps(problem, ensure_ascii=False)))
                 ats.record('targeted_test_fix', response[-1200:], task_id, **context,
                        implementer=implementer, failed_commands=[c['command'] for c in failed])
-                checks = ats.run_checks(conf, folder)
+                checks = ats.retest_after_repair(conf, folder, checks, failed, task_id, context, cycle)
             except (AgentUsageExhausted, RuntimeError) as exc:
                 ats.record('targeted_test_fix_skipped', str(exc)[:500], task_id, **context)
                 # Keep existing behavior: the full independent review still decides.
